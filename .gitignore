@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Conda / virtual envs
+env/
+venv/
+.venv/
+
+# Spyder / IDE
+.spyderproject
+.spyproject
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data / outputs (wichtig für dein Projekt)
+*.bag
+data/
+outputs/
+results/
+
+# Logs
+*.log
+
+# Packaging / build artifacts
+*.egg-info/
