@@ -37,11 +37,26 @@ class HoughCircleParams:
     param2: float = 8
     invert: bool = True
     median_ks: int = 5
+    
+
+def _validate_params(params: HoughCircleParams) -> None:
+    if params.dp <= 0:
+        raise ValueError("dp must be > 0.")
+    if params.minDist <= 0:
+        raise ValueError("minDist must be > 0.")
+    if params.min_radius < 0 or params.max_radius < 0:
+        raise ValueError("min_radius and max_radius must be >= 0.")
+    if params.max_radius and params.min_radius > params.max_radius:
+        raise ValueError("min_radius must be <= max_radius.")
+    if params.param1 <= 0 or params.param2 <= 0:
+        raise ValueError("param1 and param2 must be > 0.")
+    if params.median_ks < 0:
+        raise ValueError("median_ks must be >= 0.")
 
 
 def detect_blobs_hough(
     image: np.ndarray,
-    params: HoughCircleParams,
+    params: Optional[HoughCircleParams] = None,
 ) -> Optional[np.ndarray]:
     """
     Detect circular blobs in a grayscale image using the Hough Circle Transform.
@@ -54,8 +69,9 @@ def detect_blobs_hough(
     ----------
     image : np.ndarray
         Input image as a single-channel uint8 array.
-    params : HoughCircleParams
-        Parameter set controlling the Hough circle detection.
+    params : HoughCircleParams, optional
+        Parameter set controlling the Hough circle detection. Uses defaults
+        when omitted.
 
     Returns
     -------
@@ -67,14 +83,20 @@ def detect_blobs_hough(
     Raises
     ------
     ValueError
-        If the input image is not a single-channel uint8 array.
+        If the input image is not a single-channel uint8 array or params are invalid.
     """
+    if image.size == 0:
+        return None
     if image.ndim != 2:
         raise ValueError("Input image must be single-channel (grayscale).")
     if image.dtype != np.uint8:
         raise ValueError("Input image must be of type uint8.")
 
-    img = image.copy()
+    if params is None:
+        params = HoughCircleParams()
+    _validate_params(params)
+
+    img = np.ascontiguousarray(image)
 
     if params.invert:
         img = 255 - img
