@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Created on Tue Dec 23 12:45:10 2025
+example_blob_detection.py
 
-@author: domin
+Test for blob detection helpers.
 """
 
 import sys
@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-from overlay.calib.tools.blob_detection import HoughCircleParams, detect_blobs_hough
+from overlay.tools.blob_detection import HoughCircleParams, detect_blobs_hough
 
 
 # ============================================================

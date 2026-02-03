@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-test_checkerboard_corner_detection.py
+example_checkerboard_corner_detection.py
 
 Interactive test runner for checkerboard_corner_detection.
 """
@@ -12,7 +12,7 @@ import pyrealsense2 as rs
 import tkinter as tk
 from tkinter import messagebox
 
-from overlay.calib.tools.checkerboard_corner_detection import (
+from overlay.tools.checkerboard_corner_detection import (
     detect_classic_downscaled,
     detect_snapshot_full,
     get_extreme_corners_geometric,

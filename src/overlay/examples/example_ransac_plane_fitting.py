@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-test_ransac_plane_fitting.py
+example_ransac_plane_fitting.py
 
 Interactive test harness for RANSAC_plane_fitting helpers.
 """
@@ -13,13 +13,30 @@ import pyrealsense2 as rs
 import tkinter as tk
 from tkinter import messagebox
 
-from overlay.calib.tools import checkerboard_corner_detection as cbd
-from overlay.calib.tools import ransac_plane_fitting as rpf
+from overlay.tools import checkerboard_corner_detection as cbd
+from overlay.tools import ransac_plane_fitting as rpf
 
 
 LIVE_WIN = "Live RGB (SPACE=capture if FOUND, ESC=quit)"
 RES_WIN = "Corner Detection Result"
 PLANE_WIN = "Plane Fitting Preview (ESC=quit)"
+
+
+def setup_window(name: str) -> None:
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(name, 960, 540)
+
+
+def ask_corners_satisfied(
+    title: str = "Corner Detection",
+    msg: str = "Satisfied with the detected corners?\n\nYes: Next (plane fitting)\nNo: back to live video",
+) -> bool:
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    ans = messagebox.askyesno(title, msg, icon="question")
+    root.destroy()
+    return ans
 
 
 def ask_plane_satisfied(title: str = "Plane Fitting", msg: str = "Satisfied with plane fitting?\n\nYes: accept\nNo: redo") -> bool:
@@ -29,6 +46,22 @@ def ask_plane_satisfied(title: str = "Plane Fitting", msg: str = "Satisfied with
     ans = messagebox.askyesno(title, msg, icon="question")
     root.destroy()
     return ans
+
+
+def draw_extremes(img_bgr, extremes, color=(208, 224, 64), radius=10, thickness=-1):
+    for name, (u, v) in extremes.items():
+        cv2.circle(img_bgr, (int(u), int(v)), radius, color, thickness)
+        cv2.putText(
+            img_bgr,
+            name,
+            (int(u) + 8, int(v) - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+    return img_bgr
 
 
 def start_realsense_rgbd(fps: int = 30):
@@ -54,10 +87,7 @@ def start_realsense_rgbd(fps: int = 30):
 
 
 def rect_from_extremes(extremes: dict[str, tuple[float, float]], img_w: int, img_h: int, pad_px: int):
-    pts = np.array(
-        [extremes["top_left"], extremes["top_right"], extremes["bottom_left"]],
-        dtype=np.float32,
-    )
+    pts = np.array([extremes["top_left"], extremes["top_right"], extremes["bottom_left"]], dtype=np.float32)
 
     umin = int(np.floor(np.min(pts[:, 0]) - pad_px))
     umax = int(np.ceil(np.max(pts[:, 0]) + pad_px))
@@ -150,7 +180,7 @@ def main():
     ransac_iters = 1000
 
     pipeline, align = start_realsense_rgbd(fps=30)
-    cbd.setup_window(LIVE_WIN)
+    setup_window(LIVE_WIN)
 
     try:
         while True:
@@ -192,18 +222,15 @@ def main():
             res = snap_color.copy()
             cv2.drawChessboardCorners(res, pattern_size, corners, True)
             extremes = cbd.get_extreme_corners_geometric(corners)
-            res = cbd.draw_extremes(res, extremes, color=(208, 224, 64), radius=10, thickness=-1)
+            res = draw_extremes(res, extremes, color=(208, 224, 64), radius=10, thickness=-1)
 
-            cbd.setup_window(RES_WIN)
+            setup_window(RES_WIN)
             cv2.imshow(RES_WIN, res)
 
-            ok_corners = cbd.ask_satisfied(
-                title="Corner Detection",
-                msg="Satisfied with the detected corners?\n\nYes: Next (plane fitting)\nNo: back to live video",
-            )
+            ok_corners = ask_corners_satisfied()
             if not ok_corners:
                 cv2.destroyWindow(RES_WIN)
-                cbd.setup_window(LIVE_WIN)
+                setup_window(LIVE_WIN)
                 continue
 
             H, W = snap_color.shape[:2]
@@ -223,7 +250,7 @@ def main():
                 if len(pts3d) < 800:
                     print("Not enough points for plane fit. Try again.")
                     cv2.destroyWindow(RES_WIN)
-                    cbd.setup_window(LIVE_WIN)
+                    setup_window(LIVE_WIN)
                     break
 
                 plane_model, inliers = rpf.fit_plane_from_points(
@@ -251,16 +278,20 @@ def main():
                 )
 
                 preview = snap_color.copy()
-                preview = cbd.draw_extremes(preview, extremes, color=(208, 224, 64), radius=10, thickness=-1)
-                preview = draw_axes_top_left(preview, origin=(40, 40))
+                preview = draw_extremes(preview, extremes, color=(208, 224, 64), radius=10, thickness=-1)
+                top_left = extremes["top_left"]
+                preview = draw_axes_top_left(preview, origin=(int(round(top_left[0])), int(round(top_left[1]))))
 
                 cv2.imshow(PLANE_WIN, preview)
                 cv2.waitKey(10)
 
                 if ask_plane_satisfied():
                     cv2.destroyWindow(RES_WIN)
-                    cv2.destroyWindow(PLANE_WIN)
-                    break
+                    while True:
+                        key_final = cv2.waitKey(50) & 0xFF
+                        if key_final == 27:
+                            cv2.destroyWindow(PLANE_WIN)
+                            return
 
                 redo_seed += 1
 

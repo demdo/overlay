@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-test_marker_selection.py
+example_marker_selection.py
 
 Interactive test runner for marker_selection helpers.
 """
@@ -10,13 +10,13 @@ import cv2
 import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
-from overlay.calib.tools.marker_selection import (
+from overlay.tools.marker_selection import (
     extract_xy_from_cells,
     nearest_cell,
     prepare_nearest_cell_data,
     rect_cells_from_selected,
 )
-from overlay.calib.tools.blob_detection import HoughCircleParams, detect_blobs_hough
+from overlay.tools.blob_detection import HoughCircleParams, detect_blobs_hough
 
 
 def _ensure_qt_app():
