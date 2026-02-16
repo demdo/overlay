@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import cv2
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout,
@@ -215,6 +215,7 @@ class PlaneFittingPage(QWidget):
         # ======================================================
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setScaledContents(False)
         self.image_label.setFixedSize(self.DISP_W, self.DISP_H)
         self.image_label.setFocusPolicy(Qt.NoFocus)
 
@@ -318,22 +319,35 @@ class PlaneFittingPage(QWidget):
     # Rendering: cover+crop but anchored TOP-LEFT (x=0,y=0)
     # ======================================================
 
-    def _show_image_cover(self, img_bgr: np.ndarray) -> None:
+    def _show_image(self, img_bgr: np.ndarray) -> None:
         self._last_vis = img_bgr
 
-        pm = _bgr_to_qpixmap(img_bgr)
+        target_w = self.DISP_W
+        target_h = self.DISP_H
+
+        h, w = img_bgr.shape[:2]
+        if h <= 0 or w <= 0:
+            self.image_label.clear()
+            return
+        
+        target_ratio = float(target_w) / float(target_h)
+        src_ratio = float(w) / float(h)
+
+        vis = img_bgr
+        if src_ratio > target_ratio:
+            crop_w = int(round(h * target_ratio))
+            x0 = max(0, (w - crop_w) // 2)
+            vis = img_bgr[:, x0:x0 + crop_w]
+        elif src_ratio < target_ratio:
+            crop_h = int(round(w / target_ratio))
+            y0 = max(0, (h - crop_h) // 2)
+            vis = img_bgr[y0:y0 + crop_h, :]
+            
+        vis = cv2.resize(vis, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        pm = _bgr_to_qpixmap(vis)
         if pm.isNull():
             self.image_label.clear()
             return
-
-        target = self.image_label.size()
-
-        pm = pm.scaled(target, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-
-        # TOP-LEFT crop prevents cutting "FOUND/NOT FOUND" text
-        x = 0
-        y = 0
-        pm = pm.copy(x, y, target.width(), target.height())
 
         self.image_label.setPixmap(pm)
 
@@ -508,7 +522,7 @@ class PlaneFittingPage(QWidget):
             cv2.putText(vis, "NOT FOUND", (30, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA)
 
-        self._show_image_cover(vis)
+        self._show_image(vis)
 
     # ======================================================
     # Capture + plane fitting (kept from your flow)
@@ -536,7 +550,7 @@ class PlaneFittingPage(QWidget):
         res = _draw_extremes(res, extremes)
 
         self._mode = "corners"
-        self._show_image_cover(res)
+        self._show_image(res)
 
         ans = QMessageBox.question(
             self,
@@ -615,7 +629,7 @@ class PlaneFittingPage(QWidget):
         preview = _draw_axes_top_left(preview, (int(round(tl[0])), int(round(tl[1]))))
 
         self._mode = "plane"
-        self._show_image_cover(preview)
+        self._show_image(preview)
 
         self.info_label.setText(
             "Plane fitting stats (inliers)\n"

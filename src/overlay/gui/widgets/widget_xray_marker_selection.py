@@ -57,9 +57,9 @@ class XrayMarkerSelectionWidget(QWidget):
         self._off_y: int = 0
 
         # Grid picking
-        self._circles_grid: Optional[np.ndarray] = None  # (rows, cols, 3) (x,y,r) in original pixels
+        self._circles_grid: Optional[np.ndarray] = None
         self._prepared = None
-        self._pick_radius_px: float = 20.0  # threshold in original pixels
+        self._pick_radius_px: float = 20.0
 
         # Anchor selection overlays
         self._selected_cells: List[Cell] = []
@@ -75,7 +75,6 @@ class XrayMarkerSelectionWidget(QWidget):
     # ---------------- Public API ----------------
 
     def set_image(self, img_gray_u8: np.ndarray):
-        """Set/replace the X-ray image (fit-to-view)."""
         if img_gray_u8 is None:
             self._img_gray_u8 = None
             self._pix = None
@@ -93,7 +92,6 @@ class XrayMarkerSelectionWidget(QWidget):
         self.update()
 
     def set_grid(self, circles_grid: Optional[np.ndarray], pick_radius_px: Optional[float] = None):
-        """Set/replace circles_grid. If None: disables picking."""
         self._circles_grid = circles_grid
         if circles_grid is None:
             self._prepared = None
@@ -110,7 +108,6 @@ class XrayMarkerSelectionWidget(QWidget):
         self.set_grid(circles_grid, pick_radius_px)
 
     def clear_selection(self):
-        """Clear anchors + hover + ROI highlighting and unlock."""
         self._selected_cells.clear()
         self._highlight_cells.clear()
         self._hover_cell = None
@@ -122,14 +119,12 @@ class XrayMarkerSelectionWidget(QWidget):
         self._locked = bool(locked)
 
     def set_roi_cells(self, cells: List[Cell]):
-        """Highlight these cells as the ROI markers (after confirmation)."""
         self._roi_cells = set(cells) if cells is not None else set()
         self.update()
 
     # ---------------- Internal helpers ----------------
 
     def _widget_to_image_xy(self, xw: int, yw: int) -> Tuple[int, int]:
-        """Map widget coords -> original image pixel coords."""
         xi = (xw - self._off_x) / (self._scale + 1e-12)
         yi = (yw - self._off_y) / (self._scale + 1e-12)
         return int(round(xi)), int(round(yi))
@@ -152,7 +147,6 @@ class XrayMarkerSelectionWidget(QWidget):
         H, W = self._img_h, self._img_w
         vw, vh = self.width(), self.height()
 
-        # Fit-to-view
         sx = vw / max(1, W)
         sy = vh / max(1, H)
         self._scale = min(sx, sy)
@@ -172,12 +166,11 @@ class XrayMarkerSelectionWidget(QWidget):
         grid = self._circles_grid
         nrows, ncols, _ = grid.shape
 
-        # Pens
-        pen_normal = QPen(QColor(0, 255, 0), 2)        # green (all markers)
-        pen_anchor = QPen(QColor(0, 255, 255), 4)      # cyan (3 anchors)
-        pen_roi    = QPen(QColor(255, 165, 0), 3)      # orange (ROI markers)
-        pen_cross  = QPen(QColor(255, 0, 0), 1)        # red cross
-        pen_hover  = QPen(QColor(255, 255, 0), 2)      # yellow hover
+        pen_normal = QPen(QColor(0, 255, 0), 2)
+        pen_anchor = QPen(QColor(0, 255, 255), 4)
+        pen_roi    = QPen(QColor(255, 165, 0), 3)
+        pen_cross  = QPen(QColor(255, 0, 0), 1)
+        pen_hover  = QPen(QColor(255, 255, 0), 2)
 
         for i in range(nrows):
             for j in range(ncols):
@@ -219,11 +212,11 @@ class XrayMarkerSelectionWidget(QWidget):
     # ---------------- Qt mouse interaction ----------------
 
     def mousePressEvent(self, event):
-        if self._locked:
-            return
-
         if self._circles_grid is None or self._prepared is None:
             return
+
+        if self._locked:
+            return  # no interaction after confirmation
 
         xw = int(event.position().x())
         yw = int(event.position().y())

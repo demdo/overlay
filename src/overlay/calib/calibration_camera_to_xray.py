@@ -17,7 +17,6 @@ from typing import Iterable
 import cv2
 import numpy as np
 
-#from overlay.tools import checkerboard_corner_detection as cbd
 from overlay.tools import ransac_plane_fitting as rpf
 
 
@@ -25,9 +24,19 @@ from overlay.tools import ransac_plane_fitting as rpf
 class PnPResult:
     rvec: np.ndarray
     tvec: np.ndarray
-    rotation: np.ndarray
-    translation: np.ndarray
-    inliers: np.ndarray | None
+    rotation: np.ndarray          # (3,3)
+    translation: np.ndarray       # (3,1)
+
+    T_3x4: np.ndarray             # (3,4) [R|t]
+
+    inliers: np.ndarray | None    # (M,1) OpenCV-style OR None
+    inlier_idx: np.ndarray        # (M,) or (N,) fallback if no inliers
+
+    uv_proj: np.ndarray           # (N,2) projected points in X-ray
+    reproj_errors_px: np.ndarray  # (N,)
+    reproj_mean_px: float
+    reproj_median_px: float
+    reproj_max_px: float
     
     
 def _intersect_corners_with_plane(
@@ -97,9 +106,14 @@ def _solve_xray_pnp(
     xray_intrinsics: np.ndarray,
     dist_coeffs: np.ndarray | None = None,
     use_ransac: bool = True,
+    *,
+    ransac_reproj_error_px: float = 3.0,
+    ransac_confidence: float = 0.99,
+    ransac_iterations: int = 5000,
 ) -> PnPResult:
     """
     Solve the PnP alignment between camera-frame 3D points and X-ray 2D detections.
+    Returns pose + reprojection diagnostics.
     """
     points_xyz_camera = np.asarray(points_xyz_camera, dtype=np.float64)
     points_uv_xray = np.asarray(points_uv_xray, dtype=np.float64)
@@ -115,7 +129,8 @@ def _solve_xray_pnp(
     Kx = np.asarray(xray_intrinsics, dtype=np.float64)
     if Kx.shape != (3, 3):
         raise ValueError("xray_intrinsics must be a 3x3 matrix.")
-    dist = np.zeros((5, 1), dtype=np.float64) if dist_coeffs is None else dist_coeffs
+
+    dist = np.zeros((5, 1), dtype=np.float64) if dist_coeffs is None else np.asarray(dist_coeffs, dtype=np.float64)
 
     if use_ransac:
         success, rvec, tvec, inliers = cv2.solvePnPRansac(
@@ -124,6 +139,9 @@ def _solve_xray_pnp(
             Kx,
             dist,
             flags=cv2.SOLVEPNP_ITERATIVE,
+            reprojectionError=ransac_reproj_error_px,
+            confidence=ransac_confidence,
+            iterationsCount=ransac_iterations,
         )
     else:
         success, rvec, tvec = cv2.solvePnP(
@@ -140,13 +158,40 @@ def _solve_xray_pnp(
 
     rotation, _ = cv2.Rodrigues(rvec)
     translation = tvec.reshape(3, 1)
+    T_3x4 = np.hstack([rotation, translation])
+
+    # Reproject points
+    proj, _ = cv2.projectPoints(points_xyz_camera, rvec, tvec, Kx, dist)
+    uv_proj = proj.reshape(-1, 2)
+
+    uv_meas = points_uv_xray.reshape(-1, 2)
+    reproj_errors = np.linalg.norm(uv_meas - uv_proj, axis=1)
+
+    if inliers is None or len(inliers) == 0:
+        inlier_idx = np.arange(len(uv_meas), dtype=np.int64)
+    else:
+        inlier_idx = inliers.reshape(-1).astype(np.int64)
+
+    inlier_errs = reproj_errors[inlier_idx]
+    reproj_mean = float(np.mean(inlier_errs))
+    reproj_median = float(np.median(inlier_errs))
+    reproj_max = float(np.max(inlier_errs))
+
     return PnPResult(
         rvec=rvec,
         tvec=tvec,
         rotation=rotation,
         translation=translation,
+        T_3x4=T_3x4,
         inliers=None if inliers is None else np.asarray(inliers, dtype=np.int64),
+        inlier_idx=inlier_idx,
+        uv_proj=uv_proj,
+        reproj_errors_px=reproj_errors,
+        reproj_mean_px=reproj_mean,
+        reproj_median_px=reproj_median,
+        reproj_max_px=reproj_max,
     )
+
     
 
 def calibrate_camera_to_xray(

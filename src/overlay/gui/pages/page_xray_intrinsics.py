@@ -25,9 +25,6 @@ class XrayIntrinsicsPage(QWidget):
         root = QVBoxLayout(self)
         root.setSpacing(12)
 
-        self.title = QLabel("Step 2 — Load X-ray intrinsics")
-        root.addWidget(self.title)
-
         self.stack = QStackedWidget()
         root.addWidget(self.stack, stretch=1)
 

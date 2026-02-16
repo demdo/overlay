@@ -8,10 +8,11 @@ from PySide6.QtWidgets import (
 )
 
 from overlay.gui.state import SessionState
-from overlay.gui.pages.page_rgb_intrinsics import RgbIntrinsicsPage
 from overlay.gui.pages.page_xray_intrinsics import XrayIntrinsicsPage
+from overlay.gui.pages.page_camera_calibration import CameraCalibrationPage
 from overlay.gui.pages.page_xray_marker_selection import XrayMarkerSelectionPage
 from overlay.gui.pages.page_plane_fitting import PlaneFittingPage
+from overlay.gui.pages.page_camera_to_xray_calibration import CameraToXrayCalibrationPage
 
 
 QSS = """
@@ -84,7 +85,15 @@ class MainWindow(QMainWindow):
         self.resize(1200, 700)
 
         self.state = SessionState()
-        self.current_step = 0  # 0=RGB, 1=X-ray, 2=Markers, 3=Plane
+        self.state.steps_per_edge = 10   # TODO: an dein Marker-Grid anpassen
+
+        # NEW ORDER:
+        # 0 = X-ray intrinsics
+        # 1 = Camera Calibration
+        # 2 = Plane fitting
+        # 3 = X-ray marker selection
+        # 4 = Camera to X-ray Calibration
+        self.current_step = 0
 
         root = QWidget()
         root_layout = QHBoxLayout(root)
@@ -114,14 +123,17 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.step_list, stretch=1)
 
         # Steps (store items so we can update labels)
-        self.item_rgb = QListWidgetItem("1) Load RGB intrinsics")
-        self.item_xray = QListWidgetItem("2) Load X-ray intrinsics")
-        self.item_markers = QListWidgetItem("3) X-ray marker selection")
-        self.item_plane = QListWidgetItem("4) Plane fitting")
-        self.step_list.addItem(self.item_rgb)
+        self.item_xray = QListWidgetItem("1) Load X-ray intrinsics")
+        self.item_rgb = QListWidgetItem("2) Camera Calibration")
+        self.item_plane = QListWidgetItem("3) Plane fitting")
+        self.item_markers = QListWidgetItem("4) X-ray marker selection")
+        self.item_cam2xray = QListWidgetItem("5) Camera → X-ray (PnP)")
+        
         self.step_list.addItem(self.item_xray)
-        self.step_list.addItem(self.item_markers)
+        self.step_list.addItem(self.item_rgb)
         self.step_list.addItem(self.item_plane)
+        self.step_list.addItem(self.item_markers)
+        self.step_list.addItem(self.item_cam2xray)
 
         # Optional placeholder button (disabled)
         settings_btn = QPushButton("Settings")
@@ -143,15 +155,17 @@ class MainWindow(QMainWindow):
         self.pages = QStackedWidget()
         content_layout.addWidget(self.pages, stretch=1)
 
-        self.page_rgb = RgbIntrinsicsPage(self.state, self.on_complete_changed)
         self.page_xray = XrayIntrinsicsPage(self.state, self.on_complete_changed)
+        self.page_cam_calib = CameraCalibrationPage(self.state, self.on_complete_changed)
+        self.page_plane = PlaneFittingPage(self.state, self.on_complete_changed)
         self.page_markers = XrayMarkerSelectionPage(self.state, self.on_complete_changed)
-        self.page_plane = PlaneFittingPage(self.state, self.on_complete_changed)  # NEW
+        self.page_cam2xray = CameraToXrayCalibrationPage(self.state, self.on_complete_changed)
 
-        self.pages.addWidget(self.page_rgb)      # index 0
-        self.pages.addWidget(self.page_xray)     # index 1
-        self.pages.addWidget(self.page_markers)  # index 2
-        self.pages.addWidget(self.page_plane)    # index 3
+        self.pages.addWidget(self.page_xray)            # index 0
+        self.pages.addWidget(self.page_cam_calib)       # index 1
+        self.pages.addWidget(self.page_plane)           # index 2
+        self.pages.addWidget(self.page_markers)         # index 3
+        self.pages.addWidget(self.page_cam2xray)        # index 4
 
         # Bottom navigation bar
         nav = QFrame()
@@ -168,10 +182,10 @@ class MainWindow(QMainWindow):
 
         self.btn_back.clicked.connect(self.go_back)
         self.btn_next.clicked.connect(self.go_next)
-        
+
         self.btn_back.setFocusPolicy(Qt.NoFocus)
         self.btn_next.setFocusPolicy(Qt.NoFocus)
-        
+
         self.btn_back.setAutoDefault(False)
         self.btn_back.setDefault(False)
         self.btn_next.setAutoDefault(False)
@@ -193,82 +207,126 @@ class MainWindow(QMainWindow):
     # -------- Wizard logic --------
 
     def step_complete(self, idx: int) -> bool:
-        if idx == 0:
-            return self.state.K_rgb is not None
-        if idx == 1:
+        if idx == 0:   # Step 1: X-ray intrinsics
             return self.state.K_xray is not None
-        if idx == 2:
-            # marker selection page sets xray_image
+        if idx == 1:   # Step 2: Camera Calibration
+            return self.state.K_rgb is not None
+        if idx == 2:   # Step 3: plane fitting
+            return (
+                getattr(self.state, "plane_model_c", None) is not None
+                and getattr(self.state, "plane_stats", None) is not None
+            )
+        if idx == 3:   # Step 4: marker selection (minimal gate)
             return self.state.xray_image is not None
-        if idx == 3:
-            # plane fitting page sets plane_model + stats (and pts3d)
-            return getattr(self.state, "plane_model_c", None) is not None and getattr(self.state, "plane_stats", None) is not None
+        if idx == 4:   # Step 5: Camera -> X-ray (PnP)
+            return getattr(self.state, "T_xray_from_cam_4x4", None) is not None
         return False
 
     def can_enter_step(self, idx: int) -> bool:
-        # Step 2 requires Step 1
-        if idx == 1 and not self.step_complete(0):
+        if idx == 1 and not self.step_complete(0):  # Step 2 requires Step 1
             return False
-        # Step 3 requires Step 2
-        if idx == 2 and not self.step_complete(1):
+        if idx == 2 and not self.step_complete(1):  # Step 3 requires Step 2
             return False
-        # Step 4 requires Step 3
-        if idx == 3 and not self.step_complete(2):
+        if idx == 3 and not self.step_complete(2):  # Step 4 requires Step 3
+            return False
+        if idx == 4 and not self.step_complete(3):  # Step 5 requires Step 4
             return False
         return True
 
     def on_complete_changed(self):
-        # Called by pages after successful load / reload
         self.update_ui()
 
     def update_ui(self):
-        # Enforce gating if current step becomes invalid
-        if not self.can_enter_step(self.current_step):
-            self.current_step = 0
-
-        # Show current page
-        self.pages.setCurrentIndex(self.current_step)
-
-        # Refresh pages so they show Load vs Summary correctly
-        self.page_rgb.refresh()
-        self.page_xray.refresh()
-        self.page_markers.refresh()
-        # Plane page may not have refresh() (safe call)
-        if hasattr(self.page_plane, "refresh"):
+        # ------------------------------------------------------------
+        # 1) Ensure pages exist / refresh current data
+        # ------------------------------------------------------------
+        # Refresh all pages (they should internally decide what to do if inputs missing)
+        if hasattr(self, "page_xray") and hasattr(self.page_xray, "refresh"):
+            self.page_xray.refresh()
+    
+        if hasattr(self, "page_rgb") and hasattr(self.page_rgb, "refresh"):
+            self.page_rgb.refresh()
+    
+        if hasattr(self, "page_plane") and hasattr(self.page_plane, "refresh"):
             self.page_plane.refresh()
+    
+        if hasattr(self, "page_markers") and hasattr(self.page_markers, "refresh"):
+            self.page_markers.refresh()
+    
+        if hasattr(self, "page_cam2xray") and hasattr(self.page_cam2xray, "refresh"):
+            self.page_cam2xray.refresh()
+    
+        # ------------------------------------------------------------
+        # 2) Update stacked widget to current step
+        # ------------------------------------------------------------
+        if hasattr(self, "pages"):
+            self.pages.setCurrentIndex(self.current_step)
+    
+        # ------------------------------------------------------------
+        # 3) Update sidebar item labels (✅ / ⬜ / 🔒)
+        # ------------------------------------------------------------
+        def _set_item_text(item, done: bool, locked: bool, base: str):
+            if item is None:
+                return
+            prefix = "✅ " if done else ("🔒 " if locked else "⬜ ")
+            item.setText(prefix + base)
+    
+        # Determine completion status
+        xray_done = self.step_complete(0)
+        rgb_done = self.step_complete(1)
+        plane_done = self.step_complete(2)
+        markers_done = self.step_complete(3)
+        cam2xray_done = self.step_complete(4)
+    
+        # Determine locking status (locked if cannot enter AND not already done)
+        xray_locked = (not self.can_enter_step(0)) and (not xray_done)
+        rgb_locked = (not self.can_enter_step(1)) and (not rgb_done)
+        plane_locked = (not self.can_enter_step(2)) and (not plane_done)
+        markers_locked = (not self.can_enter_step(3)) and (not markers_done)
+        cam2xray_locked = (not self.can_enter_step(4)) and (not cam2xray_done)
+    
+        _set_item_text(self.item_xray, xray_done, xray_locked, "1) Load X-ray intrinsics")
+        _set_item_text(self.item_rgb, rgb_done, rgb_locked, "2) Camera Calibration")
+        _set_item_text(self.item_plane, plane_done, plane_locked, "3) Plane fitting")
+        _set_item_text(self.item_markers, markers_done, markers_locked, "4) X-ray marker selection")
+        _set_item_text(self.item_cam2xray, cam2xray_done, cam2xray_locked, "5) Camera → X-ray (PnP)")
+    
+        # Keep sidebar selection synced (without re-triggering signals too aggressively)
+        if hasattr(self, "step_list"):
+            if self.step_list.currentRow() != self.current_step:
+                self.step_list.blockSignals(True)
+                self.step_list.setCurrentRow(self.current_step)
+                self.step_list.blockSignals(False)
+    
+        # ------------------------------------------------------------
+        # 4) Prev/Next button enabled state
+        # ------------------------------------------------------------
+        # Prev enabled if not first step
+        if hasattr(self, "btn_prev"):
+            self.btn_prev.setEnabled(self.current_step > 0)
+    
+        # Next enabled if there is a next step AND current step is complete
+        if hasattr(self, "btn_next") and hasattr(self, "pages"):
+            last_idx = self.pages.count() - 1
+            if self.current_step < last_idx:
+                self.btn_next.setEnabled(self.step_complete(self.current_step))
+            else:
+                self.btn_next.setEnabled(False)
+    
+        # ------------------------------------------------------------
+        # 5) Optional: status label / title (if you have one)
+        # ------------------------------------------------------------
+        if hasattr(self, "lbl_step_title"):
+            titles = [
+                "Step 1 — Load X-ray intrinsics",
+                "Step 2 — Camera Calibration",
+                "Step 3 — Plane fitting",
+                "Step 4 — X-ray marker selection",
+                "Step 5 — Camera → X-ray (PnP)",
+            ]
+            if 0 <= self.current_step < len(titles):
+                self.lbl_step_title.setText(titles[self.current_step])
 
-        # Back enabled only if not first step
-        self.btn_back.setEnabled(self.current_step > 0)
-
-        # Next enabled only if current step complete AND next step (if any) is allowed
-        if self.current_step == 0:
-            self.btn_next.setEnabled(self.step_complete(0))
-        elif self.current_step == 1:
-            self.btn_next.setEnabled(self.step_complete(1))
-        elif self.current_step == 2:
-            self.btn_next.setEnabled(self.step_complete(2))
-        elif self.current_step == 3:
-            self.btn_next.setEnabled(False)
-        else:
-            self.btn_next.setEnabled(False)
-
-        # Sidebar: highlight current step
-        self.step_list.setCurrentRow(self.current_step)
-
-        # Sidebar: show done/locked via text
-        rgb_done = self.step_complete(0)
-        xray_done = self.step_complete(1)
-        markers_done = self.step_complete(2)
-        plane_done = self.step_complete(3)
-
-        xray_locked = not self.can_enter_step(1)
-        markers_locked = not self.can_enter_step(2) and not markers_done
-        plane_locked = not self.can_enter_step(3) and not plane_done
-
-        self.item_rgb.setText(("✅ " if rgb_done else "⬜ ") + "1) Load RGB intrinsics")
-        self.item_xray.setText(("🔒 " if xray_locked else ("✅ " if xray_done else "⬜ ")) + "2) Load X-ray intrinsics")
-        self.item_markers.setText(("🔒 " if markers_locked else ("✅ " if markers_done else "⬜ ")) + "3) X-ray marker selection")
-        self.item_plane.setText(("🔒 " if plane_locked else ("✅ " if plane_done else "⬜ ")) + "4) Plane fitting")
 
     def go_next(self):
         if not self.step_complete(self.current_step):

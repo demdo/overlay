@@ -27,6 +27,21 @@ class SessionState:
     plane_model_c: Optional[np.ndarray] = None                 # (4,) [a,b,c,d]
     plane_stats: Optional[Dict[str, float]] = None             # keys: n_inliers, mean, median, p95 (units as you choose)
     plane_redo_seed: int = 0 
+    
+    steps_per_edge: Optional[int] = None
+    xray_points_xyz_c: Optional[np.ndarray] = None   # (N,3) 3D points in camera frame matching xray_points_uv
+    T_xray_from_cam_3x4: Optional[np.ndarray] = None
+    T_xray_from_cam_4x4: Optional[np.ndarray] = None
+    pnp_n_points: Optional[int] = None
+    pnp_inliers_idx: Optional[np.ndarray] = None
+    pnp_n_inliers: Optional[int] = None
+    pnp_reproj_errors_px: Optional[np.ndarray] = None
+    pnp_reproj_mean_px: Optional[float] = None
+    pnp_reproj_median_px: Optional[float] = None
+    pnp_reproj_max_px: Optional[float] = None
+    pnp_uv_measured: Optional[np.ndarray] = None
+    pnp_uv_projected: Optional[np.ndarray] = None
+    pnp_debug_bgr: Optional[np.ndarray] = None
 
     @property
     def has_rgb_intrinsics(self) -> bool:
