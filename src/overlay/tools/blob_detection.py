@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 from dataclasses import dataclass
-from typing import Optional
+from typing import Union, Sequence, Optional
 
 
 @dataclass(frozen=True)
@@ -36,7 +36,7 @@ class HoughCircleParams:
     param1: float = 120
     param2: float = 8
     invert: bool = True
-    median_ks: int = 5
+    median_ks: Union[int, Sequence[int]] = (3, 5)
     
 
 def _validate_params(params: HoughCircleParams) -> None:
@@ -50,8 +50,13 @@ def _validate_params(params: HoughCircleParams) -> None:
         raise ValueError("min_radius must be <= max_radius.")
     if params.param1 <= 0 or params.param2 <= 0:
         raise ValueError("param1 and param2 must be > 0.")
-    if params.median_ks < 0:
-        raise ValueError("median_ks must be >= 0.")
+    if isinstance(params.median_ks, (list, tuple)):
+        for ks in params.median_ks:
+            if ks < 0:
+                raise ValueError("All median_ks values must be >= 0.")
+    else:
+        if params.median_ks < 0:
+            raise ValueError("median_ks must be >= 0.")
 
 
 def detect_blobs_hough(
@@ -85,6 +90,7 @@ def detect_blobs_hough(
     ValueError
         If the input image is not a single-channel uint8 array or params are invalid.
     """
+
     if image.size == 0:
         return None
     if image.ndim != 2:
@@ -101,22 +107,54 @@ def detect_blobs_hough(
     if params.invert:
         img = 255 - img
 
-    if params.median_ks and params.median_ks > 1:
-        k = params.median_ks if params.median_ks % 2 == 1 else params.median_ks + 1
-        img = cv2.medianBlur(img, k)
+    # allow int or iterable for median_ks
+    if isinstance(params.median_ks, (list, tuple)):
+        ks_values = list(params.median_ks)
+    else:
+        ks_values = [params.median_ks]
 
-    circles = cv2.HoughCircles(
-        img,
-        cv2.HOUGH_GRADIENT,
-        dp=params.dp,
-        minDist=params.minDist,
-        param1=params.param1,
-        param2=params.param2,
-        minRadius=params.min_radius,
-        maxRadius=params.max_radius,
-    )
+    all_circles = []
 
-    if circles is None:
+    for ks in ks_values:
+        img_run = img
+
+        if ks and ks > 1:
+            k = ks if ks % 2 == 1 else ks + 1
+            img_run = cv2.medianBlur(img_run, k)
+
+        circles = cv2.HoughCircles(
+            img_run,
+            cv2.HOUGH_GRADIENT,
+            dp=params.dp,
+            minDist=params.minDist,
+            param1=params.param1,
+            param2=params.param2,
+            minRadius=params.min_radius,
+            maxRadius=params.max_radius,
+        )
+
+        if circles is not None:
+            all_circles.append(circles[0].astype(np.float32))
+
+    if not all_circles:
         return None
 
-    return circles[0].astype(np.float32)
+    circles = np.vstack(all_circles)
+
+    # merge near-duplicate detections
+    r_med = float(np.median(circles[:, 2]))
+    dist_thr = 0.6 * r_med
+
+    kept = []
+    for c in circles:
+        x, y, r = c
+        is_new = True
+        for k in kept:
+            if np.hypot(x - k[0], y - k[1]) < dist_thr:
+                is_new = False
+                break
+        if is_new:
+            kept.append(c.copy())
+
+    return np.asarray(kept, dtype=np.float32)
+

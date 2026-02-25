@@ -2,76 +2,55 @@
 
 from __future__ import annotations
 
-import os
 import cv2
 import numpy as np
+import pydicom
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFileDialog, QMessageBox, QGroupBox, QGridLayout, QSizePolicy
+    QPushButton, QFileDialog, QMessageBox, QSizePolicy
 )
 
 from overlay.gui.state import SessionState
+from overlay.gui.pages.templates.templ_static_image import StaticImagePage
 from overlay.gui.widgets.widget_xray_marker_selection import XrayMarkerSelectionWidget
 
-from overlay.tools.xray_marker_selection import detector_mask_radial, sort_circles_grid
+from overlay.tools.xray_marker_selection import (
+    detector_mask,
+    sort_circles_grid,
+    select_marker_roi_from_grid,
+)
 from overlay.tools.blob_detection import HoughCircleParams, detect_blobs_hough
 
 
-class XrayMarkerSelectionPage(QWidget):
+class XrayMarkerSelectionPage(StaticImagePage):
     """
     Step — X-ray marker selection
 
-    Goals:
-      - Control bar RIGHT aligned like other pages
-      - X-ray image size "like before": nice 960×540 workspace (max), NEVER clipped
-      - Before loading: white workspace (no instructions)
-      - NO logic changes (only layout + robust refresh gating)
+    GUI wrapper around the same logic as example_xray_marker_selection.py
+    (no algorithmic differences vs the example).
     """
 
-    # "nice size like before"
-    MAX_W = 960
-    MAX_H = 540
+    def __init__(self, state: SessionState, on_complete_changed, parent=None):
+        super().__init__(parent)
 
-    RIGHT_W = 260
-    MARGIN = 20
-    SPACING = 20
-
-    def __init__(self, state: SessionState, on_complete_changed):
-        super().__init__()
         self.state = state
         self.on_complete_changed = on_complete_changed
 
         # ======================================================
-        # LEFT: marker selection widget (key sizing behavior)
+        # LEFT: replace template image_label with interactive widget
         # ======================================================
-        self.marker_widget = XrayMarkerSelectionWidget()
+        self.marker_widget = XrayMarkerSelectionWidget(self.image_label)
         self.marker_widget.selection_proposed.connect(self.on_selection_proposed)
+        self.marker_widget.selection_changed.connect(self._on_selection_changed)
 
-        # IMPORTANT FIX:
-        # - allow shrinking -> prevents clipping
-        # - cap growth -> keeps the "nice" size
-        self.marker_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.marker_widget.setMaximumSize(self.MAX_W, self.MAX_H)
-        self.marker_widget.resize(self.MAX_W, self.MAX_H)
-
-        # white before image
-        self.marker_widget.setStyleSheet("background-color: white; border-radius: 10px;")
-
-        left_container = QWidget()
-        left_layout = QVBoxLayout(left_container)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(0)
-
-        # anchor top-left
-        left_layout.addWidget(self.marker_widget, 0, Qt.AlignLeft | Qt.AlignTop)
-        left_layout.addStretch(1)
+        # Fill the template viewport
+        self.marker_widget.setGeometry(0, 0, self.image_label.width(), self.image_label.height())
+        self.marker_widget.show()
 
         # ======================================================
-        # RIGHT: control bar (same geometry as other pages)
+        # RIGHT: controls
         # ======================================================
-        self.btn_load = QPushButton("Load different X-ray image…")
+        self.btn_load = QPushButton("Load X-ray Image")
         self.btn_load.clicked.connect(self.load_xray_image)
 
         self.btn_detect = QPushButton("Detect markers")
@@ -82,55 +61,29 @@ class XrayMarkerSelectionPage(QWidget):
 
         for b in (self.btn_load, self.btn_detect, self.btn_reset):
             b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
-        controls = QGroupBox("Controls")
-        g = QGridLayout(controls)
-        g.setContentsMargins(8, 8, 8, 8)
-        g.setSpacing(8)
-        g.addWidget(self.btn_load, 0, 0, 1, 2)
-        g.addWidget(self.btn_detect, 1, 0)
-        g.addWidget(self.btn_reset, 1, 1)
-        g.setColumnStretch(0, 1)
-        g.setColumnStretch(1, 1)
-
-        self.path_label = QLabel("")
-        self.path_label.setWordWrap(True)
-        self.path_label.setStyleSheet("color: #6c757d;")
-
-        self.status_label = QLabel("")
-        self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("color: #6c757d;")
-
-        status_box = QGroupBox("Status")
-        sv = QVBoxLayout(status_box)
-        sv.setContentsMargins(8, 8, 8, 8)
-        sv.setSpacing(8)
-        sv.addWidget(self.path_label)
-        sv.addWidget(self.status_label)
-
-        right_layout = QVBoxLayout()
-        right_layout.setAlignment(Qt.AlignTop)
-        right_layout.setSpacing(12)
-        right_layout.addWidget(controls)
-        right_layout.addWidget(status_box)
-        right_layout.addStretch(1)
-
-        right_panel = QWidget()
-        right_panel.setLayout(right_layout)
-        right_panel.setFixedWidth(self.RIGHT_W)
-        right_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+            self.controls_content.addWidget(b)
 
         # ======================================================
-        # MAIN LAYOUT (matches others)
+        # Instructions under image (template)
         # ======================================================
-        main = QHBoxLayout(self)
-        main.setContentsMargins(self.MARGIN, self.MARGIN, self.MARGIN, self.MARGIN)
-        main.setSpacing(self.SPACING)
+        self.instructions_label.setText(
+            "1) Load an X-ray image\n"
+            "2) Click 'Detect markers'\n"
+            "3) Select 3 anchor markers (LMB select, RMB undo, ESC cancel)\n"
+            "4) Confirm selection"
+        )
 
-        # left stretch=1 ensures control bar aligns like other pages
-        main.addWidget(left_container, 1)
-        main.addWidget(right_panel, 0)
+        self.refresh()
 
+    # ------------------------------------------------------------------
+    # Keep marker widget in sync with template viewport size
+    # ------------------------------------------------------------------
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.marker_widget.setGeometry(0, 0, self.image_label.width(), self.image_label.height())
+
+    def _on_selection_changed(self):
         self.refresh()
 
     # ---------------- Completion ----------------
@@ -143,75 +96,108 @@ class XrayMarkerSelectionPage(QWidget):
     def refresh(self):
         img = getattr(self.state, "xray_image", None)
 
+        # --------------------------------------------------
+        # Case 1: no image loaded yet
+        # --------------------------------------------------
         if img is None:
-            # White empty workspace
             self.marker_widget.set_image(None)
             self.marker_widget.set_grid(None)
             self.marker_widget.set_locked(False)
 
-            self.path_label.setText("")
-            self.status_label.setText("")
+            self.set_stats_rows([
+                ("Blobs detected", "-"),
+                ("Blobs selected", "-"),
+            ])
 
+            self.btn_load.setEnabled(True)
             self.btn_detect.setEnabled(False)
             self.btn_reset.setEnabled(False)
             return
 
-        # Show image
+        # --------------------------------------------------
+        # Case 2: image loaded
+        # --------------------------------------------------
         self.marker_widget.set_image(img)
 
         circles_grid = getattr(self.state, "circles_grid", None)
         pick_r = getattr(self.state, "pick_radius_px", None)
+
         if circles_grid is not None and pick_r is not None:
             self.marker_widget.set_grid(circles_grid, float(pick_r))
         else:
             self.marker_widget.set_grid(None)
 
-        # Status
-        self.path_label.setText(os.path.basename(getattr(self.state, "xray_image_path", "") or ""))
-
         confirmed = bool(getattr(self.state, "xray_points_confirmed", False))
-        if confirmed:
-            n = 0 if getattr(self.state, "xray_points_uv", None) is None else len(self.state.xray_points_uv)
-            self.status_label.setText(f"Markers confirmed. {n} ROI markers selected. Ready.")
-            self.btn_detect.setEnabled(False)
-            self.btn_reset.setEnabled(False)
-            self.marker_widget.set_locked(True)
+
+        # Load: never again once an image is loaded
+        self.btn_load.setEnabled(False)
+
+        # Detect: only once, only after image load, only if not detected yet
+        already_detected = circles_grid is not None
+        self.btn_detect.setEnabled(not already_detected)
+
+        # Reset: only if at least 1 anchor marker selected
+        selected_cells = self.marker_widget.get_selected_cells()
+        self.btn_reset.setEnabled(len(selected_cells) > 0)
+
+        # Lock interaction after confirmation
+        self.marker_widget.set_locked(confirmed)
+
+        # Stats
+        if circles_grid is None:
+            detected_txt = "-"
+            selected_txt = "- / 3"
         else:
-            if circles_grid is None:
-                self.status_label.setText("Image loaded. Click 'Detect markers'.")
-                self.btn_detect.setEnabled(True)
-                self.btn_reset.setEnabled(False)
-            else:
-                self.status_label.setText("Select 3 anchor markers (Left=select, Right=undo).")
-                self.btn_detect.setEnabled(True)
-                self.btn_reset.setEnabled(True)
-            self.marker_widget.set_locked(False)
+            n_detected = int(np.isfinite(circles_grid[..., 0]).sum())
+            n_selected = len(selected_cells)
+            detected_txt = str(n_detected)
+            selected_txt = f"{n_selected} / 3"
+
+        self.set_stats_rows([
+            ("Blobs detected", detected_txt),
+            ("Blobs selected", selected_txt),
+        ])
 
     # ---------------- Image loading ----------------
 
     def load_xray_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select X-ray image",
-            "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All Files (*)"
-        )
+        dlg = QFileDialog(self.window(), "Select X-ray image")  # parent = top-level window
+        dlg.setFileMode(QFileDialog.ExistingFile)
+        dlg.setNameFilter("Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.dcm *.ima);;All Files (*)")
+
+        # critical for your symptom on Windows: avoid native dialog hang
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+
+        if dlg.exec() != QFileDialog.Accepted:
+            return
+
+        files = dlg.selectedFiles()
+        path = files[0] if files else ""
         if not path:
             return
 
         try:
-            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if path.lower().endswith((".dcm", ".ima")):
+                ds = pydicom.dcmread(path)
+                img = ds.pixel_array.astype(np.float32)
+                img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+                img = img.astype(np.uint8)
+            else:
+                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+
             if img is None:
                 raise ValueError("Could not read image.")
 
             self.state.xray_image = img
             self.state.xray_image_path = path
 
-            # reset dependent states (unchanged)
+            # reset dependent states
             self.state.circles_grid = None
             self.state.pick_radius_px = None
             self.state.xray_points_uv = None
             self.state.xray_points_confirmed = False
+            self.state.xray_marker_overlay_bgr = None
+            self.state.marker_radius_px = None
 
             self.marker_widget.clear_selection()
             self.marker_widget.set_locked(False)
@@ -232,26 +218,19 @@ class XrayMarkerSelectionPage(QWidget):
             img = self.state.xray_image
 
             params = HoughCircleParams(
-                min_radius=3,
+                min_radius=2,
                 max_radius=7,
                 dp=1.2,
-                minDist=26,
+                minDist=16,
                 param1=120,
-                param2=8,
+                param2=12,
                 invert=True,
-                median_ks=5,
+                median_ks=(3, 5),
             )
 
             use_clahe = True
             clahe_clip = 2.0
             clahe_tiles = (12, 12)
-
-            n_angles = 360
-            smooth_sigma = 2.0
-            r_min_frac = 0.20
-            r_max_frac = 0.98
-            shrink_px = 12
-
             row_tol_px = 13.0
 
             img_proc = img.copy()
@@ -259,16 +238,7 @@ class XrayMarkerSelectionPage(QWidget):
                 clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=clahe_tiles)
                 img_proc = clahe.apply(img_proc)
 
-            mask, _ = detector_mask_radial(
-                img_proc,
-                n_angles=n_angles,
-                r_min_frac=r_min_frac,
-                r_max_frac=r_max_frac,
-                smooth_sigma=smooth_sigma,
-                peak_prominence=0.0,
-                shrink_px=shrink_px,
-            )
-
+            mask = detector_mask(img_proc)
             img_masked = img_proc.copy()
             img_masked[mask == 0] = 0
 
@@ -279,8 +249,8 @@ class XrayMarkerSelectionPage(QWidget):
 
             circles_out = np.asarray(circles_out, dtype=np.float32)
             circles_sorted = sort_circles_grid(circles_out, row_tol_px=row_tol_px)
-            if circles_sorted is None or len(circles_sorted) < 10:
-                QMessageBox.warning(self, "Marker detection", "Too few circles after sorting.")
+            if circles_sorted is None or len(circles_sorted) == 0:
+                QMessageBox.warning(self, "Marker detection", "No circles after sorting.")
                 return
 
             r_med = float(np.median(circles_sorted[:, 2]))
@@ -294,18 +264,20 @@ class XrayMarkerSelectionPage(QWidget):
             for k in range(1, len(c)):
                 pt = c[k]
                 if abs(float(pt[1]) - y_ref) > y_thresh_px:
-                    rows.append(current[np.argsort(current[:, 0])])
+                    sort_idx = np.argsort(current[:, 0])
+                    rows.append(current[sort_idx])
                     current = pt.reshape(1, -1)
                     y_ref = float(pt[1])
                 else:
                     current = np.vstack([current, pt])
                     y_ref = float(np.mean(current[:, 1]))
 
-            rows.append(current[np.argsort(current[:, 0])])
-
+            sort_idx = np.argsort(current[:, 0])
+            rows.append(current[sort_idx])
             nrows = len(rows)
+
             center_row_idx = int(np.argmax([len(row) for row in rows]))
-            ncols = int(len(rows[center_row_idx]))
+            ncols = len(rows[center_row_idx])
 
             circles_grid = np.full((nrows, ncols, 3), np.nan, dtype=np.float32)
             for i, row in enumerate(rows):
@@ -317,14 +289,26 @@ class XrayMarkerSelectionPage(QWidget):
 
             radii = circles_grid[..., 2]
             finite_r = radii[np.isfinite(radii)]
-            pick_radius_px = 0.6 * float(np.median(finite_r)) if finite_r.size else 20.0
-
+            
+            # NEW: store true/visual radius (median of detected radii)
+            if finite_r.size:
+                self.state.marker_radius_px = float(np.median(finite_r))
+            else:
+                self.state.marker_radius_px = None
+            
+            # keep your existing pick radius logic (interaction radius)
+            if self.state.marker_radius_px is not None:
+                pick_radius_px = 0.6 * float(self.state.marker_radius_px)
+            else:
+                pick_radius_px = 20.0
+            
             self.state.circles_grid = circles_grid
             self.state.pick_radius_px = float(pick_radius_px)
 
-            # reset selection/confirmation (unchanged)
+            # reset selection/confirmation + cached overlay
             self.state.xray_points_uv = None
             self.state.xray_points_confirmed = False
+            self.state.xray_marker_overlay_bgr = None
 
             self.marker_widget.clear_selection()
             self.marker_widget.set_locked(False)
@@ -352,34 +336,48 @@ class XrayMarkerSelectionPage(QWidget):
         if ans != QMessageBox.Yes:
             self.state.xray_points_uv = None
             self.state.xray_points_confirmed = False
+            self.state.xray_marker_overlay_bgr = None  # keep consistent
             self.marker_widget.clear_selection()
             self.marker_widget.set_locked(False)
             self.refresh()
             self.on_complete_changed()
             return
 
-        rs = [c[0] for c in cells]
-        cs = [c[1] for c in cells]
-        r0, r1 = min(rs), max(rs)
-        c0, c1 = min(cs), max(cs)
+        grid = getattr(self.state, "circles_grid", None)
+        if grid is None:
+            return
 
-        grid = self.state.circles_grid
-        roi_cells = []
-        roi_uv = []
-
-        for rr in range(r0, r1 + 1):
-            for cc in range(c0, c1 + 1):
-                x, y, _ = grid[rr, cc]
-                if not np.isfinite(x):
-                    continue
-                roi_cells.append((rr, cc))
-                roi_uv.append((float(x), float(y)))
-
-        self.state.xray_points_uv = np.asarray(roi_uv, dtype=float)
+        xy, roi_cells_set = select_marker_roi_from_grid(
+            circles_grid=grid,
+            selected_cells=cells,
+        )
+        
+        # xray_points_uv:
+        #   Shape: (N, 2)
+        #   Format: [u, v] pixel coordinates in the ORIGINAL X-ray image
+        #   Coordinate system:
+        #       - origin: top-left
+        #       - u: x-direction (right)
+        #       - v: y-direction (down)
+        #   Units: pixels
+        #   Distortion: NOT undistorted
+        #
+        #   Ordering:
+        #       - Stored row-wise (row-major order)
+        #       - Within each row: left → right
+        #       - Rows: top → bottom
+        #       - Matches the ordering of objectPoints for PnP
+        #
+        #   Intended use:
+        #       cv2.solvePnP(objectPoints, imagePoints, K_x, distCoeffs)
+        self.state.xray_points_uv = np.asarray(xy, dtype=float)
         self.state.xray_points_confirmed = True
 
-        self.marker_widget.set_roi_cells(roi_cells)
+        self.marker_widget.set_roi_cells(list(roi_cells_set))
         self.marker_widget.set_locked(True)
+
+        # Cache FULL-SIZE ROI overlay (green circles + red crosses, ROI only)
+        self.state.xray_marker_overlay_bgr = self._render_roi_overlay_bgr()
 
         self.refresh()
         self.on_complete_changed()
@@ -389,7 +387,52 @@ class XrayMarkerSelectionPage(QWidget):
     def on_reset_selection(self):
         self.state.xray_points_uv = None
         self.state.xray_points_confirmed = False
+        self.state.xray_marker_overlay_bgr = None
         self.marker_widget.clear_selection()
+        self.marker_widget.set_roi_cells([])
         self.marker_widget.set_locked(False)
         self.refresh()
         self.on_complete_changed()
+
+    # ---------------- Helpers ----------------
+
+    def _render_roi_overlay_bgr(self) -> np.ndarray | None:
+        """
+        Render full-size X-ray image with only ROI overlay:
+        - green circles
+        - red crosses
+        """
+        img = getattr(self.state, "xray_image", None)
+        uv = getattr(self.state, "xray_points_uv", None)
+
+        if img is None or uv is None or len(uv) == 0:
+            return None
+
+        if img.dtype != np.uint8:
+            img8 = np.clip(img, 0, 255).astype(np.uint8)
+        else:
+            img8 = img
+
+        out = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
+
+        pick_r = getattr(self.state, "pick_radius_px", None)
+        roi_r = 6.0 if pick_r is None else max(3.0, 0.35 * float(pick_r))
+
+        cross_r = int(round(0.6 * roi_r))
+
+        uv = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
+
+        for (u, v) in uv:
+            if not np.isfinite(u) or not np.isfinite(v):
+                continue
+
+            uu, vv = int(round(u)), int(round(v))
+
+            # Green ROI circle
+            cv2.circle(out, (uu, vv), int(round(roi_r)), (0, 255, 0), 2, cv2.LINE_AA)
+
+            # Red measured cross
+            cv2.line(out, (uu - cross_r, vv), (uu + cross_r, vv), (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.line(out, (uu, vv - cross_r), (uu, vv + cross_r), (0, 0, 255), 2, cv2.LINE_AA)
+
+        return out

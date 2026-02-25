@@ -17,8 +17,6 @@ from typing import Iterable
 import cv2
 import numpy as np
 
-from overlay.tools import ransac_plane_fitting as rpf
-
 
 @dataclass(frozen=True)
 class PnPResult:
@@ -27,7 +25,7 @@ class PnPResult:
     rotation: np.ndarray          # (3,3)
     translation: np.ndarray       # (3,1)
 
-    T_3x4: np.ndarray             # (3,4) [R|t]
+    T_4x4: np.ndarray             # (4,4) homogeneous transform
 
     inliers: np.ndarray | None    # (M,1) OpenCV-style OR None
     inlier_idx: np.ndarray        # (M,) or (N,) fallback if no inliers
@@ -38,67 +36,6 @@ class PnPResult:
     reproj_median_px: float
     reproj_max_px: float
     
-    
-def _intersect_corners_with_plane(
-    corners_uv: np.ndarray,
-    rgb_intrinsics: np.ndarray,
-    plane_model: np.ndarray,
-) -> np.ndarray:
-    """
-    Intersect pixel rays with the calibration plane to recover 3D corner positions.
-    
-    corners_uv: (3, 2) array [u, v] for top-left, top-right, bottom-left.
-    """
-    corners_uv = np.asarray(corners_uv, dtype=np.float64)
-    if corners_uv.shape != (3, 2):
-        raise ValueError("corners_uv must have shape (3, 2).")
-
-    K = np.asarray(rgb_intrinsics, dtype=np.float64)
-    if K.shape != (3, 3):
-        raise ValueError("rgb_intrinsics must be a 3x3 matrix.")
-    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-    a, b, c, d = [float(x) for x in plane_model]
-    
-    xyz = np.zeros((3, 3), dtype=np.float64)
-    for i, (u, v) in enumerate(corners_uv):
-        x = (u - cx) / fx
-        y = (v - cy) / fy
-        denom = a * x + b * y + c
-        if abs(denom) < 1e-12:
-            raise ValueError("Corner ray is parallel to the fitted plane.")
-        z = -d / denom
-        xyz[i] = np.array([x * z, y * z, z], dtype=np.float64)
-    return xyz
-
-
-def _interpolate_marker_grid(
-    corner_xyz: np.ndarray,
-    steps_per_edge: int,
-) -> np.ndarray:
-    """
-    Interpolate the marker grid from 3 corner points.
-    
-    corner_xyz: (3, 3) array [P_tl, P_tr, P_bl]
-    steps_per_edge: s, with alpha/beta in {0, 1, ..., s}
-    Returns points in row-major order with shape ((s+1)*(s+1), 3).
-    """
-    if steps_per_edge <= 0:
-        raise ValueError("steps_per_edge must be > 0.")
-
-    corner_xyz = np.asarray(corner_xyz, dtype=np.float64)
-    if corner_xyz.shape != (3, 3):
-        raise ValueError("corner_xyz must have shape (3, 3).")
-
-    p_tl, p_tr, p_bl = corner_xyz
-    step_x = (p_tr - p_tl) / float(steps_per_edge)
-    step_y = (p_bl - p_tl) / float(steps_per_edge)
-
-    points = []
-    for beta in range(steps_per_edge + 1):
-        for alpha in range(steps_per_edge + 1):
-            points.append(p_tl + alpha * step_x + beta * step_y)
-    return np.asarray(points, dtype=np.float64)
-
 
 def _solve_xray_pnp(
     points_xyz_camera: np.ndarray,
@@ -107,14 +44,68 @@ def _solve_xray_pnp(
     dist_coeffs: np.ndarray | None = None,
     use_ransac: bool = True,
     *,
-    ransac_reproj_error_px: float = 3.0,
+    ransac_reproj_error_px: float = 3.0,   # threshold
     ransac_confidence: float = 0.99,
     ransac_iterations: int = 5000,
 ) -> PnPResult:
     """
-    Solve the PnP alignment between camera-frame 3D points and X-ray 2D detections.
-    Returns pose + reprojection diagnostics.
+    Estimate the rigid pose (R, t) of the X-ray system relative to the camera
+    from 3D–2D correspondences using a perspective projection model.
+    
+    If use_ransac=True, a RANSAC-based PnP formulation is applied in order
+    to robustly reject outlier correspondences prior to computing the final
+    reprojection statistics.
+    
+    Parameters
+    ----------
+    ransac_reproj_error_px : float
+        Inlier threshold in pixels used by solvePnPRansac.
+        A correspondence is classified as an inlier if its reprojection error
+        (Euclidean distance between measured and projected image point)
+        is below this value.
+    
+        The threshold is defined in pixel units on the detector.
+    
+        For the ARCADIS Orbic system (23 cm detector field-of-view over
+        1024 px resolution), the detector scale is approximately:
+    
+            230 mm / 1024 px ≈ 0.225 mm/px   (at SOD = SID = 980 mm)
+    
+        However, the effective mm/px in the object plane depends on
+        geometric magnification:
+    
+            mm/px ≈ (230 mm / 1024 px) * (SOD / SID)
+    
+        Assuming a typical board position of
+            SOD ≈ 450 mm and SID ≈ 980 mm,
+    
+        this yields:
+    
+            mm/px ≈ 0.10 mm/px
+    
+        Consequently, a RANSAC threshold of 3 px corresponds to
+        approximately 0.3 mm in the board plane.
+    
+        Typical values in practice: 2–4 px.
+    
+    ransac_confidence : float
+        Desired probability that at least one randomly sampled minimal
+        subset is free of outliers. This parameter controls the statistical
+        robustness of RANSAC but does not directly influence pose accuracy.
+        Commonly set to 0.99.
+    
+    ransac_iterations : int
+        Maximum number of RANSAC iterations. Higher values increase the
+        probability of finding a valid inlier-only model when the outlier
+        ratio is high, at the cost of increased computation time.
+    
+    Returns
+    -------
+    PnPResult
+        Contains rotation, translation, homogeneous transform,
+        inlier indices, projected points, and reprojection error statistics.
     """
+
     points_xyz_camera = np.asarray(points_xyz_camera, dtype=np.float64)
     points_uv_xray = np.asarray(points_uv_xray, dtype=np.float64)
     if points_xyz_camera.ndim != 2 or points_xyz_camera.shape[1] != 3:
@@ -158,7 +149,10 @@ def _solve_xray_pnp(
 
     rotation, _ = cv2.Rodrigues(rvec)
     translation = tvec.reshape(3, 1)
-    T_3x4 = np.hstack([rotation, translation])
+    
+    T_4x4 = np.eye(4, dtype=np.float64)
+    T_4x4[:3, :3] = rotation
+    T_4x4[:3, 3:4] = translation
 
     # Reproject points
     proj, _ = cv2.projectPoints(points_xyz_camera, rvec, tvec, Kx, dist)
@@ -182,7 +176,7 @@ def _solve_xray_pnp(
         tvec=tvec,
         rotation=rotation,
         translation=translation,
-        T_3x4=T_3x4,
+        T_4x4=T_4x4,
         inliers=None if inliers is None else np.asarray(inliers, dtype=np.int64),
         inlier_idx=inlier_idx,
         uv_proj=uv_proj,
@@ -192,47 +186,11 @@ def _solve_xray_pnp(
         reproj_max_px=reproj_max,
     )
 
-    
 
-def calibrate_camera_to_xray(
-    points_xyz: np.ndarray,
-    corners_uv: np.ndarray,
-    rgb_intrinsics: np.ndarray,
-    xray_points_uv: np.ndarray,
-    xray_intrinsics: np.ndarray,
-    *,
-    plane_model: np.ndarray | None = None,
-    steps_per_edge: int | None = None,
-    dist_coeffs: np.ndarray | None = None,
-    use_ransac_pnp: bool = True,
-) -> tuple[PnPResult, np.ndarray, np.ndarray]:
-    """
-    End-to-end camera-to-X-ray calibration.
-    
-    Returns:
-        (pnp_result, corner_xyz, marker_xyz_camera)
-    """
-    if plane_model is None:
-        plane_model, _ = rpf.fit_plane_from_points(
-            points_xyz,
-            distance_threshold=0.005,
-            ransac_n=3,
-            num_iterations=1000,
-        )
-    
-    corner_xyz = _intersect_corners_with_plane(corners_uv, rgb_intrinsics, plane_model)
-
-    if steps_per_edge is None:
-        raise ValueError("steps_per_edge is required to build the marker grid.")
-    marker_xyz = _interpolate_marker_grid(corner_xyz, steps_per_edge=steps_per_edge)
-    
-    pnp = _solve_xray_pnp(
-        marker_xyz,
-        xray_points_uv,
-        xray_intrinsics,
-        dist_coeffs=dist_coeffs,
-        use_ransac=use_ransac_pnp,
-    )
-    return pnp, corner_xyz, marker_xyz
-
-    
+def invert_T(T: np.ndarray) -> np.ndarray:
+    R = T[:3, :3]
+    t = T[:3, 3:4]
+    Tinv = np.eye(4, dtype=T.dtype)
+    Tinv[:3, :3] = R.T
+    Tinv[:3, 3:4] = -R.T @ t
+    return Tinv

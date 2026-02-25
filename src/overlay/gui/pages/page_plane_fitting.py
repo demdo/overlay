@@ -1,556 +1,516 @@
+# overlay/gui/pages/page_plane_fitting.py
+
 from __future__ import annotations
+from typing import Any, Dict, Optional
 
 import numpy as np
 import cv2
 
-from PySide6.QtCore import Qt, QTimer, QSize
-from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import (
-    QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout,
-    QMessageBox, QGroupBox, QGridLayout, QSizePolicy
-)
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QPushButton, QMessageBox, QSizePolicy, QWidget, QCheckBox
 
 import pyrealsense2 as rs
 
 from overlay.gui.state import SessionState
+from overlay.gui.widgets.widget_flow_layout import FlowLayout
+
 from overlay.tools import checkerboard_corner_detection as cbd
 from overlay.tools import ransac_plane_fitting as rpf
+from overlay.gui.pages.templates.templ_live_image import LiveImagePage
 
 
-# ============================================================
-# Helpers
-# ============================================================
-
-def _bgr_to_qpixmap(img_bgr: np.ndarray) -> QPixmap:
-    if img_bgr is None:
-        return QPixmap()
-    if img_bgr.ndim == 2:
-        img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
-
-    img_bgr = np.ascontiguousarray(img_bgr)
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img_rgb = np.ascontiguousarray(img_rgb)
-
-    h, w = img_rgb.shape[:2]
-    qimg = QImage(img_rgb.data, w, h, img_rgb.strides[0], QImage.Format_RGB888)
-    return QPixmap.fromImage(qimg)
-
-
-def _draw_extremes(
-    img_bgr: np.ndarray,
-    extremes: dict[str, tuple[float, float]],
-    color=(208, 224, 64),
-    radius=10,
-    thickness=-1,
-) -> np.ndarray:
-    out = img_bgr.copy()
-    for name, (u, v) in extremes.items():
-        cv2.circle(out, (int(round(u)), int(round(v))), radius, color, thickness)
-        cv2.putText(
-            out,
-            name,
-            (int(round(u)) + 8, int(round(v)) - 6),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
+def _draw_extremes(img: np.ndarray, pts_uv: np.ndarray) -> np.ndarray:
+    out = img.copy()
+    for (u, v) in pts_uv:
+        cv2.circle(out, (int(round(u)), int(round(v))), 10, (208, 224, 64), -1)
     return out
 
 
-def _draw_axes_top_left(img_bgr: np.ndarray, origin_uv: tuple[int, int]) -> np.ndarray:
-    out = img_bgr.copy()
-    shaft = 70
-    thickness = 2
-    tip_length = 0.2
-
-    u0, v0 = origin_uv
-    x_end = (u0 + shaft, v0)
-    y_end = (u0, v0 + shaft)
-    z_end = (u0 + int(shaft * 0.7), v0 + int(shaft * 0.7))
-
-    cv2.arrowedLine(out, (u0, v0), x_end, (0, 0, 255), thickness, cv2.LINE_AA, tipLength=tip_length)
-    cv2.arrowedLine(out, (u0, v0), y_end, (0, 255, 0), thickness, cv2.LINE_AA, tipLength=tip_length)
-    cv2.arrowedLine(out, (u0, v0), z_end, (255, 0, 0), thickness, cv2.LINE_AA, tipLength=tip_length)
-    return out
-
-
-def _rect_from_extremes(extremes: dict[str, tuple[float, float]], img_w: int, img_h: int, pad_px: int):
-    pts = np.array(
-        [extremes["top_left"], extremes["top_right"], extremes["bottom_left"]],
-        dtype=np.float32
-    )
-    umin = int(np.floor(np.min(pts[:, 0]) - pad_px))
-    umax = int(np.ceil(np.max(pts[:, 0]) + pad_px))
-    vmin = int(np.floor(np.min(pts[:, 1]) - pad_px))
-    vmax = int(np.ceil(np.max(pts[:, 1]) + pad_px))
-
-    umin = max(0, min(img_w - 1, umin))
-    umax = max(0, min(img_w - 1, umax))
-    vmin = max(0, min(img_h - 1, vmin))
-    vmax = max(0, min(img_h - 1, vmax))
-
-    if umax < umin:
-        umin, umax = umax, umin
-    if vmax < vmin:
-        vmin, vmax = vmax, vmin
-
-    return (umin, vmin, umax, vmax)
-
-
-def _sample_points_3d_in_rect(
-    depth_frame_aligned,
-    rect,
-    max_points: int,
-    z_min: float,
-    z_max: float,
-    seed: int,
-) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    depth_intrin = depth_frame_aligned.profile.as_video_stream_profile().intrinsics
-
-    umin, vmin, umax, vmax = rect
-    roi_w = umax - umin + 1
-    roi_h = vmax - vmin + 1
-    if roi_w <= 2 or roi_h <= 2:
-        return np.empty((0, 3), dtype=np.float64)
-
-    num_pixels = roi_w * roi_h
-    sample_n = min(max_points, num_pixels)
-    idx = rng.choice(num_pixels, size=sample_n, replace=False)
-
-    us = (idx % roi_w).astype(np.int32) + umin
-    vs = (idx // roi_w).astype(np.int32) + vmin
-
-    pts3d = []
-    for u, v in zip(us, vs):
-        z = depth_frame_aligned.get_distance(int(u), int(v))
-        if z <= 0 or z < z_min or z > z_max:
-            continue
-        xyz = rs.rs2_deproject_pixel_to_point(depth_intrin, [float(u), float(v)], float(z))
-        pts3d.append(xyz)
-
-    if not pts3d:
-        return np.empty((0, 3), dtype=np.float64)
-
-    return np.asarray(pts3d, dtype=np.float64)
-
-
-def _compute_deviations(points: np.ndarray, plane_model: np.ndarray) -> np.ndarray:
-    normal = plane_model[:3]
-    norm = float(np.linalg.norm(normal))
-    if norm <= 1e-12:
-        return np.zeros(points.shape[0], dtype=np.float64)
-    return np.abs(points @ normal + plane_model[3]) / norm
-
-
-# ============================================================
-# Page
-# ============================================================
-
-class PlaneFittingPage(QWidget):
-    """
-    Step — Plane Fitting
-
-    Key behavior:
-    - Before Start: show nothing (transparent), but reserve the same workspace height/width
-    - Start: open camera and show live stream
-    - Space: capture only when FOUND
-    - No black bars: cover+crop
-    - No "square" look: the display area is forced to 16:9 (960x540)
-    """
-
-    # Display box is fixed 16:9 to avoid "square" crops
-    DISP_W = 960
-    DISP_H = 540
-
-    RIGHT_W = 260
-    MARGIN = 20
-    SPACING = 20
-
+class PlaneFittingPage(LiveImagePage):
     def __init__(self, state: SessionState, on_complete_changed=None, parent=None):
-        super().__init__(parent)
         self.state = state
         self.on_complete_changed = on_complete_changed
 
-        # ---------- params ----------
+        # detection
         self.pattern_size = (3, 3)
         self.det_width = 640
-        self.rect_pad_px = 15
 
+        # ROI & sampling
+        self.pad_px = 15
         self.max_points = 40000
         self.z_min, self.z_max = 0.15, 2.0
-
-        self.ransac_thresh_m = 0.005
-        self.ransac_n = 3
-        self.ransac_iters = 1000
         self.min_points_for_fit = 800
 
-        # ---------- realsense ----------
-        self.pipeline = None
-        self.align = None
+        # RANSAC
+        self.thresh_m = 0.005
+        self.ransac_n = 3
+        self.iters = 1000
 
-        # ---------- runtime ----------
-        self._mode = "idle"  # idle | live | corners | plane
-        self._found_live = False
-        self._live_color = None
-        self._live_depth = None
+        # local config
+        self.steps_per_edge = 10
 
-        self._snap_color = None
+        # runtime
+        self._mode = "idle"  # idle | live | frozen
+        self._found = False
+
+        self._live_color: np.ndarray | None = None
+        self._live_depth = None  # keep if you still want it
+        # IMPORTANT: cache depth as numpy so we can display even if rs.poll_for_frames() returns None
+        self._live_depth_u16: np.ndarray | None = None
+        self._live_depth_vis_bgr: np.ndarray | None = None
+
+        self._snap_color: np.ndarray | None = None
+        self._snap_vis: np.ndarray | None = None
         self._snap_depth = None
-        self._corners = None
-        self._extremes = None
-        self._rect = None
 
-        self._last_vis = None  # last BGR visual for redraw
+        self._ext_uv: np.ndarray | None = None  # (3,2)
+        self._rect: tuple[int, int, int, int] | None = None
+        self._seed = 0
+        self._show_depth = False
 
-        # ---------- timer ----------
-        self._timer = QTimer(self)
-        self._timer.setInterval(15)
-        self._timer.timeout.connect(self._tick)
+        # RealSense depth tuning
+        self.use_tuned_depth_settings = True  # Plane fitting benefits from tuning
+        self._depth_sensor: rs.sensor | None = None
+        self._depth_prev_settings: dict[rs.option, float] | None = None
 
-        # ======================================================
-        # LEFT: fixed 16:9 display area (prevents "square" look)
-        # ======================================================
-        self.image_label = QLabel()
-        self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setScaledContents(False)
-        self.image_label.setFixedSize(self.DISP_W, self.DISP_H)
-        self.image_label.setFocusPolicy(Qt.NoFocus)
+        # stats storage
+        self._stats: list[str] = []
+        self._last_stats_rows: list[tuple[str, str]] | None = None
 
-        # before start: show nothing
-        self.image_label.setStyleSheet("background-color: transparent; border-radius: 10px;")
-        self.image_label.clear()
-
-        # Put the label into a container so it can be aligned nicely
-        left_container = QWidget()
-        left_layout = QVBoxLayout(left_container)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(0)
-        left_layout.addWidget(self.image_label, 0, Qt.AlignLeft | Qt.AlignTop)
-        left_layout.addStretch(1)
-
-        # ======================================================
-        # RIGHT: keep your buttons logic (as before)
-        # ======================================================
-        self.info_label = QLabel("Press Start to begin.")
-        self.info_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.info_label.setWordWrap(True)
-
-        self.btn_start = QPushButton("Start")
-        self.btn_stop = QPushButton("Stop")
-        self.btn_redo = QPushButton("Redo Plane Fitting")
-
-        self.btn_start.clicked.connect(self.start)
-        self.btn_stop.clicked.connect(self.stop)
-        self.btn_redo.clicked.connect(self.redo_plane_fit)
-
-        # Important for SPACE: buttons should not steal focus
-        self.btn_start.setFocusPolicy(Qt.NoFocus)
-        self.btn_stop.setFocusPolicy(Qt.NoFocus)
-        self.btn_redo.setFocusPolicy(Qt.NoFocus)
-
-        for b in (self.btn_start, self.btn_stop, self.btn_redo):
-            b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
-        controls = QGroupBox("Controls")
-        g = QGridLayout(controls)
-        g.setContentsMargins(8, 8, 8, 8)
-        g.setSpacing(8)
-        g.addWidget(self.btn_start, 0, 0)
-        g.addWidget(self.btn_stop, 0, 1)
-        g.addWidget(self.btn_redo, 1, 0, 1, 2)
-        g.setColumnStretch(0, 1)
-        g.setColumnStretch(1, 1)
-
-        stats_box = QGroupBox("Plane Fitting Stats")
-        stats_layout = QVBoxLayout(stats_box)
-        stats_layout.setContentsMargins(8, 8, 8, 8)
-        stats_layout.addWidget(self.info_label)
-
-        right_layout = QVBoxLayout()
-        right_layout.setAlignment(Qt.AlignTop)
-        right_layout.setSpacing(12)
-        right_layout.addWidget(controls)
-        right_layout.addWidget(stats_box)
-        right_layout.addStretch(1)
-
-        self.right_panel = QWidget()
-        self.right_panel.setLayout(right_layout)
-        self.right_panel.setFixedWidth(self.RIGHT_W)
-        self.right_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
-
-        # ======================================================
-        # MAIN LAYOUT
-        # ======================================================
-        main = QHBoxLayout(self)
-        main.setContentsMargins(self.MARGIN, self.MARGIN, self.MARGIN, self.MARGIN)
-        main.setSpacing(self.SPACING)
-        main.addWidget(left_container, 1)
-        main.addWidget(self.right_panel, 0)
-
-        # Page must receive key events (SPACE)
+        super().__init__(parent)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setFocus()
 
-        self._set_ui_state_idle()
+        self._build_controls()
 
-    # ======================================================
-    # UI states
-    # ======================================================
+        self.instructions_label.setText(
+            "1) Press Start to open RGB-D\n"
+            "2) Move checkerboard until FOUND\n"
+            "3) Press SPACE to capture\n"
+            "4) Confirm corners to run plane fitting"
+        )
 
-    def _set_ui_state_idle(self):
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        self.btn_redo.setEnabled(False)
+        self.set_viewport_background(active=False)
 
-    def _set_ui_state_live(self):
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.btn_redo.setEnabled(False)
+        # if state already has plane points, show frozen so Next works immediately
+        if getattr(self.state, "plane_model_c", None) is not None and getattr(self.state, "plane_stats", None) is not None:
+            self._mode = "frozen"
 
-    def _set_ui_state_plane(self):
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.btn_redo.setEnabled(True)
+        self._update_buttons()
+        self._update_panels()
+        self.update_view()
 
-    # ======================================================
-    # Rendering: cover+crop but anchored TOP-LEFT (x=0,y=0)
-    # ======================================================
+    # ---------------- UI: controls + panels ----------------
 
-    def _show_image(self, img_bgr: np.ndarray) -> None:
-        self._last_vis = img_bgr
+    def _build_controls(self) -> None:
+        self.btn_start = QPushButton("Start")
+        self.btn_start.clicked.connect(self.start_clicked)
 
-        target_w = self.DISP_W
-        target_h = self.DISP_H
+        self.btn_start.setFocusPolicy(Qt.NoFocus)
+        self.btn_start.setMinimumHeight(44)
+        self.btn_start.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self.btn_start.setMinimumWidth(0)
 
-        h, w = img_bgr.shape[:2]
-        if h <= 0 or w <= 0:
-            self.image_label.clear()
-            return
-        
-        target_ratio = float(target_w) / float(target_h)
-        src_ratio = float(w) / float(h)
+        self.chk_show_depth = QCheckBox("Show depth image")
+        self.chk_show_depth.setChecked(False)
+        self.chk_show_depth.stateChanged.connect(self._on_show_depth_changed)
+        self.chk_show_depth.setFocusPolicy(Qt.NoFocus)
 
-        vis = img_bgr
-        if src_ratio > target_ratio:
-            crop_w = int(round(h * target_ratio))
-            x0 = max(0, (w - crop_w) // 2)
-            vis = img_bgr[:, x0:x0 + crop_w]
-        elif src_ratio < target_ratio:
-            crop_h = int(round(w / target_ratio))
-            y0 = max(0, (h - crop_h) // 2)
-            vis = img_bgr[y0:y0 + crop_h, :]
-            
-        vis = cv2.resize(vis, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        pm = _bgr_to_qpixmap(vis)
-        if pm.isNull():
-            self.image_label.clear()
-            return
+        wrap = QWidget()
+        wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 
-        self.image_label.setPixmap(pm)
+        flow = FlowLayout(wrap, spacing=10)
+        wrap.setLayout(flow)
 
-    # ======================================================
-    # Lifecycle (camera)
-    # ======================================================
+        flow.addWidget(self.btn_start)
+        flow.addWidget(self.chk_show_depth)
 
-    def start(self):
-        # show the dark background only AFTER Start
-        self.image_label.setStyleSheet("background-color: #202020; border-radius: 10px;")
+        self.controls_content.addWidget(wrap)
 
+    def _update_panels(self) -> None:
+        rows = self.stats_rows()
+        if rows != self._last_stats_rows:
+            self.set_stats_rows(rows)
+            self._last_stats_rows = list(rows)
+
+    def stats_rows(self) -> list[tuple[str, str]]:
+        if not self._stats:
+            return [
+                ("Inliers", "-"),
+                ("Mean", "-"),
+                ("Median", "-"),
+                ("P95", "-"),
+            ]
+
+        out: list[tuple[str, str]] = []
+        for s in self._stats:
+            if ":" in s:
+                k, v = s.split(":", 1)
+                out.append((k.strip(), v.strip()))
+            else:
+                out.append((s.strip(), ""))
+        return out
+
+    # ---------------- template hooks ----------------
+
+    def get_frame(self) -> np.ndarray | None:
+        if self._mode == "idle":
+            return None
+        if self._mode == "frozen":
+            return self._snap_vis
+
+        # No pipeline yet -> return last cached frame depending on toggle
+        if self.pipeline is None or self.align is None:
+            if self._show_depth and self._live_depth_vis_bgr is not None:
+                return self._live_depth_vis_bgr
+            return self._live_color
+
+        frames = self.pipeline.poll_for_frames()
+
+        # If no new frames, return cached view depending on toggle
+        if not frames:
+            if self._show_depth and self._live_depth_vis_bgr is not None:
+                return self._live_depth_vis_bgr
+            return self._live_color
+
+        # Align depth to color, so depth visualization matches RGB geometry
+        frames = self.align.process(frames)
+
+        cf = frames.get_color_frame()
+        df = frames.get_depth_frame()
+
+        # If color missing, fall back to cached
+        if not cf:
+            if self._show_depth and self._live_depth_vis_bgr is not None:
+                return self._live_depth_vis_bgr
+            return self._live_color
+
+        # Update RGB cache always
+        color = np.asanyarray(cf.get_data())
+        self._live_color = color
+
+        # Update depth caches if depth frame exists
+        if df:
+            self._live_depth = df
+            depth_u16 = np.asanyarray(df.get_data()).astype(np.uint16)
+            self._live_depth_u16 = depth_u16
+
+            # Precompute visual once per frame (so display can fallback reliably)
+            self._live_depth_vis_bgr = self._depth_u16_to_vis_bgr(depth_u16)
+
+        # Checkerboard detection ALWAYS on RGB (even if we display depth)
+        gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
+        found, _ = cbd.detect_classic_downscaled(gray, self.pattern_size, det_width=self.det_width)
+        self._found = bool(found)
+
+        self._update_panels()
+
+        # --- Display selection (toggle) ---
+        if self._show_depth:
+            # If we don't have a valid depth yet, show black (or last RGB if you prefer)
+            if self._live_depth_vis_bgr is None:
+                h, w = color.shape[:2]
+                return np.zeros((h, w, 3), dtype=np.uint8)
+
+            depth_bgr = self._live_depth_vis_bgr.copy()
+            cv2.putText(
+                depth_bgr,
+                "DEPTH VIEW",
+                (30, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.2,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            return depth_bgr
+
+        return self._live_color
+
+    def draw_overlay(self, frame_bgr: np.ndarray) -> np.ndarray:
+        vis = frame_bgr.copy()
+        if self._mode == "live":
+            txt = "FOUND (press SPACE)" if self._found else "NOT FOUND"
+            col = (0, 255, 0) if self._found else (0, 0, 255)
+            cv2.putText(vis, txt, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 6, cv2.LINE_AA)
+            cv2.putText(vis, txt, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, col, 2, cv2.LINE_AA)
+        return vis
+
+    # ---------------- depth image helpers ----------------
+
+    def _on_show_depth_changed(self, state: int) -> None:
+        self._show_depth = (state == Qt.Checked)
+        self.update_view()
+
+    @staticmethod
+    def _depth_u16_to_vis_bgr(depth_u16: np.ndarray) -> np.ndarray:
+        """
+        Robust depth visualization:
+        - normalize using 2..98 percentiles (raw units)
+        - invalid depth (0) shown as black
+        """
+        depth_u16 = np.asarray(depth_u16, dtype=np.uint16)
+
+        nonzero = depth_u16[depth_u16 > 0]
+        if nonzero.size == 0:
+            return np.zeros((depth_u16.shape[0], depth_u16.shape[1], 3), dtype=np.uint8)
+
+        lo = float(np.percentile(nonzero, 2.0))
+        hi = float(np.percentile(nonzero, 98.0))
+        if hi <= lo:
+            hi = lo + 1.0
+
+        depth_8u = np.clip(
+            (depth_u16.astype(np.float32) - lo) * (255.0 / (hi - lo)),
+            0, 255
+        ).astype(np.uint8)
+
+        depth_bgr = cv2.applyColorMap(depth_8u, cv2.COLORMAP_JET)
+        depth_bgr[depth_u16 == 0] = (0, 0, 0)
+        return depth_bgr
+
+    # ---------------- lifecycle ----------------
+
+    def on_enter(self) -> None:
+        pass
+
+    def on_leave(self) -> None:
+        try:
+            self._apply_depth_defaults()
+        except Exception:
+            pass
+
+        super().on_leave()
+
+    # ---------------- RealSense depth tuning helpers ----------------
+
+    @staticmethod
+    def _rs_get(sensor: rs.sensor | None, opt: rs.option) -> float | None:
+        try:
+            if sensor is not None and sensor.supports(opt):
+                return float(sensor.get_option(opt))
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _rs_set(sensor: rs.sensor | None, opt: rs.option, val: float) -> bool:
+        try:
+            if sensor is not None and sensor.supports(opt):
+                sensor.set_option(opt, float(val))
+                return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _rs_range(sensor: rs.sensor | None, opt: rs.option):
+        try:
+            if sensor is not None and sensor.supports(opt):
+                return sensor.get_option_range(opt)
+        except Exception:
+            pass
+        return None
+
+    def _get_depth_sensor(self) -> rs.sensor | None:
+        """Fetch & cache depth sensor from current pipeline (if running)."""
         if self.pipeline is None:
-            try:
-                self.pipeline, self.align = self._start_realsense_rgbd(fps=30)
-            except Exception as e:
-                self.image_label.setStyleSheet("background-color: transparent; border-radius: 10px;")
-                self.image_label.clear()
-                QMessageBox.critical(self, "Camera", f"Could not open RealSense camera.\n\n{e}")
-                self.pipeline = None
-                self.align = None
-                self._mode = "idle"
-                self._set_ui_state_idle()
-                return
+            self._depth_sensor = None
+            return None
+        try:
+            prof = self.pipeline.get_active_profile()
+            dev = prof.get_device()
+            self._depth_sensor = dev.first_depth_sensor()
+            return self._depth_sensor
+        except Exception:
+            self._depth_sensor = None
+            return None
+
+    def _snapshot_depth_settings(self, sensor: rs.sensor | None) -> Dict[rs.option, float]:
+        """Store exactly what we will touch, so restore is precise."""
+        opts = [
+            rs.option.visual_preset,
+            rs.option.emitter_enabled,
+            rs.option.laser_power,
+            rs.option.enable_auto_exposure,
+            rs.option.exposure,
+            rs.option.gain,
+        ]
+        snap: Dict[rs.option, float] = {}
+        for o in opts:
+            v = self._rs_get(sensor, o)
+            if v is not None:
+                snap[o] = float(v)
+        return snap
+
+    def _apply_depth_defaults(self) -> None:
+        """
+        Reset depth sensor to a known 'default-ish' baseline.
+        (RealSense settings can persist across runs; so we force a clean baseline.)
+        """
+        sensor = self._get_depth_sensor()
+        if sensor is None:
+            return
+
+        # Snapshot previous ONCE (so restore-on-leave is exact)
+        if self._depth_prev_settings is None:
+            self._depth_prev_settings = self._snapshot_depth_settings(sensor)
+
+        # 1) Auto exposure ON
+        self._rs_set(sensor, rs.option.enable_auto_exposure, 1)
+
+        # 2) Emitter: prefer AUTO (often 2), else ON
+        r = self._rs_range(sensor, rs.option.emitter_enabled)
+        if r is not None:
+            target = 2.0
+            if target < r.min or target > r.max:
+                target = float(np.clip(1.0, r.min, r.max))
+            self._rs_set(sensor, rs.option.emitter_enabled, target)
+
+        # 3) Laser power: neutral mid
+        r = self._rs_range(sensor, rs.option.laser_power)
+        if r is not None:
+            mid = 0.5 * (float(r.min) + float(r.max))
+            self._rs_set(sensor, rs.option.laser_power, mid)
+
+        # 4) Visual preset back to 0 (clamped)
+        r = self._rs_range(sensor, rs.option.visual_preset)
+        if r is not None:
+            self._rs_set(sensor, rs.option.visual_preset, float(np.clip(0.0, r.min, r.max)))
+
+    def _apply_depth_tuning(self) -> None:
+        """
+        Apply manual/tuned RealSense depth settings for plane fitting.
+        """
+        if not self.use_tuned_depth_settings:
+            return
+
+        sensor = self._get_depth_sensor()
+        if sensor is None:
+            return
+
+        if self._depth_prev_settings is None:
+            self._depth_prev_settings = self._snapshot_depth_settings(sensor)
+
+        self._rs_set(sensor, rs.option.emitter_enabled, 1)
+        self._rs_set(sensor, rs.option.enable_auto_exposure, 0)
+
+        r = self._rs_range(sensor, rs.option.laser_power)
+        if r is not None:
+            self._rs_set(sensor, rs.option.laser_power, float(np.clip(150, r.min, r.max)))
+
+        r = self._rs_range(sensor, rs.option.exposure)
+        if r is not None:
+            self._rs_set(sensor, rs.option.exposure, float(np.clip(4000, r.min, r.max)))
+
+        r = self._rs_range(sensor, rs.option.gain)
+        if r is not None:
+            self._rs_set(sensor, rs.option.gain, float(np.clip(16, r.min, r.max)))
+
+    # ---------------- actions ----------------
+
+    def start_clicked(self) -> None:
+        if self.state.K_rgb is None:
+            QMessageBox.information(self, "Plane Fitting", "Missing K_rgb. Run Camera Calibration first.")
+            return
+
+        try:
+            if self.pipeline is None:
+                self.start_realsense(
+                    fps=self.FPS,
+                    color_size=(1920, 1080),
+                    depth_size=(1280, 720),
+                    align_to="color",
+                )
+                self._apply_depth_defaults()
+                self._apply_depth_tuning()
+
+        except Exception as e:
+            self.stop_realsense()
+            QMessageBox.critical(self, "Camera", f"Could not open RealSense camera.\n\n{e}")
+            self._mode = "idle"
+            self.set_viewport_background(active=False)
+            self._update_buttons()
+            self._update_panels()
+            self.update_view()
+            return
+
+        # reset outputs + snapshot state
+        self.state.xray_points_xyz_c = None
+        self.state.plane_confirmed = False
+        self.state.plane_model_c = None
+        self.state.plane_stats = None
+
+        self._stats = []
+        self._last_stats_rows = None
+
+        self._snap_color = None
+        self._snap_vis = None
+        self._snap_depth = None
+        self._ext_uv = None
+        self._rect = None
+        self._seed = 0
 
         self._mode = "live"
-        self._found_live = False
-        self._live_color = None
-        self._live_depth = None
-        self._last_vis = None
-
-        # reset state outputs
-        self.state.cb_found = False
-        self.state.cb_corners_uv = None
-        self.state.cb_extremes_uv = None
-        self.state.cb_rect_uv = None
-
-        self.state.pts3d_c = None
-        self.state.plane_model_c = None
-        self.state.plane_stats = None
-        self.state.plane_redo_seed = 0
-
-        self.info_label.setText("Live view running.\nPress SPACE only when checkerboard is FOUND.")
-        self._set_ui_state_live()
-
-        # Ensure page has focus for SPACE
+        self.set_viewport_background(active=True)
+        self.start_timer(self.FPS)
+        self._update_buttons()
+        self._update_panels()
         self.setFocus()
-        self._timer.start()
-        self._tick()
+        self.update_view()
 
-    def stop(self):
-        self._timer.stop()
+        if callable(self.on_complete_changed):
+            self.on_complete_changed()
 
-        if self.pipeline is not None:
-            try:
-                self.pipeline.stop()
-            except Exception:
-                pass
-
-        self.pipeline = None
-        self.align = None
-
-        self._mode = "idle"
-        self._found_live = False
-        self._live_color = None
-        self._live_depth = None
-        self._last_vis = None
-
-        # reset outputs
-        self.state.cb_found = False
-        self.state.cb_corners_uv = None
-        self.state.cb_extremes_uv = None
-        self.state.cb_rect_uv = None
-
-        self.state.pts3d_c = None
-        self.state.plane_model_c = None
-        self.state.plane_stats = None
-        self.state.plane_redo_seed = 0
-
-        self.info_label.setText("Press Start to begin.")
-        self._set_ui_state_idle()
-
-        # before start: show nothing
-        self.image_label.setStyleSheet("background-color: transparent; border-radius: 10px;")
-        self.image_label.clear()
-
-        # regain focus
-        self.setFocus()
-
-    def closeEvent(self, event):
-        self.stop()
-        super().closeEvent(event)
-
-    # ======================================================
-    # Keyboard (SPACE)
-    # ======================================================
+    # ---------------- keyboard ----------------
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            self.stop()
-            event.accept()
-            return
-
         if event.key() == Qt.Key_Space:
-            # keep behavior like before: only capture in live + found
-            if self._mode == "live" and self._found_live:
-                self._capture_and_detect()
+            if self._mode == "live" and self._found:
+                self._capture()
             event.accept()
             return
 
         super().keyPressEvent(event)
 
-    # ======================================================
-    # RealSense
-    # ======================================================
+    # ---------------- workflow ----------------
 
-    @staticmethod
-    def _start_realsense_rgbd(fps: int = 30):
-        pipeline = rs.pipeline()
-        config = rs.config()
-
-        # D435i color stream: 1920x1080 -> 16:9
-        config.enable_stream(rs.stream.color, 1920, 1080, rs.format.bgr8, fps)
-        config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, fps)
-
-        profile = pipeline.start(config)
-        align = rs.align(rs.stream.color)
-
-        # reduce latency if possible
-        try:
-            dev = profile.get_device()
-            for sensor in dev.query_sensors():
-                try:
-                    sensor.set_option(rs.option.frames_queue_size, 1)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        return pipeline, align
-
-    # ======================================================
-    # Live tick (non-blocking)
-    # ======================================================
-
-    def _tick(self):
-        if self.pipeline is None or self.align is None or self._mode != "live":
-            return
-
-        frames = self.pipeline.poll_for_frames()
-        if not frames:
-            return
-
-        frames = self.align.process(frames)
-        cf = frames.get_color_frame()
-        df = frames.get_depth_frame()
-        if not cf or not df:
-            return
-
-        color = np.asanyarray(cf.get_data())
-        self._live_color = color
-        self._live_depth = df
-
-        gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
-        found_live, _ = cbd.detect_classic_downscaled(gray, self.pattern_size, det_width=self.det_width)
-        self._found_live = bool(found_live)
-
-        vis = color.copy()
-        if self._found_live:
-            cv2.putText(vis, "FOUND (press SPACE to capture)", (30, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3, cv2.LINE_AA)
-        else:
-            cv2.putText(vis, "NOT FOUND", (30, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA)
-
-        self._show_image(vis)
-
-    # ======================================================
-    # Capture + plane fitting (kept from your flow)
-    # ======================================================
-
-    def _capture_and_detect(self):
+    def _capture(self) -> None:
         if self._live_color is None or self._live_depth is None:
             return
 
-        snap_color = self._live_color.copy()
-        snap_depth = self._live_depth
+        color = self._live_color.copy()
+        depth = self._live_depth
 
         found, corners = cbd.detect_snapshot_full(
-            snap_color,
+            color,
             pattern_size=self.pattern_size,
             det_width=self.det_width,
         )
-        if not found or corners is None:
+        if (not found) or corners is None:
             return
 
-        res = snap_color.copy()
-        cv2.drawChessboardCorners(res, self.pattern_size, corners, True)
+        ex = cbd.get_extreme_corners_geometric(corners)
+        ext_uv = np.array(
+            [ex["top_left"], ex["top_right"], ex["bottom_left"]],
+            dtype=np.float64,
+        )
 
-        extremes = cbd.get_extreme_corners_geometric(corners)
-        res = _draw_extremes(res, extremes)
+        preview = color.copy()
+        cv2.drawChessboardCorners(preview, self.pattern_size, corners, True)
+        preview = _draw_extremes(preview, ext_uv)
 
-        self._mode = "corners"
-        self._show_image(res)
+        # Freeze view while modal dialog is open
+        self._mode = "frozen"
+        self._snap_color = color
+        self._snap_vis = preview
+        self._snap_depth = depth
+        self._ext_uv = ext_uv
+        self.stop_timer()
+
+        self._update_buttons()
+        self._update_panels()
+        self.update_view()
 
         ans = QMessageBox.question(
             self,
@@ -561,110 +521,100 @@ class PlaneFittingPage(QWidget):
         )
 
         if ans != QMessageBox.Yes:
+            # Back to live
+            self._seed = 0
             self._mode = "live"
+            self._snap_color = None
+            self._snap_vis = None
+            self._snap_depth = None
+            self._ext_uv = None
+            self._rect = None
+            self._stats = []
+            self._last_stats_rows = None
+
+            self.set_viewport_background(active=True)
+            self.start_timer(self.FPS)
+
+            self._update_buttons()
+            self._update_panels()
             self.setFocus()
+            self.update_view()
             return
 
-        self._snap_color = snap_color
-        self._snap_depth = snap_depth
-        self._corners = corners
-        self._extremes = extremes
+        h, w = color.shape[:2]
+        self._rect = rpf.rect_from_pts(ext_uv, w, h, self.pad_px)
+        self._seed = 0
 
-        h, w = snap_color.shape[:2]
-        self._rect = _rect_from_extremes(extremes, w, h, pad_px=self.rect_pad_px)
+        self._fit_and_grid()
 
-        self.state.cb_found = True
-        self.state.cb_corners_uv = corners
-        self.state.cb_extremes_uv = np.array(
-            [extremes["top_left"], extremes["top_right"], extremes["bottom_left"]],
-            dtype=np.float32,
-        )
-        self.state.cb_rect_uv = self._rect
-        self.state.plane_redo_seed = 0
-
-        self._run_plane_fit_once()
+        # Stay frozen (timer already stopped)
+        self._update_buttons()
+        self._update_panels()
         self.setFocus()
+        self.update_view()
 
-    def _run_plane_fit_once(self) -> bool:
-        if self._snap_color is None or self._snap_depth is None or self._rect is None or self._extremes is None:
-            return False
+    def _fit_and_grid(self) -> None:
+        assert self._snap_depth is not None and self._rect is not None and self._ext_uv is not None
+        assert self.state.K_rgb is not None
 
-        pts3d = _sample_points_3d_in_rect(
-            depth_frame_aligned=self._snap_depth,
-            rect=self._rect,
-            max_points=self.max_points,
-            z_min=self.z_min,
-            z_max=self.z_max,
-            seed=int(self.state.plane_redo_seed),
+        pts3d = rpf.sample_pts3d(
+            self._snap_depth,
+            self._rect,
+            self.max_points,
+            self.z_min,
+            self.z_max,
+            self._seed,
         )
-
         if pts3d.shape[0] < self.min_points_for_fit:
-            QMessageBox.warning(
-                self,
-                "Plane Fitting",
-                f"Not enough points for plane fit ({pts3d.shape[0]} < {self.min_points_for_fit}).\n"
-                "Try again (move closer / improve depth / re-capture).",
-            )
-            self._mode = "live"
-            self._set_ui_state_live()
-            return False
+            QMessageBox.warning(self, "Plane Fitting", f"Not enough points ({pts3d.shape[0]}).")
+            return
 
-        plane_model, inliers = rpf.fit_plane_from_points(
+        plane, inliers = rpf.fit_plane_from_points(
             pts3d,
-            distance_threshold=self.ransac_thresh_m,
+            distance_threshold=self.thresh_m,
             ransac_n=self.ransac_n,
-            num_iterations=self.ransac_iters,
+            num_iterations=self.iters,
         )
 
-        deviations = _compute_deviations(pts3d, plane_model)
-        inlier_devs = deviations[inliers] if len(inliers) else deviations
+        dev = rpf.deviations(pts3d, plane)
+        dev_in = dev[inliers] if len(inliers) else dev
 
-        mean = float(np.mean(inlier_devs)) if inlier_devs.size else float(np.mean(deviations))
-        median = float(np.median(inlier_devs)) if inlier_devs.size else float(np.median(deviations))
-        p95 = float(np.percentile(inlier_devs, 95)) if inlier_devs.size else float(np.percentile(deviations, 95))
+        mean = float(np.mean(dev_in))
+        med = float(np.median(dev_in))
+        p95 = float(np.percentile(dev_in, 95))
 
-        preview = self._snap_color.copy()
-        preview = _draw_extremes(preview, self._extremes)
-        tl = self._extremes["top_left"]
-        preview = _draw_axes_top_left(preview, (int(round(tl[0])), int(round(tl[1]))))
+        # Stats (UI)
+        self._stats = [
+            f"Inliers: {int(len(inliers))}",
+            f"Mean: {mean*1000.0:.3f} mm",
+            f"Median: {med*1000.0:.3f} mm",
+            f"P95: {p95*1000.0:.3f} mm",
+        ]
+        self._last_stats_rows = None  # force rebuild once after new stats
 
-        self._mode = "plane"
-        self._show_image(preview)
-
-        self.info_label.setText(
-            "Plane fitting stats (inliers)\n"
-            f"n_inliers: {int(len(inliers))}\n"
-            f"mean:   {mean * 1000.0:.3f} mm\n"
-            f"median: {median * 1000.0:.3f} mm\n"
-            f"P95:    {p95 * 1000.0:.3f} mm\n"
-        )
-
-        self.state.pts3d_c = pts3d
-        self.state.plane_model_c = plane_model
+        # IMPORTANT FOR NEXT BUTTON (main.py step_complete):
+        self.state.plane_model_c = np.asarray(plane, dtype=np.float64)
         self.state.plane_stats = {
-            "n_inliers": float(len(inliers)),
+            "n_inliers": int(len(inliers)),
             "mean_m": mean,
-            "median_m": median,
+            "median_m": med,
             "p95_m": p95,
         }
 
-        self._set_ui_state_plane()
+        # Grid in camera frame
+        corner_xyz = rpf.intersect_corners_with_plane(self._ext_uv, self.state.K_rgb, plane)
+        marker_xyz = rpf.interpolate_marker_grid(corner_xyz, steps_per_edge=int(self.steps_per_edge))
+
+        self.state.xray_points_xyz_c = marker_xyz
+        self.state.plane_confirmed = True
 
         if callable(self.on_complete_changed):
             self.on_complete_changed()
 
-        return True
+        self._update_buttons()
+        self._update_panels()
+        self.update_view()
 
-    # ======================================================
-    # Button handler (kept)
-    # ======================================================
-
-    def redo_plane_fit(self):
-        if self._mode != "plane":
-            return
-        if self._snap_color is None or self._snap_depth is None or self._rect is None:
-            return
-
-        self.state.plane_redo_seed += 1
-        self._run_plane_fit_once()
-        self.setFocus()
+    def _update_buttons(self) -> None:
+        # Start only when idle (you intentionally have no "stop")
+        self.btn_start.setEnabled(self._mode == "idle")

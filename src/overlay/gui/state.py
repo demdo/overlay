@@ -1,48 +1,43 @@
 # overlay/gui/state.py
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Tuple, Any
+from typing import Optional
 import numpy as np
 
 
 @dataclass
 class SessionState:
-    K_rgb: Optional[np.ndarray] = None
+    # --- X-ray intrinsics ---
     K_xray: Optional[np.ndarray] = None
     
+    # --- Camera calibration ---
+    K_rgb: Optional[np.ndarray] = None
+
+    # --- X-ray marker selection (interactive -> confirmed) ---
     xray_image: Optional[np.ndarray] = None
     xray_image_path: Optional[str] = None
     xray_points_uv: Optional[np.ndarray] = None
     xray_points_confirmed: bool = False
-    
-    circles_grid: Optional[np.ndarray] = None     # shape (rows, cols, 3) with (x,y,r) per cell
-    pick_radius_px: Optional[float] = None
-    
-    cb_found: bool = False
-    cb_corners_uv: Optional[np.ndarray] = None                 # (N,1,2) or (N,2)
-    cb_extremes_uv: Optional[np.ndarray] = None                # (3,2) -> [top_left, top_right, bottom_left]
-    cb_rect_uv: Optional[Tuple[int, int, int, int]] = None     # (umin, vmin, umax, vmax)
+    xray_marker_overlay_bgr: Optional[np.ndarray] = None
+    marker_radius_px: Optional[float] = None
 
-    pts3d_c: Optional[np.ndarray] = None                       # (M,3) in camera frame (meters)
-    plane_model_c: Optional[np.ndarray] = None                 # (4,) [a,b,c,d]
-    plane_stats: Optional[Dict[str, float]] = None             # keys: n_inliers, mean, median, p95 (units as you choose)
-    plane_redo_seed: int = 0 
+    # --- Plane fitting result (interactive -> confirmed) ---
+    xray_points_xyz_c: Optional[np.ndarray] = None
+    plane_confirmed: bool = False
     
-    steps_per_edge: Optional[int] = None
-    xray_points_xyz_c: Optional[np.ndarray] = None   # (N,3) 3D points in camera frame matching xray_points_uv
-    T_xray_from_cam_3x4: Optional[np.ndarray] = None
-    T_xray_from_cam_4x4: Optional[np.ndarray] = None
-    pnp_n_points: Optional[int] = None
-    pnp_inliers_idx: Optional[np.ndarray] = None
-    pnp_n_inliers: Optional[int] = None
-    pnp_reproj_errors_px: Optional[np.ndarray] = None
-    pnp_reproj_mean_px: Optional[float] = None
-    pnp_reproj_median_px: Optional[float] = None
-    pnp_reproj_max_px: Optional[float] = None
-    pnp_uv_measured: Optional[np.ndarray] = None
-    pnp_uv_projected: Optional[np.ndarray] = None
-    pnp_debug_bgr: Optional[np.ndarray] = None
+    # --- PnP diagnostics / settings ---
+    pnp_ransac_threshold_px: Optional[float] = None
 
+    # --- Final transformations (homogeneous 4x4) ---
+    # Convention:
+    #   X_x = T_cx @ X_c   (Camera -> X-ray)
+    #   X_c = T_xc @ X_x   (X-ray -> Camera)
+    T_cx: Optional[np.ndarray] = None  # Camera -> X-ray
+    T_xc: Optional[np.ndarray] = None  # X-ray -> Camera
+    
+    # ----------------
+    # Convenience flags
+    # ----------------
     @property
     def has_rgb_intrinsics(self) -> bool:
         return self.K_rgb is not None
@@ -50,27 +45,31 @@ class SessionState:
     @property
     def has_xray_intrinsics(self) -> bool:
         return self.K_xray is not None
-    
+
     @property
     def has_xray_image(self) -> bool:
         return self.xray_image is not None
-    
+
     @property
     def has_xray_points(self) -> bool:
         return self.xray_points_uv is not None and len(self.xray_points_uv) > 0
-    
-    @property
-    def has_circles_grid(self) -> bool:
-        return self.circles_grid is not None and self.pick_radius_px is not None
-    
-    @property
-    def has_xray_points_confirmed(self) -> bool:
-        return self.xray_points_confirmed
-    
-    @property
-    def has_checkerboard_3d(self) -> bool:
-        return self.pts3d_c is not None and len(self.pts3d_c) > 0
 
     @property
-    def has_plane_fit(self) -> bool:
-        return self.plane_model_c is not None and self.plane_stats is not None
+    def has_xray_points_confirmed(self) -> bool:
+        return self.xray_points_confirmed and self.has_xray_points
+
+    @property
+    def has_xray_points_xyz(self) -> bool:
+        return self.xray_points_xyz_c is not None and len(self.xray_points_xyz_c) > 0
+
+    @property
+    def has_plane_confirmed(self) -> bool:
+        return self.plane_confirmed and self.has_xray_points_xyz
+
+    @property
+    def has_cam_to_xray(self) -> bool:
+        return self.T_cx is not None
+
+    @property
+    def has_xray_to_cam(self) -> bool:
+        return self.T_xc is not None

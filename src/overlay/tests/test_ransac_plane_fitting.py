@@ -3,10 +3,24 @@
 example_ransac_plane_fitting.py
 
 Interactive test harness for RANSAC_plane_fitting helpers.
+
+Features:
+- Live RGB preview + live Depth preview (aligned)
+- SPACE:
+    - always saves a depth snapshot:
+        * raw 16-bit depth PNG
+        * colorized depth PNG (for quick inspection)
+        * JSON metadata with key RealSense depth settings
+    - if chessboard is FOUND, continues into your capture + plane fitting flow
+- Optional RealSense depth tuning via flag USE_TUNED_SETTINGS
+  (and when disabled, we explicitly switch back to auto/default-ish settings)
 """
 
 from __future__ import annotations
 
+import os
+import time
+import json
 import numpy as np
 import cv2
 import pyrealsense2 as rs
@@ -19,8 +33,30 @@ from overlay.tools import ransac_plane_fitting as rpf
 
 
 LIVE_WIN = "Live RGB (SPACE=capture if FOUND, ESC=quit)"
+DEPTH_WIN = "Live Depth (aligned)"
 RES_WIN = "Corner Detection Result"
 PLANE_WIN = "Plane Fitting Preview (ESC=quit)"
+DEPTH_SNAP_WIN = "Depth Snapshot + ROI"
+
+# Toggle RealSense tuning on/off (so you can A/B compare)
+USE_TUNED_SETTINGS = False  # set True to enable manual depth tuning
+
+
+# =========================
+# Small helpers
+# =========================
+def script_dir() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def save_preview_same_dir(img: np.ndarray, filename: str) -> str:
+    """Save to same dir as this script. Returns output path."""
+    out_path = os.path.join(script_dir(), filename)
+    ok = cv2.imwrite(out_path, img)
+    if not ok:
+        raise RuntimeError(f"cv2.imwrite failed for: {out_path}")
+    print(f"[DEBUG] Saved: {out_path}")
+    return out_path
 
 
 def setup_window(name: str) -> None:
@@ -40,7 +76,10 @@ def ask_corners_satisfied(
     return ans
 
 
-def ask_plane_satisfied(title: str = "Plane Fitting", msg: str = "Satisfied with plane fitting?\n\nYes: accept\nNo: redo") -> bool:
+def ask_plane_satisfied(
+    title: str = "Plane Fitting",
+    msg: str = "Satisfied with plane fitting?\n\nYes: accept\nNo: redo",
+) -> bool:
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
@@ -49,33 +88,128 @@ def ask_plane_satisfied(title: str = "Plane Fitting", msg: str = "Satisfied with
     return ans
 
 
-def draw_extremes(img_bgr, extremes, color=(208, 224, 64), radius=10, thickness=-1):
+def draw_extremes(img_bgr, extremes, color=(208, 224, 64), radius=10, thickness=-1, draw_labels=True):
     for name, (u, v) in extremes.items():
         cv2.circle(img_bgr, (int(u), int(v)), radius, color, thickness)
-        cv2.putText(
-            img_bgr,
-            name,
-            (int(u) + 8, int(v) - 6),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
+        if draw_labels:
+            cv2.putText(
+                img_bgr,
+                name,
+                (int(u) + 8, int(v) - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
     return img_bgr
+
+
+def draw_axes_top_left(image: np.ndarray, origin: tuple[int, int]):
+    shaft = 70
+    thickness = 2
+    tip_length = 0.2
+
+    x_end = (origin[0] + shaft, origin[1])
+    y_end = (origin[0], origin[1] + shaft)
+    z_end = (origin[0] + int(shaft * 0.7), origin[1] + int(shaft * 0.7))
+
+    cv2.arrowedLine(image, origin, x_end, (0, 0, 255), thickness, cv2.LINE_AA, tipLength=tip_length)
+    cv2.arrowedLine(image, origin, y_end, (0, 255, 0), thickness, cv2.LINE_AA, tipLength=tip_length)
+    cv2.arrowedLine(image, origin, z_end, (255, 0, 0), thickness, cv2.LINE_AA, tipLength=tip_length)
+
+    return image
+
+
+def draw_support_rect(img_bgr, rect, color=(255, 255, 0), thickness=2):
+    umin, vmin, umax, vmax = rect
+    out = img_bgr.copy()
+    cv2.rectangle(out, (umin, vmin), (umax, vmax), color, thickness, cv2.LINE_AA)
+    return out
+
+
+def depth_to_vis_bgr(depth_frame) -> np.ndarray:
+    """
+    Robust visualization of depth:
+    - normalize using 2..98 percentiles for better contrast
+    - invalid depth (0) shown as black
+    """
+    depth_img = np.asanyarray(depth_frame.get_data()).astype(np.uint16)
+
+    nonzero = depth_img[depth_img > 0]
+    if nonzero.size == 0:
+        return np.zeros((depth_img.shape[0], depth_img.shape[1], 3), dtype=np.uint8)
+
+    lo = float(np.percentile(nonzero, 2.0))
+    hi = float(np.percentile(nonzero, 98.0))
+    if hi <= lo:
+        hi = lo + 1.0
+
+    depth_8u = np.clip((depth_img.astype(np.float32) - lo) * (255.0 / (hi - lo)), 0, 255).astype(np.uint8)
+    depth_bgr = cv2.applyColorMap(depth_8u, cv2.COLORMAP_JET)
+    depth_bgr[depth_img == 0] = (0, 0, 0)
+
+    txt = f"Depth vis: p2={lo:.0f}, p98={hi:.0f} (raw units)"
+    cv2.putText(depth_bgr, txt, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    return depth_bgr
+
+
+# =========================
+# RealSense option helpers + setup
+# =========================
+def _rs_get(sensor: rs.sensor | None, opt: rs.option) -> float | None:
+    try:
+        if sensor is not None and sensor.supports(opt):
+            return float(sensor.get_option(opt))
+    except Exception:
+        pass
+    return None
+
+
+def _rs_set(sensor: rs.sensor | None, opt: rs.option, val: float) -> bool:
+    try:
+        if sensor is not None and sensor.supports(opt):
+            sensor.set_option(opt, float(val))
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _rs_range(sensor: rs.sensor | None, opt: rs.option):
+    try:
+        if sensor is not None and sensor.supports(opt):
+            return sensor.get_option_range(opt)
+    except Exception:
+        pass
+    return None
+
+
+def get_depth_settings_dict(depth_sensor: rs.sensor | None) -> dict:
+    """Key parameters for reproducibility/logging."""
+    return {
+        "visual_preset": _rs_get(depth_sensor, rs.option.visual_preset),
+        "emitter_enabled": _rs_get(depth_sensor, rs.option.emitter_enabled),
+        "laser_power": _rs_get(depth_sensor, rs.option.laser_power),
+        "auto_exposure": _rs_get(depth_sensor, rs.option.enable_auto_exposure),
+        "exposure": _rs_get(depth_sensor, rs.option.exposure),
+        "gain": _rs_get(depth_sensor, rs.option.gain),
+    }
 
 
 def start_realsense_rgbd(fps: int = 30):
     pipeline = rs.pipeline()
     config = rs.config()
+
+    # Streams
     config.enable_stream(rs.stream.color, 1920, 1080, rs.format.bgr8, fps)
     config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, fps)
 
     profile = pipeline.start(config)
-    align = rs.align(rs.stream.color)
+    dev = profile.get_device()
 
+    # reduce queue latency
     try:
-        dev = profile.get_device()
         for sensor in dev.query_sensors():
             try:
                 sensor.set_option(rs.option.frames_queue_size, 1)
@@ -84,9 +218,99 @@ def start_realsense_rgbd(fps: int = 30):
     except Exception:
         pass
 
-    return pipeline, align
+    # Depth sensor
+    try:
+        depth_sensor = dev.first_depth_sensor()
+    except Exception:
+        depth_sensor = None
+
+    # --- Optional depth tuning (toggle with USE_TUNED_SETTINGS) ---
+    if depth_sensor is not None:
+        if USE_TUNED_SETTINGS:
+            # MANUAL / tuned settings
+            _rs_set(depth_sensor, rs.option.emitter_enabled, 1)
+            _rs_set(depth_sensor, rs.option.enable_auto_exposure, 0)
+
+            r = _rs_range(depth_sensor, rs.option.laser_power)
+            if r is not None:
+                _rs_set(depth_sensor, rs.option.laser_power, min(r.max, max(r.min, 150)))
+
+            r = _rs_range(depth_sensor, rs.option.exposure)
+            if r is not None:
+                _rs_set(depth_sensor, rs.option.exposure, float(np.clip(4000, r.min, r.max)))
+
+            r = _rs_range(depth_sensor, rs.option.gain)
+            if r is not None:
+                # D435i often has min gain 16
+                _rs_set(depth_sensor, rs.option.gain, float(np.clip(16, r.min, r.max)))
+
+            print("[Depth tuning enabled]")
+        else:
+            # AUTO / default-ish settings (so A/B really works)
+            _rs_set(depth_sensor, rs.option.enable_auto_exposure, 1)
+
+            # emitter: prefer AUTO if supported (often 2 on D435i)
+            r = _rs_range(depth_sensor, rs.option.emitter_enabled)
+            if r is not None:
+                _rs_set(depth_sensor, rs.option.emitter_enabled, min(r.max, 2))
+
+            # laser power: set to neutral mid (avoids stale manual power)
+            r = _rs_range(depth_sensor, rs.option.laser_power)
+            if r is not None:
+                _rs_set(depth_sensor, rs.option.laser_power, float(np.clip(150, r.min, r.max)))
+
+            print("[Depth tuning disabled -> auto exposure ON, emitter AUTO]")
+
+        # Always print current key settings
+        s = get_depth_settings_dict(depth_sensor)
+        print("[Depth settings]")
+        for k, v in s.items():
+            print(f"  {k}: {v}")
+
+    align = rs.align(rs.stream.color)
+    return pipeline, align, profile, depth_sensor
 
 
+def save_depth_snapshot_with_meta(
+    df_aligned,
+    depth_sensor: rs.sensor | None,
+    use_tuned: bool,
+    prefix: str = "depth",
+) -> None:
+    """
+    Saves:
+    - raw 16-bit depth PNG
+    - colorized depth PNG
+    - JSON meta including key RealSense settings
+    """
+    ts = time.strftime("%Y%m%d_%H%M%S")
+
+    depth_raw = np.asanyarray(df_aligned.get_data())  # uint16
+    depth_vis = depth_to_vis_bgr(df_aligned)
+
+    raw_name = f"{prefix}_{ts}_raw.png"
+    vis_name = f"{prefix}_{ts}_vis.png"
+    meta_name = f"{prefix}_{ts}_meta.json"
+
+    save_preview_same_dir(depth_raw, raw_name)
+    save_preview_same_dir(depth_vis, vis_name)
+
+    meta = {
+        "timestamp": ts,
+        "use_tuned_settings": bool(use_tuned),
+        "depth_settings": get_depth_settings_dict(depth_sensor),
+        # You can extend this later (e.g. intrinsics, stream sizes, etc.)
+    }
+
+    meta_path = os.path.join(script_dir(), meta_name)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[DEBUG] Saved: {meta_path}")
+
+
+# =========================
+# Geometry helpers
+# =========================
 def rect_from_extremes(extremes: dict[str, tuple[float, float]], img_w: int, img_h: int, pad_px: int):
     pts = np.array([extremes["top_left"], extremes["top_right"], extremes["bottom_left"]], dtype=np.float32)
 
@@ -154,30 +378,24 @@ def compute_deviations(points: np.ndarray, plane_model: np.ndarray):
     return np.abs(points @ normal + plane_model[3]) / norm
 
 
-def draw_axes_top_left(image: np.ndarray, origin: tuple[int, int]):
-    shaft = 70
-    thickness = 2
-    tip_length = 0.2
-
-    x_end = (origin[0] + shaft, origin[1])
-    y_end = (origin[0], origin[1] + shaft)
-    z_end = (origin[0] + int(shaft * 0.7), origin[1] + int(shaft * 0.7))
-
-    cv2.arrowedLine(image, origin, x_end, (0, 0, 255), thickness, cv2.LINE_AA, tipLength=tip_length)
-    cv2.arrowedLine(image, origin, y_end, (0, 255, 0), thickness, cv2.LINE_AA, tipLength=tip_length)
-    cv2.arrowedLine(image, origin, z_end, (255, 0, 0), thickness, cv2.LINE_AA, tipLength=tip_length)
-
-    return image
-
-
-def show_plane_fit_3d(inlier_pts3d: np.ndarray, plane_model: np.ndarray, title: str = "Plane fit (3D)"):
+# =========================
+# Plot helpers (unchanged)
+# =========================
+def show_plane_fit_3d(
+    inlier_pts3d: np.ndarray,
+    plane_model: np.ndarray,
+    title: str = "Plane fit (3D)",
+    tuning: dict | None = None,
+):
     """
     3D visualization:
     - inlier point cloud
     - fitted plane surface (bounded by inlier bbox)
-    - local plane frame at centroid:
-        X_tangent (red), Y_tangent (green), Normal (blue)
-      all arrows same length and thicker.
+    - normal vector at centroid (blue)
+    - info box (figure coords, stable position):
+        * USE_TUNED_SETTINGS=True  -> "Depth tuning" + key values
+        * USE_TUNED_SETTINGS=False -> "No depth tuning"
+      Box height follows the actual text (no padding lines).
     """
 
     P = np.asarray(inlier_pts3d, dtype=float)
@@ -254,7 +472,7 @@ def show_plane_fit_3d(inlier_pts3d: np.ndarray, plane_model: np.ndarray, title: 
     ax.plot(XX[:, 0],  YY[:, 0],  ZZ[:, 0],  color="k", linewidth=2.0)
     ax.plot(XX[:, -1], YY[:, -1], ZZ[:, -1], color="k", linewidth=2.0)
 
-    # normal (blue: 0,0,255)
+    # normal (blue)
     ax.quiver(center[0], center[1], center[2],
               n_unit[0], n_unit[1], n_unit[2],
               length=L, normalize=True,
@@ -290,6 +508,46 @@ def show_plane_fit_3d(inlier_pts3d: np.ndarray, plane_model: np.ndarray, title: 
     ax.set_ylim(mid[1] - max_half, mid[1] + max_half)
     ax.set_zlim(mid[2] - max_half, mid[2] + max_half)
 
+    # --- info box: fixed position, natural height ---
+    # Place it where you circled: a bit right of the left margin, below the title.
+    BOX_X = 0.25
+    BOX_Y = 0.85
+
+    if USE_TUNED_SETTINGS:
+        lp = tuning.get("laser_power", None) if isinstance(tuning, dict) else None
+        ex = tuning.get("exposure", None) if isinstance(tuning, dict) else None
+        ae = tuning.get("auto_exposure", None) if isinstance(tuning, dict) else None
+
+        def _fmt(x):
+            try:
+                return f"{float(x):.0f}"
+            except Exception:
+                return "n/a"
+
+        ae_str = "n/a"
+        try:
+            if ae is not None:
+                ae_str = "ON" if float(ae) > 0.5 else "OFF"
+        except Exception:
+            ae_str = "n/a"
+
+        lines = [
+            r"$\bf{Depth\ tuning}$",
+            f"Laser power: {_fmt(lp)}",
+            f"Exposure: {_fmt(ex)}",
+            f"Auto exposure: {ae_str}",
+        ]
+    else:
+        lines = [r"$\bf{No\ depth\ tuning}$"]
+
+    fig.text(
+        BOX_X, BOX_Y,
+        "\n".join(lines),
+        va="top", ha="left",
+        fontsize=12,
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor="0.3", alpha=0.95),
+    )
+
     ax.legend(loc="upper right", frameon=True)
     plt.show(block=True)
 
@@ -300,21 +558,14 @@ def show_plane_fit_histogram(
     inliers: np.ndarray,
     ransac_thresh_m: float | None = None,
     bins: int = 60,
-    x_quantile: float = 99.5,
     density: bool = False,
-    title: str = r"RANSAC plane fit: inlier distance distribution",
 ):
-    """
-    Histogram for inlier point-to-plane distances.
-
-    - density=False: y-axis is Count (default)
-    - density=True : y-axis is Probability density (better for comparing different n)
-    """
-
     pts3d = np.asarray(pts3d, dtype=float)
     inliers = np.asarray(inliers, dtype=int)
 
-    # --- plane parameters ---
+    total_points = pts3d.shape[0]
+    inlier_count = len(inliers)
+
     a, b, c, d = [float(x) for x in plane_model]
     nvec = np.array([a, b, c], dtype=float)
     n_norm = np.linalg.norm(nvec)
@@ -322,33 +573,23 @@ def show_plane_fit_histogram(
         print("Invalid plane normal.")
         return
 
-    # --- distances (inliers only) in mm ---
+    # --- perpendicular distances (inliers only) in mm ---
     d_perp_mm = (np.abs(pts3d[inliers] @ nvec + d) / n_norm) * 1000.0
 
-    # --- stats ---
-    N = int(d_perp_mm.size)
+    # --- statistics ---
     d_mean = float(np.mean(d_perp_mm))
     d_med  = float(np.median(d_perp_mm))
     d_p95  = float(np.percentile(d_perp_mm, 95))
     tau_mm = (ransac_thresh_m * 1000.0) if ransac_thresh_m is not None else None
 
-    # x-range: show at least up to tau if given, otherwise show some tail beyond P95
-    if tau_mm is not None:
-        xmax = max(tau_mm, d_p95 * 1.2)
-    else:
-        xmax = d_p95 * 1.8
+    xmax = max((tau_mm if tau_mm is not None else 0.0), d_p95 * 1.8)
     xmax = max(xmax, 1e-6)
 
-    # --- histogram counts (manual drawing so only bars are colored) ---
     counts, edges = np.histogram(d_perp_mm, bins=bins, range=(0.0, xmax))
     widths = np.diff(edges)
     lefts = edges[:-1]
-    centers = lefts + 0.5 * widths
 
-    is_left = centers <= d_p95
-    is_right = ~is_left
-
-    # --- style (LaTeX-like) ---
+    # --- LaTeX style ---
     plt.rcParams.update({
         "text.usetex": True,
         "font.family": "serif",
@@ -361,40 +602,52 @@ def show_plane_fit_histogram(
 
     fig, ax = plt.subplots()
 
-    # bars
-    ax.bar(lefts[is_left], counts[is_left], width=widths[is_left],
-           align="edge", alpha=0.85, color="#1f77b4", edgecolor="none")
-    ax.bar(lefts[is_right], counts[is_right], width=widths[is_right],
-           align="edge", alpha=0.35, color="#d62728", edgecolor="none")
+    # --- draw histogram ---
+    bars = ax.bar(
+        lefts,
+        counts,
+        width=widths,
+        align="edge",
+        alpha=0.85,
+        edgecolor="none",
+    )
 
-    # --- short P95 marker (only slightly above the P95 bin) ---
-    k = int(np.clip(np.searchsorted(edges, d_p95, side="right") - 1, 0, len(counts) - 1))
-    bar_h = float(counts[k])
-    y0 = bar_h * 0.15          # start a bit above the bar base (looks nicer)
-    y1 = bar_h * 1.10 + 1.0    # end a bit above the bar
+    # --- color bins right of P95 red ---
+    for left, bar in zip(lefts, bars):
+        if left >= d_p95:
+            bar.set_color("#d62728")  # red (upper 5%)
+        else:
+            bar.set_color("#1f77b4")  # blue
 
-    ax.plot([d_p95, d_p95], [y0, y1], linestyle="--", linewidth=2.5, color="black")
-    ax.text(d_p95 + 0.02 * xmax, y1, r"$P_{95}$", ha="left", va="bottom")
+    # --- title with tuning state ---
+    if USE_TUNED_SETTINGS:
+        tuning_tag = r"$\mathrm{Depth\ tuning}$"
+    else:
+        tuning_tag = r"$\mathrm{No\ depth\ tuning}$"
 
-    # labels
-    ax.set_title(r"RANSAC plane fit: distribution of $d_{\perp}$")
+    ax.set_title(
+        r"RANSAC plane fit: distribution of $d_{\perp}$ ("
+        + tuning_tag +
+        r")"
+    )
+
+    # --- axis labels ---
     ax.set_xlabel(r"Point-to-plane distance $d_{\perp}\;[\mathrm{mm}]$")
-    ax.set_ylabel(r"Count")
+    ax.set_ylabel(r"Count" if not density else r"Density")
 
-    ax.set_xlim(left=0.0, right=xmax)
-    ax.set_ylim(bottom=0.0)
     ax.grid(True, alpha=0.2)
+    ax.set_xlim(0.0, xmax)
+    ax.set_ylim(bottom=0.0)
 
-    # --- stats-only legend (INSIDE upper-right, guaranteed visible) ---
-    # Create dummy handles (invisible) so legend shows text lines only
+    # --- statistics legend ---
     handles = [ax.plot([], [], " ")[0] for _ in range(5)]
-
     labels = [
-        rf"$n={N}$",
+        rf"$n={inlier_count}/{total_points}$",
         rf"$\bar{{d}}={d_mean:.3f}\,\mathrm{{mm}}$",
         rf"$\tilde{{d}}={d_med:.3f}\,\mathrm{{mm}}$",
         rf"$P_{{95}}={d_p95:.3f}\,\mathrm{{mm}}$",
-        (rf"$\tau_{{\mathrm{{RANSAC}}}}={tau_mm:.1f}\,\mathrm{{mm}}$" if tau_mm is not None
+        (rf"$\tau_{{\mathrm{{RANSAC}}}}={tau_mm:.1f}\,\mathrm{{mm}}$"
+         if tau_mm is not None
          else rf"$\tau_{{\mathrm{{RANSAC}}}}=\mathrm{{n/a}}$")
     ]
 
@@ -404,18 +657,25 @@ def show_plane_fit_histogram(
     plt.show(block=True)
 
 
+# =========================
+# Main
+# =========================
 def main():
     pattern_size = (3, 3)
     det_width = 640
     rect_pad_px = 15
-    max_points = 40000
+
+    max_points = 5000
     z_min, z_max = 0.15, 2.0
-    ransac_thresh_m = 0.005   # threshold based on expected depth noise
+
+    ransac_thresh_m = 0.0015
     ransac_n = 3
     ransac_iters = 1000
 
-    pipeline, align = start_realsense_rgbd(fps=30)
+    pipeline, align, profile, depth_sensor = start_realsense_rgbd(fps=30)
+
     setup_window(LIVE_WIN)
+    setup_window(DEPTH_WIN)
 
     try:
         while True:
@@ -432,6 +692,7 @@ def main():
 
             found_live, _ = cbd.detect_classic_downscaled(gray, pattern_size, det_width=det_width)
 
+            # --- RGB overlay ---
             vis_live = color.copy()
             if found_live:
                 cv2.putText(vis_live, "FOUND (press SPACE to capture)", (30, 60),
@@ -441,11 +702,28 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA)
 
             cv2.imshow(LIVE_WIN, vis_live)
+
+            # --- Depth preview (aligned) ---
+            depth_vis = depth_to_vis_bgr(df)
+            cv2.putText(depth_vis, "DEPTH (aligned)", (30, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.imshow(DEPTH_WIN, depth_vis)
+
             key = cv2.waitKey(1) & 0xFF
 
-            if key == 27:
+            if key == 27:  # ESC
                 break
 
+            # --- SPACE: always save depth snapshot + meta ---
+            if key == 32:
+                save_depth_snapshot_with_meta(
+                    df_aligned=df,
+                    depth_sensor=depth_sensor,
+                    use_tuned=USE_TUNED_SETTINGS,
+                    prefix="depth",
+                )
+
+            # Capture only on SPACE when pattern is found
             if key != 32 or not found_live:
                 continue
 
@@ -471,10 +749,17 @@ def main():
             H, W = snap_color.shape[:2]
             rect = rect_from_extremes(extremes, W, H, pad_px=rect_pad_px)
 
+            # show depth snapshot with ROI (preview)
+            depth_snap = depth_to_vis_bgr(df)
+            depth_snap = draw_support_rect(depth_snap, rect, color=(0, 165, 255), thickness=2)
+            cv2.imshow(DEPTH_SNAP_WIN, depth_snap)
+            cv2.waitKey(10)
+            save_preview_same_dir(depth_snap, "plane_fitting_depth_snapshot_roi.png")
+
             redo_seed = 0
             accepted = False
             accepted_cache = None
-            
+
             while True:
                 pts3d = sample_points_3d_in_rect(
                     depth_frame_aligned=df,
@@ -504,44 +789,50 @@ def main():
                 normal /= np.linalg.norm(normal) + 1e-12
 
                 print("\nRANSAC plane fitting")
-                print(f"Plane model (a,b,c,d): [{plane_model[0]:+.6f}, {plane_model[1]:+.6f}, {plane_model[2]:+.6f}, {plane_model[3]:+.6f}]")
+                print(f"Plane model (a,b,c,d): [{plane_model[0]:+.6f}, {plane_model[1]:+.6f}, "
+                      f"{plane_model[2]:+.6f}, {plane_model[3]:+.6f}]")
                 print(f"Normal: [{normal[0]:+.6f}, {normal[1]:+.6f}, {normal[2]:+.6f}]")
-                
+
                 if len(inliers) == 0:
-                    print("WARNING: No inliers returned by RANSAC. Cannot compute inlier mean/median.")
+                    print("WARNING: No inliers returned by RANSAC. Cannot compute stats.")
                 else:
-                    inlier_dev_mm = inlier_deviations * 1000.0  # m -> mm
+                    inlier_dev_mm = inlier_deviations * 1000.0
                     mean_mm = float(np.mean(inlier_dev_mm))
                     median_mm = float(np.median(inlier_dev_mm))
                     std_mm = float(np.std(inlier_dev_mm))
                     max_mm = float(np.max(inlier_dev_mm))
-                
+
                     print(f"Inliers: {len(inliers)}/{len(pts3d)} ({len(inliers)/len(pts3d):.3f})")
                     print(f"Inlier distance mean:   {mean_mm:.3f} mm")
                     print(f"Inlier distance median: {median_mm:.3f} mm")
-                    print(f"Inlier distance std: {std_mm:.3f} mm")
-                    print(f"Inlier distance max: {max_mm:.3f} mm")
+                    print(f"Inlier distance std:    {std_mm:.3f} mm")
+                    print(f"Inlier distance max:    {max_mm:.3f} mm")
 
                 preview = snap_color.copy()
-                preview = draw_extremes(preview, extremes, color=(208, 224, 64), radius=10, thickness=-1)
+                preview = draw_extremes(preview, extremes, color=(208, 224, 64),
+                                        radius=6, thickness=-1, draw_labels=False)
+                preview = draw_support_rect(preview, rect, color=(0, 165, 255), thickness=2)
                 top_left = extremes["top_left"]
                 preview = draw_axes_top_left(preview, origin=(int(round(top_left[0])), int(round(top_left[1]))))
+
+                save_preview_same_dir(preview, "plane_fitting_01_corners_support.png")
 
                 cv2.imshow(PLANE_WIN, preview)
                 cv2.waitKey(10)
 
                 if ask_plane_satisfied():
                     cv2.destroyWindow(RES_WIN)
-                    
+
                     accepted = True
                     accepted_cache = {
                         "pts3d": pts3d,
-                        "inliers": inliers,         # int indices
+                        "inliers": inliers,
                         "plane_model": plane_model,
                     }
                     break
+
                 redo_seed += 1
-                
+
             if accepted and accepted_cache is not None:
                 while True:
                     k = cv2.waitKey(50) & 0xFF
@@ -549,9 +840,9 @@ def main():
                         break
 
                 cv2.destroyWindow(PLANE_WIN)
+
                 inlier_pts3d = accepted_cache["pts3d"][accepted_cache["inliers"]]
 
-                # optional downsample for clarity/speed
                 max_plot = 8000
                 if inlier_pts3d.shape[0] > max_plot:
                     rng = np.random.default_rng(0)
@@ -561,16 +852,17 @@ def main():
                 show_plane_fit_3d(
                     inlier_pts3d=inlier_pts3d,
                     plane_model=accepted_cache["plane_model"],
-                    title="RANSAC plane fit: inliers + fitted plane + normal"
+                    title="RANSAC plane fit: inliers + fitted plane + normal",
+                    tuning=get_depth_settings_dict(depth_sensor)
                 )
-                
+
                 show_plane_fit_histogram(
                     pts3d=accepted_cache["pts3d"],
                     plane_model=accepted_cache["plane_model"],
                     inliers=accepted_cache["inliers"],
-                    ransac_thresh_m=ransac_thresh_m,   # nur für Legende
+                    ransac_thresh_m=ransac_thresh_m,
                     bins=60,
-                    density=False,   # oder True
+                    density=False,
                 )
                 return
 

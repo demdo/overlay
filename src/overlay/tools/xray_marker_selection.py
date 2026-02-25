@@ -44,64 +44,66 @@ def fit_circle_kasa(points_xy: np.ndarray) -> Tuple[float, float, float] | None:
     return float(xc), float(yc), float(r)
 
 
-def detector_mask_radial(
-    img_u8: np.ndarray,
-    n_angles: int = 360,
-    r_min_frac: float = 0.20,
-    r_max_frac: float = 0.98,
-    smooth_sigma: float = 2.0,
-    peak_prominence: float = 0.0,
-    shrink_px: int = 12,
-) -> Tuple[np.ndarray, Tuple[float, float, float]]:
-    """Create a circular mask by finding the boundary via radial gradients."""
-    if img_u8.ndim != 2 or img_u8.dtype != np.uint8:
-        raise ValueError("detector_mask_radial expects a uint8 grayscale image.")
+def detector_mask(
+    img_gray: np.ndarray,
+    blur_ks: int = 11,
+    thr_mode: str = "otsu",
+    adaptive_block: int = 51,
+    adaptive_C: int = -5,
+    close_ks: int = 41,
+    close_iter: int = 1,
+) -> np.ndarray:
+    if img_gray.ndim != 2:
+        raise ValueError("img_gray must be grayscale (H,W).")
+    h, w = img_gray.shape
 
-    h, w = img_u8.shape
-    cx0, cy0 = w / 2.0, h / 2.0
-    r0 = 0.5 * min(h, w)
+    # 1) Smooth
+    k = blur_ks if blur_ks % 2 == 1 else blur_ks + 1
+    blur = cv2.GaussianBlur(img_gray, (k, k), 0)
 
-    img_blur = cv2.GaussianBlur(img_u8, (0, 0), smooth_sigma)
-    gx = cv2.Sobel(img_blur, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(img_blur, cv2.CV_32F, 0, 1, ksize=3)
-    grad_mag = cv2.magnitude(gx, gy)
+    # 2) Binarize
+    if thr_mode == "adaptive":
+        blk = adaptive_block if adaptive_block % 2 == 1 else adaptive_block + 1
+        bw = cv2.adaptiveThreshold(
+            blur, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blk, adaptive_C
+        )
+    else:
+        _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    r_min = int(max(5, r_min_frac * r0))
-    r_max = int(max(r_min + 10, r_max_frac * r0))
+    if np.mean(bw) > 220:
+        bw = 255 - bw
 
-    boundary_pts: List[List[float]] = []
-    angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False).astype(np.float32)
-    rs = np.arange(r_min, r_max, dtype=np.float32)
+    # 3) Contours
+    cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return np.full((h, w), 255, dtype=np.uint8)
 
-    for th in angles:
-        xs = cx0 + rs * np.cos(th)
-        ys = cy0 + rs * np.sin(th)
+    def touches_border(c: np.ndarray) -> bool:
+        xs = c[:, 0, 0]
+        ys = c[:, 0, 1]
+        return (xs.min() <= 1) or (ys.min() <= 1) or (xs.max() >= w-2) or (ys.max() >= h-2)
 
-        xs_i = np.clip(xs, 0, w - 1).astype(np.int32)
-        ys_i = np.clip(ys, 0, h - 1).astype(np.int32)
+    # 4) Candidates
+    nb = [c for c in cnts if not touches_border(c)]
+    candidates = nb if len(nb) > 0 else cnts
 
-        prof = grad_mag[ys_i, xs_i]
-        k = int(np.argmax(prof))
-
-        if peak_prominence > 0.0 and prof[k] < peak_prominence:
-            continue
-
-        boundary_pts.append([xs[k], ys[k]])
-
-    boundary_pts = np.array(boundary_pts, dtype=np.float32)
-
-    circle = fit_circle_kasa(boundary_pts)
-    if circle is None:
-        mask = np.ones((h, w), dtype=np.uint8) * 255
-        return mask, (cx0, cy0, r0)
-
-    cx, cy, r = circle
-    r = max(1.0, r - float(shrink_px))
-
+    largest = max(candidates, key=cv2.contourArea)
     mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.circle(mask, (int(round(cx)), int(round(cy))), int(round(r)), 255, -1)
+    cv2.drawContours(mask, [largest], -1, 255, thickness=-1)
 
-    return mask, (cx, cy, r)
+    # 6) Closing
+    if close_ks > 1:
+        kc = close_ks if close_ks % 2 == 1 else close_ks + 1
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE,
+            np.ones((kc, kc), np.uint8),
+            iterations=close_iter
+        )
+
+    return mask
 
 
 def sort_circles_grid(circles: np.ndarray, row_tol_px: float = 13.0) -> np.ndarray:
@@ -160,39 +162,86 @@ def nearest_cell(prepared, x_click: int, y_click: int):
 
 
 def rect_cells_from_selected(circles_grid: np.ndarray, selected_cells: Sequence[Cell]):
-    """Return finite cells in rectangle spanned by selected cells."""
+    """Return finite cells inside the XY bounding box spanned by selected cells."""
     if circles_grid.ndim != 3 or circles_grid.shape[2] != 3:
         raise ValueError("circles_grid must have shape (nrows, ncols, 3).")
     if len(selected_cells) < 3:
         raise ValueError("selected_cells must contain at least 3 entries.")
-    
-    rows_sel = [p[0] for p in selected_cells]
-    cols_sel = [p[1] for p in selected_cells]
-    r0, r1 = int(min(rows_sel)), int(max(rows_sel))
-    c0, c1 = int(min(cols_sel)), int(max(cols_sel))
+
+    # Anchor coordinates (x,y)
+    ax = []
+    ay = []
+    ar = []
+    for (i, j) in selected_cells:
+        x, y, r = circles_grid[i, j]
+        if not np.isfinite(x):
+            continue
+        ax.append(float(x))
+        ay.append(float(y))
+        ar.append(float(r))
+
+    if len(ax) < 3:
+        raise ValueError("Selected cells must refer to finite grid entries.")
+
+    # Small margin so you don't lose edge points
+    margin = 0.75 * float(np.median(ar)) if ar else 0.0
+
+    xmin, xmax = min(ax) - margin, max(ax) + margin
+    ymin, ymax = min(ay) - margin, max(ay) + margin
 
     rect_cells = set()
-    for i in range(r0, r1 + 1):
-        for j in range(c0, c1 + 1):
+    nrows, ncols, _ = circles_grid.shape
+    for i in range(nrows):
+        for j in range(ncols):
             x, y, _ = circles_grid[i, j]
-            if np.isfinite(x):
+            if not np.isfinite(x):
+                continue
+            xf = float(x)
+            yf = float(y)
+            if (xmin <= xf <= xmax) and (ymin <= yf <= ymax):
                 rect_cells.add((i, j))
 
-    # Ensure the 3 anchors included
     rect_cells.update(selected_cells)
     return rect_cells
 
-    
+
+""" 
 def extract_xy_from_cells(circles_grid: np.ndarray, cells: Iterable[Cell]) -> np.ndarray:
-    """Return (N,2) array of x,y values for provided cell indices."""
-    cells_sorted = sorted(cells)
-    if not cells_sorted:
+    #Return (N,2) array of x,y values for provided cell indices, ordered by (y,x).
+    cells_list = list(cells)
+    if not cells_list:
         return np.empty((0, 2), dtype=np.float32)
-    return np.array(
-        [(circles_grid[i, j, 0], circles_grid[i, j, 1]) for (i, j) in cells_sorted],
+
+    xy = np.array(
+        [(circles_grid[i, j, 0], circles_grid[i, j, 1]) for (i, j) in cells_list],
         dtype=np.float32,
     )
 
+    # Deterministic order independent of grid padding:
+    # sort by y, then x
+    order = np.lexsort((xy[:, 0], xy[:, 1]))
+    return xy[order]
+"""
+
+def extract_xy_from_cells(circles_grid: np.ndarray, cells: Iterable[Cell]) -> np.ndarray:
+    """
+    Return (N,2) array of (u,v) values for provided cell indices.
+
+    Ordering is strictly row-major by grid index (i,j).
+    This guarantees correct correspondences for PnP.
+    """
+    cells_list = list(cells)
+    if not cells_list:
+        return np.empty((0, 2), dtype=np.float32)
+
+    # Sort by grid indices (top->bottom, left->right)
+    cells_sorted = sorted(cells_list, key=lambda ij: (ij[0], ij[1]))
+
+    xy = np.array(
+        [(circles_grid[i, j, 0], circles_grid[i, j, 1]) for (i, j) in cells_sorted],
+        dtype=np.float32,
+    )
+    return xy
 
 def select_marker_roi_from_grid(
     circles_grid: np.ndarray,

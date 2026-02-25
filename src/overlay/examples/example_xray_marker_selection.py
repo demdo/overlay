@@ -8,10 +8,11 @@ Interactive test runner for marker_selection helpers.
 import sys
 import cv2
 import numpy as np
+import pydicom
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 from overlay.tools.xray_marker_selection import (
-    detector_mask_radial,
+    detector_mask,
     nearest_cell,
     prepare_nearest_cell_data,
     select_marker_roi_from_grid,
@@ -33,9 +34,23 @@ def open_image_file() -> str:
         None,
         "Select marker image",
         "",
-        "Image files (*.png *.jpg *.jpeg *.tif *.tiff *.bmp);;All files (*.*)",
+        "Image files (*.png *.jpg *.jpeg *.tif *.tiff *.bmp);;"
+        "DICOM files (*.dcm *.ima *.IMA);;"
+        "All files (*.*)",
     )
     return path
+
+
+def load_image(path):
+    if path.lower().endswith((".dcm", ".ima")):
+        ds = pydicom.dcmread(path)
+        img = ds.pixel_array.astype(np.float32)
+        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+        img = img.astype(np.uint8)
+
+        return img
+    else:
+        return cv2.imread(path, cv2.IMREAD_GRAYSCALE)
 
 
 def _render_overlay(
@@ -180,33 +195,26 @@ def select_marker_roi_with_ui(
 
 def main():
     params = HoughCircleParams(
-        min_radius=3,
+        min_radius=2,
         max_radius=7,
         dp=1.2,
-        minDist=26,
+        minDist=16,
         param1=120,
-        param2=8,
+        param2=12,
         invert=True,
-        median_ks=5,
+        median_ks=(3,4),
     )
 
     use_clahe = True
     clahe_clip = 2.0
     clahe_tiles = (12, 12)
-
-    n_angles = 360
-    smooth_sigma = 2.0
-    r_min_frac = 0.20
-    r_max_frac = 0.98
-    shrink_px = 12
-
     row_tol_px = 13.0
 
     image_path = open_image_file()
     if not image_path:
         raise RuntimeError("No image selected.")
 
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    img = load_image(image_path)
     if img is None:
         raise FileNotFoundError(image_path)
 
@@ -214,24 +222,15 @@ def main():
     if use_clahe:
         clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=clahe_tiles)
         img_proc = clahe.apply(img_proc)
-
-    mask, _ = detector_mask_radial(
-        img_proc,
-        n_angles=n_angles,
-        r_min_frac=r_min_frac,
-        r_max_frac=r_max_frac,
-        smooth_sigma=smooth_sigma,
-        peak_prominence=0.0,
-        shrink_px=shrink_px,
-    )
-
+        
+    mask = detector_mask(img_proc)
     img_masked = img_proc.copy()
     img_masked[mask == 0] = 0
-
+    
     circles_out = detect_blobs_hough(img_masked, params)
     if circles_out is None or len(circles_out) == 0:
         raise RuntimeError("No circles detected.")
-
+        
     circles_out = np.asarray(circles_out, dtype=np.float32)
     circles_sorted = sort_circles_grid(circles_out, row_tol_px=row_tol_px)
 

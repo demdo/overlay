@@ -40,6 +40,7 @@ class XrayMarkerSelectionWidget(QWidget):
     """
 
     selection_proposed = Signal(object)  # {"uv": [(u,v),...], "cells": [(r,c),...]}
+    selection_changed = Signal() 
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -114,9 +115,11 @@ class XrayMarkerSelectionWidget(QWidget):
         self._roi_cells.clear()
         self._locked = False
         self.update()
+        self.selection_changed.emit()
 
     def set_locked(self, locked: bool):
         self._locked = bool(locked)
+        self.update()
 
     def set_roi_cells(self, cells: List[Cell]):
         self._roi_cells = set(cells) if cells is not None else set()
@@ -165,12 +168,30 @@ class XrayMarkerSelectionWidget(QWidget):
 
         grid = self._circles_grid
         nrows, ncols, _ = grid.shape
+        
+        r_values = grid[..., 2]
+        finite_r = r_values[np.isfinite(r_values)]
+        
+        if finite_r.size > 0:
+            r_med = float(np.median(finite_r))
+        else:
+            r_med = 5.0  # fallback
+        
+        rd_display = int(round(r_med * self._scale))
+        rd_display = max(1, rd_display)
 
-        pen_normal = QPen(QColor(0, 255, 0), 2)
-        pen_anchor = QPen(QColor(0, 255, 255), 4)
-        pen_roi    = QPen(QColor(255, 165, 0), 3)
-        pen_cross  = QPen(QColor(255, 0, 0), 1)
-        pen_hover  = QPen(QColor(255, 255, 0), 2)
+        # thickness proportional to image scaling
+        t_normal = max(1, int(round(2 * self._scale)))
+        t_anchor = max(1, int(round(4 * self._scale)))
+        t_roi    = max(1, int(round(3 * self._scale)))
+        t_cross  = max(1, int(round(1 * self._scale)))
+        t_hover  = max(1, int(round(2.0 * self._scale)))
+        
+        pen_normal = QPen(QColor(0, 255, 0), t_normal)
+        pen_anchor = QPen(QColor(0, 255, 255), t_anchor)
+        pen_roi    = QPen(QColor(255, 165, 0), t_roi)
+        pen_cross  = QPen(QColor(255, 0, 0), t_cross)
+        pen_hover  = QPen(QColor(255, 255, 0), t_hover)
 
         for i in range(nrows):
             for j in range(ncols):
@@ -180,7 +201,7 @@ class XrayMarkerSelectionWidget(QWidget):
 
                 xd = int(round(self._off_x + float(x) * self._scale))
                 yd = int(round(self._off_y + float(y) * self._scale))
-                rd = int(round(float(r) * self._scale))
+                rd = rd_display
 
                 cell = (i, j)
                 if cell in self._highlight_cells:
@@ -194,8 +215,9 @@ class XrayMarkerSelectionWidget(QWidget):
                 painter.drawEllipse(xd - rd, yd - rd, 2 * rd, 2 * rd)
 
                 painter.setPen(pen_cross)
-                painter.drawLine(xd - 5, yd, xd + 5, yd)
-                painter.drawLine(xd, yd - 5, xd, yd + 5)
+                cross = int(np.clip(0.35 * rd, 2, 6))  # tweak: 0.35, min 2px, max 6px
+                painter.drawLine(xd - cross, yd, xd + cross, yd)
+                painter.drawLine(xd, yd - cross, xd, yd + cross)
 
         if (not self._locked) and (self._hover_cell is not None):
             i, j = self._hover_cell
@@ -235,6 +257,7 @@ class XrayMarkerSelectionWidget(QWidget):
             self._selected_cells.append(cell)
             self._highlight_cells.add(cell)
             self.update()
+            self.selection_changed.emit()
 
             if len(self._selected_cells) == 3:
                 anchors_uv = []
@@ -253,6 +276,7 @@ class XrayMarkerSelectionWidget(QWidget):
                 last = self._selected_cells.pop()
                 self._highlight_cells.discard(last)
                 self.update()
+                self.selection_changed.emit()
 
     def mouseMoveEvent(self, event):
         if self._locked:
@@ -277,3 +301,6 @@ class XrayMarkerSelectionWidget(QWidget):
         if new_hover != self._hover_cell:
             self._hover_cell = new_hover
             self.update()
+            
+    def get_selected_cells(self):
+        return list(self._selected_cells)
