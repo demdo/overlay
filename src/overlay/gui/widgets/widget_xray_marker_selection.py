@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple, Set, Dict, Any
+from typing import List, Optional, Tuple, Set
 
 import numpy as np
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 from PySide6.QtWidgets import QWidget
-
-from overlay.tools.xray_marker_selection import (
-    prepare_nearest_cell_data,
-    nearest_cell,
-)
 
 Cell = Tuple[int, int]
 
@@ -39,7 +34,7 @@ class XrayMarkerSelectionWidget(QWidget):
         NO:  page calls clear_selection()
     """
 
-    selection_proposed = Signal(object)  # {"uv": [(u,v),...], "cells": [(r,c),...]}
+    selection_proposed = Signal(list)  # List[Cell] (3 anchor cells)
     selection_changed = Signal() 
 
     def __init__(self, parent=None):
@@ -72,6 +67,35 @@ class XrayMarkerSelectionWidget(QWidget):
 
         # Lock interaction after confirmation
         self._locked: bool = False
+        
+    # ---------------- Picking helpers ----------------
+
+    def _prepare_nearest_cell_data(self, circles_grid: np.ndarray):
+        if circles_grid is None:
+            return None
+
+        x = circles_grid[..., 0]
+        y = circles_grid[..., 1]
+        finite = np.isfinite(x) & np.isfinite(y)
+
+        if not np.any(finite):
+            return None
+
+        ij = np.argwhere(finite).astype(np.int32)
+        xy = circles_grid[finite][:, :2].astype(np.float32)
+        return ij, xy
+
+    def _nearest_cell(self, prepared, x: float, y: float):
+        if prepared is None:
+            return None, float("inf")
+
+        ij, xy = prepared
+        q = np.array([float(x), float(y)], dtype=np.float32)
+        d2 = np.sum((xy - q) ** 2, axis=1)
+        k = int(np.argmin(d2))
+        dist = float(np.sqrt(d2[k]))
+        i, j = ij[k]
+        return (int(i), int(j)), dist
 
     # ---------------- Public API ----------------
 
@@ -97,7 +121,7 @@ class XrayMarkerSelectionWidget(QWidget):
         if circles_grid is None:
             self._prepared = None
         else:
-            self._prepared = prepare_nearest_cell_data(circles_grid)
+            self._prepared = self._prepare_nearest_cell_data(circles_grid)
 
         if pick_radius_px is not None:
             self._pick_radius_px = float(pick_radius_px)
@@ -221,13 +245,17 @@ class XrayMarkerSelectionWidget(QWidget):
 
         if (not self._locked) and (self._hover_cell is not None):
             i, j = self._hover_cell
-            x, y, r = grid[i, j]
+            x, y, _ = grid[i, j]
             if np.isfinite(x):
                 xd = int(round(self._off_x + float(x) * self._scale))
                 yd = int(round(self._off_y + float(y) * self._scale))
-                rd = int(round(float(r) * self._scale))
+        
+                # Use pick radius (consistent with click threshold)
+                rd = int(round(self._pick_radius_px * self._scale))
+                rd = max(2, rd)
+        
                 painter.setPen(pen_hover)
-                painter.drawEllipse(xd - rd - 3, yd - rd - 3, 2 * rd + 6, 2 * rd + 6)
+                painter.drawEllipse(xd - rd, yd - rd, 2 * rd, 2 * rd)
 
         painter.end()
 
@@ -248,7 +276,7 @@ class XrayMarkerSelectionWidget(QWidget):
         x, y = self._widget_to_image_xy(xw, yw)
 
         if event.button() == Qt.LeftButton:
-            cell, dist = nearest_cell(self._prepared, x, y)
+            cell, dist = self._nearest_cell(self._prepared, x, y)
             if cell is None or dist > self._pick_radius_px:
                 return
             if cell in self._highlight_cells:
@@ -260,16 +288,7 @@ class XrayMarkerSelectionWidget(QWidget):
             self.selection_changed.emit()
 
             if len(self._selected_cells) == 3:
-                anchors_uv = []
-                for (ri, ci) in self._selected_cells:
-                    px, py, _ = self._circles_grid[ri, ci]
-                    anchors_uv.append((float(px), float(py)))
-
-                payload: Dict[str, Any] = {
-                    "uv": anchors_uv,
-                    "cells": list(self._selected_cells),
-                }
-                self.selection_proposed.emit(payload)
+                self.selection_proposed.emit(list(self._selected_cells))
 
         elif event.button() == Qt.RightButton:
             if self._selected_cells:
@@ -295,7 +314,7 @@ class XrayMarkerSelectionWidget(QWidget):
             return
 
         x, y = self._widget_to_image_xy(xw, yw)
-        cell, dist = nearest_cell(self._prepared, x, y)
+        cell, dist = self._nearest_cell(self._prepared, x, y)
 
         new_hover = cell if (cell is not None and dist <= self._pick_radius_px) else None
         if new_hover != self._hover_cell:

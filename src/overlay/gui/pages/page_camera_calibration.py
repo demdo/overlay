@@ -103,8 +103,6 @@ class CameraCalibrationPage(LiveImagePage):
         # adopt intrinsics from state if already present (so button gating works)
         if getattr(self.state, "K_rgb", None) is not None:
             self._K = np.asarray(self.state.K_rgb, dtype=np.float64)
-        if getattr(self.state, "dist_rgb", None) is not None:
-            self._dist = np.asarray(self.state.dist_rgb, dtype=np.float64)
 
         self._update_buttons()
         self._update_panels()
@@ -354,7 +352,6 @@ class CameraCalibrationPage(LiveImagePage):
 
         # clear session outputs
         self.state.K_rgb = None
-        self.state.dist_rgb = None
 
         self._det = None
         self._found = False
@@ -463,7 +460,6 @@ class CameraCalibrationPage(LiveImagePage):
         self._rms = float(rms)
 
         self.state.K_rgb = self._K.copy()
-        self.state.dist_rgb = self._dist.copy()
 
         self._avg_reproj_px = None
         self._last_stats_rows = None

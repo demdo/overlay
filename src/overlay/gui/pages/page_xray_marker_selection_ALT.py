@@ -13,11 +13,12 @@ from overlay.gui.state import SessionState
 from overlay.gui.pages.templates.templ_static_image import StaticImagePage
 from overlay.gui.widgets.widget_xray_marker_selection import XrayMarkerSelectionWidget
 
-from overlay.tools.blob_detection import HoughCircleParams
 from overlay.tools.xray_marker_selection import (
-    run_xray_marker_detection,
-    compute_roi_from_grid,
+    detector_mask,
+    sort_circles_grid,
+    select_marker_roi_from_grid,
 )
+from overlay.tools.blob_detection import HoughCircleParams, detect_blobs_hough
 
 
 class XrayMarkerSelectionPage(StaticImagePage):
@@ -227,10 +228,10 @@ class XrayMarkerSelectionPage(StaticImagePage):
     def on_detect_markers(self):
         if self.state.xray_image is None:
             return
-    
+
         try:
             img = self.state.xray_image
-    
+
             params = HoughCircleParams(
                 min_radius=2,
                 max_radius=7,
@@ -241,70 +242,113 @@ class XrayMarkerSelectionPage(StaticImagePage):
                 invert=True,
                 median_ks=(3, 5),
             )
-    
-            res = run_xray_marker_detection(
-                img,
-                hough_params=params,
-                use_clahe=True,
-                clahe_clip=2.0,
-                clahe_tiles=(12, 12),
-                use_mask=True,
-                row_tol_px=13.0,
-            )
-    
-            if res.circles_grid is None or not np.isfinite(res.circles_grid[..., 0]).any():
+
+            use_clahe = True
+            clahe_clip = 2.0
+            clahe_tiles = (12, 12)
+            row_tol_px = 13.0
+
+            img_proc = img.copy()
+            if use_clahe:
+                clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=clahe_tiles)
+                img_proc = clahe.apply(img_proc)
+
+            mask = detector_mask(img_proc)
+            img_masked = img_proc.copy()
+            img_masked[mask == 0] = 0
+
+            circles_out = detect_blobs_hough(img_masked, params)
+            if circles_out is None or len(circles_out) == 0:
                 QMessageBox.warning(self, "Marker detection", "No circles detected.")
                 return
-    
-            circles_grid = res.circles_grid
-    
-            # store TRUE detected radius in EXISTING state field
+
+            circles_out = np.asarray(circles_out, dtype=np.float32)
+            circles_sorted = sort_circles_grid(circles_out, row_tol_px=row_tol_px)
+            if circles_sorted is None or len(circles_sorted) == 0:
+                QMessageBox.warning(self, "Marker detection", "No circles after sorting.")
+                return
+
+            r_med = float(np.median(circles_sorted[:, 2]))
+            y_thresh_px = 2.5 * r_med
+
+            c = circles_sorted.copy().astype(np.float32)
+            current = c[:1].copy()
+            y_ref = float(c[0, 1])
+            rows = []
+
+            for k in range(1, len(c)):
+                pt = c[k]
+                if abs(float(pt[1]) - y_ref) > y_thresh_px:
+                    sort_idx = np.argsort(current[:, 0])
+                    rows.append(current[sort_idx])
+                    current = pt.reshape(1, -1)
+                    y_ref = float(pt[1])
+                else:
+                    current = np.vstack([current, pt])
+                    y_ref = float(np.mean(current[:, 1]))
+
+            sort_idx = np.argsort(current[:, 0])
+            rows.append(current[sort_idx])
+            nrows = len(rows)
+
+            center_row_idx = int(np.argmax([len(row) for row in rows]))
+            ncols = len(rows[center_row_idx])
+
+            circles_grid = np.full((nrows, ncols, 3), np.nan, dtype=np.float32)
+            for i, row in enumerate(rows):
+                n_points = len(row)
+                left_pad = (ncols - n_points) // 2
+                padded_row = np.full((ncols, 3), np.nan, dtype=np.float32)
+                padded_row[left_pad:left_pad + n_points] = row
+                circles_grid[i] = padded_row
+
             radii = circles_grid[..., 2]
             finite_r = radii[np.isfinite(radii)]
+
+            # store TRUE detected radius in EXISTING state field
             if finite_r.size:
                 self.state.marker_radius_px = float(np.median(finite_r))
             else:
                 self.state.marker_radius_px = None
-    
+
             # keep pick radius LOCAL (interaction only)
             if self.state.marker_radius_px is not None:
                 pick_radius_px = 0.6 * float(self.state.marker_radius_px)
             else:
                 pick_radius_px = 20.0
-    
+
             self._circles_grid = circles_grid
             self._pick_radius_px = float(pick_radius_px)
-    
+
             # reset selection/confirmation + overlay (EXISTING state fields)
             self.state.xray_points_uv = None
             self.state.xray_points_confirmed = False
             self.state.xray_marker_overlay_bgr = None
-    
+
             self.marker_widget.clear_selection()
             self.marker_widget.set_roi_cells([])
             self.marker_widget.set_locked(False)
-    
+
             self.refresh()
             self.on_complete_changed()
-    
+
         except Exception as e:
             QMessageBox.critical(self, "Marker detection failed", str(e))
 
     # ---------------- Confirm flow ----------------
 
-    def on_selection_proposed(self, cells):
+    def on_selection_proposed(self, payload):
+        cells = payload.get("cells", None)
         if cells is None or len(cells) != 3:
             return
-    
-        cells = [tuple(c) for c in cells]  # optional safety
-    
+
         ans = QMessageBox.question(
             self,
             "Confirm markers",
             "Do these 3 selected markers look correct?",
             QMessageBox.Yes | QMessageBox.No
         )
-    
+
         if ans != QMessageBox.Yes:
             self.state.xray_points_uv = None
             self.state.xray_points_confirmed = False
@@ -315,29 +359,24 @@ class XrayMarkerSelectionPage(StaticImagePage):
             self.refresh()
             self.on_complete_changed()
             return
-    
+
         if self._circles_grid is None:
-            # optional safety
-            self.marker_widget.clear_selection()
-            self.marker_widget.set_roi_cells([])
-            self.marker_widget.set_locked(False)
-            self.refresh()
-            self.on_complete_changed()
             return
-    
-        xy, roi_cells_set = compute_roi_from_grid(
+
+        xy, roi_cells_set = select_marker_roi_from_grid(
             circles_grid=self._circles_grid,
             selected_cells=cells,
         )
-    
+
         self.state.xray_points_uv = np.asarray(xy, dtype=float)
         self.state.xray_points_confirmed = True
-    
+
         self.marker_widget.set_roi_cells(list(roi_cells_set))
         self.marker_widget.set_locked(True)
-    
+
+        # Cache FULL-SIZE ROI overlay
         self.state.xray_marker_overlay_bgr = self._render_roi_overlay_bgr()
-    
+
         self.refresh()
         self.on_complete_changed()
 

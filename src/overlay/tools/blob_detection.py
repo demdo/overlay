@@ -4,31 +4,16 @@ from dataclasses import dataclass
 from typing import Union, Sequence, Optional
 
 
+# ============================================================
+# Parameter definition
+# ============================================================
+
 @dataclass(frozen=True)
 class HoughCircleParams:
     """
     Parameter set for Hough-based circular blob detection.
-
-    Attributes
-    ----------
-    min_radius : int
-        Minimum circle radius in pixels.
-    max_radius : int
-        Maximum circle radius in pixels.
-    dp : float
-        Inverse ratio of the accumulator resolution to the image resolution.
-    minDist : float
-        Minimum distance between the centers of detected circles.
-    param1 : float
-        Higher threshold for the internal Canny edge detector.
-    param2 : float
-        Accumulator threshold for circle center detection.
-        Smaller values lead to more false positives.
-    invert : bool
-        If True, invert the grayscale image before detection.
-    median_ks : int
-        Kernel size for median filtering (must be odd).
     """
+
     min_radius: int = 3
     max_radius: int = 7
     dp: float = 1.2
@@ -37,15 +22,16 @@ class HoughCircleParams:
     param2: float = 8
     invert: bool = True
     median_ks: Union[int, Sequence[int]] = (3, 5)
-    
+
 
 def _validate_params(params: HoughCircleParams) -> None:
+    """Sanity checks for Hough parameters."""
     if params.dp <= 0:
         raise ValueError("dp must be > 0.")
     if params.minDist <= 0:
         raise ValueError("minDist must be > 0.")
     if params.min_radius < 0 or params.max_radius < 0:
-        raise ValueError("min_radius and max_radius must be >= 0.")
+        raise ValueError("Radii must be >= 0.")
     if params.max_radius and params.min_radius > params.max_radius:
         raise ValueError("min_radius must be <= max_radius.")
     if params.param1 <= 0 or params.param2 <= 0:
@@ -53,10 +39,270 @@ def _validate_params(params: HoughCircleParams) -> None:
     if isinstance(params.median_ks, (list, tuple)):
         for ks in params.median_ks:
             if ks < 0:
-                raise ValueError("All median_ks values must be >= 0.")
+                raise ValueError("median_ks values must be >= 0.")
     else:
         if params.median_ks < 0:
             raise ValueError("median_ks must be >= 0.")
+
+
+# ============================================================
+# Blob scoring
+# ============================================================
+
+def _circle_blob_score(
+    img_u8: np.ndarray,
+    x: float,
+    y: float,
+    r: float,
+    *,
+    rin_factor: float = 0.60,
+    rout_factor: float = 1.40,
+) -> float:
+    """
+    Compute a local blobness score for a circle candidate.
+
+    The score is defined as:
+
+        mean(inner_disk) - mean(ring)
+
+    Returns
+    -------
+    float
+        Positive values indicate strong bright-blob contrast.
+        Returns -1e9 if the local support is invalid.
+    """
+    if img_u8.ndim != 2 or img_u8.dtype != np.uint8:
+        raise ValueError("_circle_blob_score expects uint8 grayscale image.")
+
+    if r < 1.0 or not np.isfinite(x) or not np.isfinite(y):
+        return -1e9
+
+    rin = max(1.0, rin_factor * r)
+    rout = max(rin + 1.0, rout_factor * r)
+
+    h, w = img_u8.shape
+
+    x0 = int(max(0, np.floor(x - rout - 2)))
+    x1 = int(min(w, np.ceil(x + rout + 2)))
+    y0 = int(max(0, np.floor(y - rout - 2)))
+    y1 = int(min(h, np.ceil(y + rout + 2)))
+
+    roi = img_u8[y0:y1, x0:x1]
+    if roi.size == 0:
+        return -1e9
+
+    yy, xx = np.ogrid[:roi.shape[0], :roi.shape[1]]
+    cx = x - x0
+    cy = y - y0
+    d2 = (xx - cx) ** 2 + (yy - cy) ** 2
+
+    disk = d2 <= rin ** 2
+    ring = (d2 > rin ** 2) & (d2 <= rout ** 2)
+
+    disk_px = disk.sum()
+    ring_px = ring.sum()
+
+    exp_disk = np.pi * rin ** 2
+    exp_ring = np.pi * (rout ** 2 - rin ** 2)
+
+    disk_min_px = max(3, int(0.30 * exp_disk))
+    ring_min_px = max(4, int(0.15 * exp_ring))
+
+    if disk_px < disk_min_px or ring_px < ring_min_px:
+        return -1e9
+
+    return float(np.mean(roi[disk]) - np.mean(roi[ring]))
+
+
+# ============================================================
+# Geometry helpers
+# ============================================================
+
+def _enforce_min_spacing(
+    c_xy: np.ndarray,
+    scores: np.ndarray,
+    min_sep: float,
+) -> np.ndarray:
+    """
+    Enforce minimum spacing between detections.
+
+    Keeps highest scoring detections first and removes
+    neighbors closer than min_sep.
+    """
+    order = np.argsort(-scores)
+    keep = []
+    min2 = min_sep ** 2
+
+    for idx in order:
+        xi, yi = c_xy[idx, 0], c_xy[idx, 1]
+        ok = True
+
+        for j in keep:
+            dx = xi - c_xy[j, 0]
+            dy = yi - c_xy[j, 1]
+            if dx * dx + dy * dy < min2:
+                ok = False
+                break
+
+        if ok:
+            keep.append(idx)
+
+    return c_xy[keep]
+
+
+# ============================================================
+# Duplicate suppression
+# ============================================================
+
+def _merge_near_duplicates(
+    circles: np.ndarray,
+    *,
+    dist_thr: float,
+    score_img: np.ndarray,
+) -> np.ndarray:
+    """
+    Remove duplicate detections using score-based NMS
+    and pitch-based minimum spacing enforcement.
+    """
+    c = np.asarray(circles, dtype=np.float64).reshape(-1, 3)
+    if c.size == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    scores = np.array(
+        [_circle_blob_score(score_img, x, y, r) for (x, y, r) in c],
+        dtype=np.float64,
+    )
+
+    valid = scores > -1e-8
+    c = c[valid]
+    scores = scores[valid]
+
+    if c.size == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    order = np.argsort(-scores)
+    thr2 = dist_thr ** 2
+    kept = []
+
+    for idx in order:
+        xi, yi = c[idx, :2]
+        ok = True
+
+        for j in kept:
+            dx = xi - c[j, 0]
+            dy = yi - c[j, 1]
+            if dx * dx + dy * dy <= thr2:
+                ok = False
+                break
+
+        if ok:
+            kept.append(idx)
+
+    c_kept = c[kept]
+    scores_kept = scores[kept]
+
+    pitch_px = estimate_pitch_nn(c_kept[:, :2])
+    print("pitch_px: ", pitch_px)
+
+    c_final = _enforce_min_spacing(c_kept, scores_kept, min_sep=0.75 * pitch_px)
+    return c_final.astype(np.float32)
+
+
+# ============================================================
+# Public API
+# ============================================================
+
+def estimate_pitch_nn(
+    c_xy: np.ndarray,
+    axis: np.ndarray | None = None,
+) -> float:
+    """
+    Estimate grid pitch from nearest-neighbor distances.
+
+    If axis is None:
+        -> isotropic pitch (original behaviour).
+
+    If axis is given:
+        -> pitch along the given direction (projection-based).
+
+    Parameters
+    ----------
+    c_xy : (N,2)
+        Point coordinates.
+    axis : (2,) or None
+        Direction vector. If given, pitch is estimated along this axis.
+
+    Returns
+    -------
+    float
+        Estimated pitch in pixels. Returns NaN if not enough valid distances.
+    """
+    xy = np.asarray(c_xy, dtype=np.float64)
+    if xy.ndim != 2 or xy.shape[1] < 2:
+        raise ValueError("c_xy must have shape (N,2).")
+
+    xy = xy[:, :2]
+    n = xy.shape[0]
+    if n < 2:
+        return np.nan
+
+    eps = 1e-6
+
+    # ------------------------------------------------------------
+    # ORIGINAL BEHAVIOUR (no axis)  ← 100% unchanged logic
+    # ------------------------------------------------------------
+    if axis is None:
+        dmin = np.empty(n, dtype=np.float64)
+
+        for i in range(n):
+            dx = xy[:, 0] - xy[i, 0]
+            dy = xy[:, 1] - xy[i, 1]
+            d2 = dx * dx + dy * dy
+            d2[i] = np.inf
+            d2[d2 <= eps] = np.inf
+            m = np.min(d2)
+            dmin[i] = np.sqrt(m) if np.isfinite(m) else np.nan
+
+        dmin = dmin[np.isfinite(dmin)]
+        if dmin.size == 0:
+            return np.nan
+
+        return float(np.median(dmin))
+
+    # ------------------------------------------------------------
+    # NEW: Directional pitch estimation
+    # ------------------------------------------------------------
+    axis = np.asarray(axis, dtype=np.float64).ravel()
+    norm = np.linalg.norm(axis)
+    if norm <= 1e-12:
+        return np.nan
+    axis = axis / norm
+
+    dmin = np.empty(n, dtype=np.float64)
+
+    for i in range(n):
+        diff = xy - xy[i]            # (N,2)
+        proj = diff @ axis           # signed projection
+
+        proj[i] = np.inf
+        proj[np.abs(proj) <= eps] = np.inf
+
+        m = np.min(np.abs(proj))
+        dmin[i] = m if np.isfinite(m) else np.nan
+
+    dmin = dmin[np.isfinite(dmin)]
+    if dmin.size < 10:
+        return np.nan
+
+    # robust trimming
+    lo = np.quantile(dmin, 0.10)
+    hi = np.quantile(dmin, 0.90)
+    dmin = dmin[(dmin >= lo) & (dmin <= hi)]
+
+    if dmin.size < 5:
+        return np.nan
+
+    return float(np.median(dmin))
 
 
 def detect_blobs_hough(
@@ -64,62 +310,36 @@ def detect_blobs_hough(
     params: Optional[HoughCircleParams] = None,
 ) -> Optional[np.ndarray]:
     """
-    Detect circular blobs in a grayscale image using the Hough Circle Transform.
-
-    This function performs a minimal and reusable Hough-based circle detection.
-    It optionally applies image inversion and median filtering before calling
-    OpenCV's HoughCircles routine.
-
-    Parameters
-    ----------
-    image : np.ndarray
-        Input image as a single-channel uint8 array.
-    params : HoughCircleParams, optional
-        Parameter set controlling the Hough circle detection. Uses defaults
-        when omitted.
-
-    Returns
-    -------
-    circles : np.ndarray or None
-        Detected circles as an array of shape (N, 3) with entries (x, y, r),
-        where (x, y) are the circle centers in pixel coordinates and r is
-        the radius in pixels. Returns None if no circles are detected.
-
-    Raises
-    ------
-    ValueError
-        If the input image is not a single-channel uint8 array or params are invalid.
+    Detect circular blobs using HoughCircles with
+    robust duplicate suppression.
     """
-
-    if image.size == 0:
-        return None
-    if image.ndim != 2:
-        raise ValueError("Input image must be single-channel (grayscale).")
-    if image.dtype != np.uint8:
-        raise ValueError("Input image must be of type uint8.")
+    if image.ndim != 2 or image.dtype != np.uint8:
+        raise ValueError("Input must be single-channel uint8 image.")
 
     if params is None:
         params = HoughCircleParams()
+
     _validate_params(params)
 
     img = np.ascontiguousarray(image)
+    img_score = img.copy()
 
     if params.invert:
         img = 255 - img
 
-    # allow int or iterable for median_ks
-    if isinstance(params.median_ks, (list, tuple)):
-        ks_values = list(params.median_ks)
-    else:
-        ks_values = [params.median_ks]
+    ks_values = (
+        list(params.median_ks)
+        if isinstance(params.median_ks, (list, tuple))
+        else [params.median_ks]
+    )
 
-    all_circles = []
+    detections = []
 
     for ks in ks_values:
         img_run = img
 
         if ks and ks > 1:
-            k = ks if ks % 2 == 1 else ks + 1
+            k = ks if ks % 2 else ks + 1
             img_run = cv2.medianBlur(img_run, k)
 
         circles = cv2.HoughCircles(
@@ -134,27 +354,21 @@ def detect_blobs_hough(
         )
 
         if circles is not None:
-            all_circles.append(circles[0].astype(np.float32))
+            detections.append(circles.reshape(-1, 3))
 
-    if not all_circles:
+    if not detections:
         return None
 
-    circles = np.vstack(all_circles)
+    circles = np.vstack(detections)
 
-    # merge near-duplicate detections
-    r_med = float(np.median(circles[:, 2]))
-    dist_thr = 0.6 * r_med
-
-    kept = []
-    for c in circles:
-        x, y, r = c
-        is_new = True
-        for k in kept:
-            if np.hypot(x - k[0], y - k[1]) < dist_thr:
-                is_new = False
-                break
-        if is_new:
-            kept.append(c.copy())
-
-    return np.asarray(kept, dtype=np.float32)
-
+    pitch_px = estimate_pitch_nn(circles[:, :2])
+    print("pitch_px: ", pitch_px)
+    dist_thr = 0.50 * pitch_px
+    
+    circles = _merge_near_duplicates(
+        circles,
+        dist_thr=dist_thr,
+        score_img=img_score,
+    )
+    
+    return circles.astype(np.float32)
