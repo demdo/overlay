@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import pydicom
 
 from PySide6.QtWidgets import (
     QPushButton, QFileDialog, QMessageBox, QSizePolicy
@@ -20,11 +21,90 @@ from overlay.tools.xray_marker_selection import (
 )
 
 
+# ============================================================
+# Display / coordinate helpers
+# ============================================================
+
+def _rot180_image(img: np.ndarray) -> np.ndarray:
+    """
+    Return a 180° rotated copy of the image for DISPLAY / UI only.
+
+    Purpose
+    -------
+    This is only a viewing convenience so that the X-ray image appears in
+    the orientation that is easier for manual marker selection.
+
+    Important
+    ---------
+    The internal geometric state remains RAW:
+    - state.xray_image stays raw
+    - state.xray_points_uv stays raw
+    - self._circles stays raw
+    """
+    return cv2.rotate(img, cv2.ROTATE_180)
+
+
+def _uv_rot180_to_raw(uv_rot: np.ndarray, width: int, height: int) -> np.ndarray:
+    """
+    Map 2D points from the 180°-rotated display image back into RAW image coordinates.
+
+    Parameters
+    ----------
+    uv_rot : (N, 2) array
+        Pixel coordinates measured in the rotated display image.
+    width, height : int
+        Size of the RAW image.
+
+    Returns
+    -------
+    uv_raw : (N, 2) array
+        Equivalent pixel coordinates in the RAW image system.
+
+    Notes
+    -----
+    For a 180° image rotation:
+        u_raw = (width  - 1) - u_rot
+        v_raw = (height - 1) - v_rot
+    """
+    uv_rot = np.asarray(uv_rot, dtype=np.float64).reshape(-1, 2)
+    uv_raw = uv_rot.copy()
+    uv_raw[:, 0] = (width - 1) - uv_rot[:, 0]
+    uv_raw[:, 1] = (height - 1) - uv_rot[:, 1]
+    return uv_raw
+
+
+def _uv_raw_to_rot180(uv_raw: np.ndarray, width: int, height: int) -> np.ndarray:
+    """
+    Map 2D points from RAW image coordinates into the 180°-rotated display image.
+
+    Parameters
+    ----------
+    uv_raw : (N, 2) array
+        Pixel coordinates in the RAW image system.
+    width, height : int
+        Size of the RAW image.
+
+    Returns
+    -------
+    uv_rot : (N, 2) array
+        Equivalent pixel coordinates in the rotated display image.
+
+    Notes
+    -----
+    For a 180° image rotation, the transform is its own inverse.
+    """
+    uv_raw = np.asarray(uv_raw, dtype=np.float64).reshape(-1, 2)
+    uv_rot = uv_raw.copy()
+    uv_rot[:, 0] = (width - 1) - uv_raw[:, 0]
+    uv_rot[:, 1] = (height - 1) - uv_raw[:, 1]
+    return uv_rot
+
+
 class XrayMarkerSelectionPage(StaticImagePage):
     """
     Step — X-ray marker selection
 
-    IMPORTANT (your constraint):
+    IMPORTANT:
     - MUST NOT add any new SessionState fields dynamically.
     - SessionState fields used here (already defined in state.py):
         * xray_image, xray_image_path
@@ -32,8 +112,14 @@ class XrayMarkerSelectionPage(StaticImagePage):
         * xray_marker_overlay_bgr
         * marker_radius_px
     - Everything else stays LOCAL to this page:
-        * circles_grid
+        * circles
         * pick_radius_px
+
+    Coordinate convention in this page
+    ----------------------------------
+    - RAW image / RAW pixel coordinates are the internal source of truth.
+    - The marker-selection widget shows a 180° rotated DISPLAY image.
+    - Any detected / displayed points are converted between display and raw.
     """
 
     def __init__(self, state: SessionState, on_complete_changed, parent=None):
@@ -43,8 +129,8 @@ class XrayMarkerSelectionPage(StaticImagePage):
         self.on_complete_changed = on_complete_changed
 
         # ---------------- local (page-only) runtime ----------------
-        self._circles_grid: np.ndarray | None = None     # (nrows, ncols, 3) with NaNs
-        self._pick_radius_px: float | None = None        # interaction radius for selection
+        self._circles: np.ndarray | None = None       # (N,3), always RAW
+        self._pick_radius_px: float | None = None     # interaction radius
 
         # ======================================================
         # LEFT: replace template image_label with interactive widget
@@ -98,20 +184,19 @@ class XrayMarkerSelectionPage(StaticImagePage):
     # ---------------- Completion ----------------
 
     def is_complete(self) -> bool:
-        # use the dedicated state flag (no dynamic getattr needed)
         return self.state.has_xray_points_confirmed
 
     # ---------------- Refresh ----------------
 
     def refresh(self):
-        img = self.state.xray_image
+        img_raw = self.state.xray_image
 
         # --------------------------------------------------
         # Case 1: no image loaded yet
         # --------------------------------------------------
-        if img is None:
+        if img_raw is None:
             self.marker_widget.set_image(None)
-            self.marker_widget.set_grid(None)
+            self.marker_widget.set_circles(None)
             self.marker_widget.set_locked(False)
 
             self.set_stats_rows([
@@ -127,12 +212,16 @@ class XrayMarkerSelectionPage(StaticImagePage):
         # --------------------------------------------------
         # Case 2: image loaded
         # --------------------------------------------------
-        self.marker_widget.set_image(img)
+        img_disp = _rot180_image(img_raw)
+        self.marker_widget.set_image(img_disp)
 
-        if self._circles_grid is not None and self._pick_radius_px is not None:
-            self.marker_widget.set_grid(self._circles_grid, float(self._pick_radius_px))
+        if self._circles is not None and self._pick_radius_px is not None:
+            h, w = img_raw.shape[:2]
+            circles_disp = np.asarray(self._circles, dtype=np.float64).copy()
+            circles_disp[:, :2] = _uv_raw_to_rot180(circles_disp[:, :2], w, h)
+            self.marker_widget.set_circles(circles_disp, float(self._pick_radius_px))
         else:
-            self.marker_widget.set_grid(None)
+            self.marker_widget.set_circles(None)
 
         confirmed = bool(self.state.xray_points_confirmed)
 
@@ -140,23 +229,23 @@ class XrayMarkerSelectionPage(StaticImagePage):
         self.btn_load.setEnabled(False)
 
         # Detect: only once (unless you reload image)
-        already_detected = self._circles_grid is not None
+        already_detected = self._circles is not None
         self.btn_detect.setEnabled(not already_detected)
 
         # Reset: only if at least 1 anchor selected
-        selected_cells = self.marker_widget.get_selected_cells()
-        self.btn_reset.setEnabled(len(selected_cells) > 0)
+        selected_idx = self.marker_widget.get_selected_indices()
+        self.btn_reset.setEnabled(len(selected_idx) > 0)
 
         # Lock interaction after confirmation
         self.marker_widget.set_locked(confirmed)
 
         # Stats
-        if self._circles_grid is None:
+        if self._circles is None:
             detected_txt = "-"
             selected_txt = "- / 3"
         else:
-            n_detected = int(np.isfinite(self._circles_grid[..., 0]).sum())
-            n_selected = len(selected_cells)
+            n_detected = int(len(self._circles))
+            n_selected = len(selected_idx)
             detected_txt = str(n_detected)
             selected_txt = f"{n_selected} / 3"
 
@@ -182,12 +271,10 @@ class XrayMarkerSelectionPage(StaticImagePage):
             return
 
         try:
+            # --------------------------------------------------
+            # Load image
+            # --------------------------------------------------
             if path.lower().endswith((".dcm", ".ima")):
-                try:
-                    import pydicom  # lazy import (keeps page import-safe)
-                except Exception as e:
-                    raise RuntimeError("pydicom is required to open .dcm/.ima files. Install with: pip install pydicom") from e
-
                 ds = pydicom.dcmread(path)
                 img = ds.pixel_array.astype(np.float32)
                 img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
@@ -198,7 +285,9 @@ class XrayMarkerSelectionPage(StaticImagePage):
             if img is None:
                 raise ValueError("Could not read image.")
 
-            # --- store only EXISTING SessionState fields ---
+            # --------------------------------------------------
+            # Store RAW image in EXISTING SessionState
+            # --------------------------------------------------
             self.state.xray_image = img
             self.state.xray_image_path = path
 
@@ -208,12 +297,14 @@ class XrayMarkerSelectionPage(StaticImagePage):
             self.state.xray_marker_overlay_bgr = None
             self.state.marker_radius_px = None
 
-            # reset local (page-only) detection products
-            self._circles_grid = None
+            # --------------------------------------------------
+            # Reset local (page-only)
+            # --------------------------------------------------
+            self._circles = None
             self._pick_radius_px = None
 
             self.marker_widget.clear_selection()
-            self.marker_widget.set_roi_cells([])
+            self.marker_widget.set_roi_indices([])
             self.marker_widget.set_locked(False)
 
             self.refresh()
@@ -227,117 +318,155 @@ class XrayMarkerSelectionPage(StaticImagePage):
     def on_detect_markers(self):
         if self.state.xray_image is None:
             return
-    
+
         try:
-            img = self.state.xray_image
-    
+            img_raw = self.state.xray_image
+            h, w = img_raw.shape[:2]
+            img_disp = _rot180_image(img_raw)
+
             params = HoughCircleParams(
                 min_radius=2,
                 max_radius=7,
                 dp=1.2,
-                minDist=16,
+                minDist=8,
                 param1=120,
-                param2=12,
+                param2=9,
                 invert=True,
                 median_ks=(3, 5),
             )
-    
+
+            # Detection runs on the DISPLAY image because that is the
+            # orientation in which the user selects anchors.
             res = run_xray_marker_detection(
-                img,
+                img_disp,
                 hough_params=params,
                 use_clahe=True,
                 clahe_clip=2.0,
                 clahe_tiles=(12, 12),
-                use_mask=True,
-                row_tol_px=13.0,
+                use_mask=False,
             )
-    
-            if res.circles_grid is None or not np.isfinite(res.circles_grid[..., 0]).any():
+
+            if res.circles is None or len(res.circles) == 0:
                 QMessageBox.warning(self, "Marker detection", "No circles detected.")
                 return
-    
-            circles_grid = res.circles_grid
-    
-            # store TRUE detected radius in EXISTING state field
-            radii = circles_grid[..., 2]
+
+            circles_rot = np.asarray(res.circles, dtype=np.float64).reshape(-1, 3)
+
+            # Convert detected circle centers back to RAW coordinates.
+            circles_raw = circles_rot.copy()
+            circles_raw[:, :2] = _uv_rot180_to_raw(circles_rot[:, :2], w, h)
+
+            radii = circles_raw[:, 2]
             finite_r = radii[np.isfinite(radii)]
             if finite_r.size:
                 self.state.marker_radius_px = float(np.median(finite_r))
             else:
                 self.state.marker_radius_px = None
-    
-            # keep pick radius LOCAL (interaction only)
+
             if self.state.marker_radius_px is not None:
                 pick_radius_px = 0.6 * float(self.state.marker_radius_px)
             else:
                 pick_radius_px = 20.0
-    
-            self._circles_grid = circles_grid
+
+            # Store circles in RAW coordinates internally.
+            self._circles = circles_raw
             self._pick_radius_px = float(pick_radius_px)
-    
-            # reset selection/confirmation + overlay (EXISTING state fields)
+
+            # reset selection/confirmation + overlay
             self.state.xray_points_uv = None
             self.state.xray_points_confirmed = False
             self.state.xray_marker_overlay_bgr = None
-    
+
             self.marker_widget.clear_selection()
-            self.marker_widget.set_roi_cells([])
+            self.marker_widget.set_roi_indices([])
             self.marker_widget.set_locked(False)
-    
+
             self.refresh()
             self.on_complete_changed()
-    
+
         except Exception as e:
             QMessageBox.critical(self, "Marker detection failed", str(e))
 
     # ---------------- Confirm flow ----------------
 
-    def on_selection_proposed(self, cells):
-        if cells is None or len(cells) != 3:
+    def on_selection_proposed(self, selected_idx):
+        if selected_idx is None or len(selected_idx) != 3:
             return
-    
-        cells = [tuple(c) for c in cells]  # optional safety
-    
+
+        selected_idx = [int(k) for k in selected_idx]
+
         ans = QMessageBox.question(
             self,
             "Confirm markers",
             "Do these 3 selected markers look correct?",
             QMessageBox.Yes | QMessageBox.No
         )
-    
+
         if ans != QMessageBox.Yes:
             self.state.xray_points_uv = None
             self.state.xray_points_confirmed = False
             self.state.xray_marker_overlay_bgr = None
             self.marker_widget.clear_selection()
-            self.marker_widget.set_roi_cells([])
+            self.marker_widget.set_roi_indices([])
             self.marker_widget.set_locked(False)
             self.refresh()
             self.on_complete_changed()
             return
-    
-        if self._circles_grid is None:
-            # optional safety
+
+        if self._circles is None or self._pick_radius_px is None:
             self.marker_widget.clear_selection()
-            self.marker_widget.set_roi_cells([])
+            self.marker_widget.set_roi_indices([])
             self.marker_widget.set_locked(False)
             self.refresh()
             self.on_complete_changed()
             return
-    
-        xy, roi_cells_set = compute_roi_from_grid(
-            circles_grid=self._circles_grid,
-            selected_cells=cells,
+
+        margin_px = 1.1 * float(self._pick_radius_px)
+
+        # self._circles are RAW, so roi_uv is RAW as well.
+        roi_uv, roi_idx, _dbg = compute_roi_from_grid(
+            circles=self._circles,
+            anchor_idx=selected_idx,
+            margin_px=margin_px,
+            gate_tol_pitch=0.40,
+            min_steps=2,
         )
-    
-        self.state.xray_points_uv = np.asarray(xy, dtype=float)
+
+        self.state.xray_points_uv = np.asarray(roi_uv, dtype=float)
         self.state.xray_points_confirmed = True
-    
-        self.marker_widget.set_roi_cells(list(roi_cells_set))
+        
+        # ============================================================
+        # DEBUG SAVE: store correspondences
+        # ============================================================
+        
+        xyz = self.state.xray_points_xyz_c
+        uv = self.state.xray_points_uv
+        
+        if xyz is not None and uv is not None:
+            xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+            uv = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
+        
+            if xyz.shape[0] == uv.shape[0]:
+                out_path = r"C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Data\pose_debug.npz"
+        
+                np.savez(
+                    out_path,
+                    points_xyz=xyz,
+                    points_uv=uv,
+                )
+        
+                print("Saved correspondences to:", out_path)
+            else:
+                print("WARNING: xyz / uv mismatch:", xyz.shape, uv.shape)
+        
+        
+        
+
+        self.marker_widget.set_roi_indices(list(np.asarray(roi_idx, dtype=np.int64).tolist()))
         self.marker_widget.set_locked(True)
-    
+
         self.state.xray_marker_overlay_bgr = self._render_roi_overlay_bgr()
-    
+
         self.refresh()
         self.on_complete_changed()
 
@@ -349,7 +478,7 @@ class XrayMarkerSelectionPage(StaticImagePage):
         self.state.xray_marker_overlay_bgr = None
 
         self.marker_widget.clear_selection()
-        self.marker_widget.set_roi_cells([])
+        self.marker_widget.set_roi_indices([])
         self.marker_widget.set_locked(False)
 
         self.refresh()
@@ -359,9 +488,15 @@ class XrayMarkerSelectionPage(StaticImagePage):
 
     def _render_roi_overlay_bgr(self) -> np.ndarray | None:
         """
-        Render full-size X-ray image with only ROI overlay:
+        Render full-size RAW X-ray image with only RAW ROI overlay:
         - green circles
         - red crosses
+
+        Notes
+        -----
+        This overlay is intentionally rendered in the RAW image coordinate
+        system because the downstream calibration page also operates on the
+        RAW X-ray image.
         """
         img = self.state.xray_image
         uv = self.state.xray_points_uv
@@ -372,7 +507,6 @@ class XrayMarkerSelectionPage(StaticImagePage):
         img8 = img if img.dtype == np.uint8 else np.clip(img, 0, 255).astype(np.uint8)
         out = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
 
-        # use local pick radius if available
         if self._pick_radius_px is None:
             roi_r = 6.0
         else:

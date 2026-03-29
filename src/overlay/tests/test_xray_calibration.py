@@ -40,7 +40,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 from overlay.calib.calib_xray_intrinsics import (
     estimate_intrinsics_from_homographies,
     decompose_homography,
-    relative_board_angles_deg,
+    relative_board_tilt_from_normal_deg,
     relative_shift_board_mm,
 )
 
@@ -166,11 +166,24 @@ def _load_required_points_from_npz(path: Path) -> Tuple[np.ndarray, np.ndarray]:
 
 def _load_kx_from_npz(path: Path) -> np.ndarray:
     with np.load(str(path), allow_pickle=False) as npz:
-        if "Kx" not in npz.files:
-            raise KeyError(f"{path.name} must contain key 'Kx'. Found keys: {npz.files}")
-        K = np.asarray(npz["Kx"], dtype=np.float64)
+
+        preferred_keys = ["K_xray", "K", "Kx"]
+
+        for key in preferred_keys:
+            if key in npz.files:
+                K = np.asarray(npz[key], dtype=np.float64)
+                break
+        else:
+            raise KeyError(
+                f"{path.name} must contain one of {preferred_keys}. "
+                f"Found keys: {list(npz.files)}"
+            )
+
     if K.shape != (3, 3):
-        raise ValueError(f"{path.name}: Kx has shape {K.shape}, expected (3,3)")
+        raise ValueError(
+            f"{path.name}: intrinsics matrix has shape {K.shape}, expected (3,3)"
+        )
+
     return K
 
 
@@ -392,9 +405,56 @@ class ZoomOverlayViewer:
 # TEST 1 — Intrinsics + Motion
 # ============================================================
 
+def tilt_direction_deg_from_normal(
+    R_ref: np.ndarray,
+    R: np.ndarray,
+    *,
+    xray_axes: bool = False,
+) -> float:
+    """
+    Direction of the board tilt in the board plane (deg).
+
+    0 deg  -> tilt towards +x_g
+    90 deg -> tilt towards +y_g
+    """
+
+    R_ref = np.asarray(R_ref, dtype=np.float64)
+    R = np.asarray(R, dtype=np.float64)
+
+    R_rel = R_ref.T @ R
+
+    if xray_axes:
+        S = np.array([
+            [0.0,  1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0,  0.0, 1.0],
+        ], dtype=np.float64)
+
+        R_rel = S.T @ R_rel @ S
+
+    n = R_rel @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    nx, ny, nz = n.tolist()
+
+    if nz < 0:
+        nx, ny, nz = -nx, -ny, -nz
+
+    phi = np.degrees(np.arctan2(ny, nx))
+
+    return float(phi)
+
+
+def rotation_angle_deg(R_rel: np.ndarray) -> float:
+    R_rel = np.asarray(R_rel, dtype=np.float64)
+    c = (np.trace(R_rel) - 1.0) * 0.5
+    c = float(np.clip(c, -1.0, 1.0))
+    return float(np.degrees(np.arccos(c)))
+
+
 def test_estimate_intrinsics_and_report_motion() -> None:
+
     # ------------------------------------------------------------
-    # 1) Load Kx (already estimated before)
+    # 1) Load Kx
     # ------------------------------------------------------------
     kx_path = select_npz_file("Select xray_intrinsics_Kx.npz (contains Kx)")
     if kx_path is None:
@@ -407,8 +467,6 @@ def test_estimate_intrinsics_and_report_motion() -> None:
         print(f"ERROR loading Kx: {e}")
         return
 
-    np.set_printoptions(precision=8, suppress=True)
-
     print("\n==============================================")
     print("Loaded X-ray Intrinsics Kx")
     print("==============================================")
@@ -416,76 +474,191 @@ def test_estimate_intrinsics_and_report_motion() -> None:
     print(f"\nKx NPZ: {kx_path.name}")
 
     # ------------------------------------------------------------
-    # 2) Select exactly TWO view NPZs (each must contain a homography H)
-    #    - first selected -> reference view
-    #    - second selected -> test view
+    # 2) Select view files
     # ------------------------------------------------------------
-    view_paths = select_npz_files("Select TWO VIEW .npz files (Ref first, then Test)")
+    view_paths = select_npz_files(
+        "Select VIEW .npz files (FIRST selected = reference)"
+    )
 
-    if len(view_paths) != 2:
-        print(f"ERROR: Please select exactly 2 view .npz files. You selected {len(view_paths)}.")
-        return
-
-    ref_path, test_path = view_paths[0], view_paths[1]
-
-    # ------------------------------------------------------------
-    # 3) Load H_ref and H_test
-    # ------------------------------------------------------------
-    def _load_H_from_view_npz(p: Path) -> Optional[np.ndarray]:
-        with np.load(str(p), allow_pickle=False) as npz_view:
-            H = _find_first_matrix33(npz_view)
-            if H is None:
-                print(f"ERROR: Could not find a (3,3) homography in {p.name}. Keys: {npz_view.files}")
-                return None
-            return H.astype(np.float64)
-
-    H_ref = _load_H_from_view_npz(ref_path)
-    if H_ref is None:
-        return
-
-    H_test = _load_H_from_view_npz(test_path)
-    if H_test is None:
+    if len(view_paths) < 2:
+        print("Please select at least two views.")
         return
 
     # ------------------------------------------------------------
-    # 4) Decompose into poses using FIXED Kx
+    # 3) Load homographies
     # ------------------------------------------------------------
+    def _load_labeled_homographies(p: Path):
+
+        items = []
+
+        with np.load(str(p), allow_pickle=False) as npz:
+
+            for key in npz.files:
+
+                arr = np.asarray(npz[key])
+
+                if arr.shape == (3, 3):
+
+                    label = f"{p.name}::{key}"
+                    items.append((label, arr.astype(np.float64)))
+
+                elif arr.ndim == 3 and arr.shape[1:] == (3, 3):
+
+                    for i in range(arr.shape[0]):
+
+                        label = f"{p.name}::{key}[{i}]"
+                        items.append((label, arr[i].astype(np.float64)))
+
+        return items
+
+    all_items = []
+
+    for p in view_paths:
+
+        items = _load_labeled_homographies(p)
+
+        if len(items) == 0:
+            print(f"No homography found in {p.name}")
+            continue
+
+        all_items.extend(items)
+
+    if len(all_items) < 2:
+        print("Not enough homographies.")
+        return
+
+    # ------------------------------------------------------------
+    # 4) Reference homography
+    # ------------------------------------------------------------
+    ref_items = _load_labeled_homographies(view_paths[0])
+
+    if len(ref_items) == 0:
+        print("Reference file contains no homography.")
+        return
+
+    ref_label, H_ref = ref_items[0]
+
     pose_ref = decompose_homography(Kx, H_ref)
-    pose_test = decompose_homography(Kx, H_test)
 
-    R_ref, t_ref = pose_ref.R, pose_ref.t
-    R_test, t_test = pose_test.R, pose_test.t
+    R_ref = pose_ref.R
+    t_ref = pose_ref.t
 
     # ------------------------------------------------------------
-    # 5) Relative board motion (test w.r.t. reference)
+    # 5) Compute relative motion
     # ------------------------------------------------------------
-    tilt_xg, tilt_yg, inplane = relative_board_angles_deg(
-        R_ref,
-        R_test,
-        xray_axes=True,
-    )
+    rows = []
 
-    dt = relative_shift_board_mm(
-        R_ref, t_ref,
-        R_test, t_test,
-        xray_axes=True,
-    )
-    dx_g, dy_g, dz_g = dt.tolist()
+    for label, H in all_items:
 
+        pose = decompose_homography(Kx, H)
+
+        R = pose.R
+        t = pose.t
+
+        tilt_xg, tilt_yg, tilt_mag = relative_board_tilt_from_normal_deg(
+            R_ref,
+            R,
+            xray_axes=True
+        )
+
+        tilt_dir = tilt_direction_deg_from_normal(
+            R_ref,
+            R,
+            xray_axes=True
+        )
+
+        dt = relative_shift_board_mm(
+            R_ref,
+            t_ref,
+            R,
+            t,
+            xray_axes=True
+        )
+
+        dx_g, dy_g, dz_g = dt.tolist()
+
+        rows.append(
+            (
+                label,
+                tilt_xg,
+                tilt_yg,
+                tilt_mag,
+                tilt_dir,
+                dx_g,
+                dy_g,
+                dz_g,
+            )
+        )
+
+    # ------------------------------------------------------------
+    # 6) Print table
+    # ------------------------------------------------------------
     print("\n==============================================")
-    print("Relative Board Motion (Test w.r.t. Reference)")
+    print("Relative Board Motion (w.r.t. reference)")
     print("==============================================")
-    print(f"Reference view: {ref_path.name}")
-    print(f"Test view     : {test_path.name}")
-    print("\nAngles in deg, translation in mm (xray_axes=True):")
-    print("--------------------------------------------------------------------------")
-    print("tilt_xg   tilt_yg   inplane   |   dx_g (mm)   dy_g (mm)   dz_g (mm)")
-    print("--------------------------------------------------------------------------")
-    print(
-        f"{tilt_xg:8.3f}  {tilt_yg:8.3f}  {inplane:8.3f}  | "
-        f"{dx_g:10.3f}  {dy_g:10.3f}  {dz_g:10.3f}"
+
+    print(f"Reference: {ref_label}\n")
+
+    header = (
+        f"{'Homography':40s} "
+        f"{'tilt_xg':>8} "
+        f"{'tilt_yg':>8} "
+        f"{'tilt_mag':>9} "
+        f"{'tilt_dir':>9} | "
+        f"{'dx_g (mm)':>10} "
+        f"{'dy_g (mm)':>10} "
+        f"{'dz_g (mm)':>10}"
     )
-    print("--------------------------------------------------------------------------")
+
+    print(header)
+    print("-" * len(header))
+
+    for r in rows:
+
+        label, tx, ty, tm, td, dx, dy, dz = r
+
+        print(
+            f"{label:40s} "
+            f"{tx:8.3f} "
+            f"{ty:8.3f} "
+            f"{tm:9.3f} "
+            f"{td:9.3f} | "
+            f"{dx:10.3f} "
+            f"{dy:10.3f} "
+            f"{dz:10.3f}"
+        )
+
+    # ------------------------------------------------------------
+    # 7) Save table to TXT
+    # ------------------------------------------------------------
+    save_path = view_paths[0].parent / "relative_board_motion.txt"
+
+    with open(save_path, "w", encoding="utf-8") as f:
+
+        f.write("Relative Board Motion (w.r.t. reference)\n")
+        f.write(f"Reference: {ref_label}\n\n")
+
+        f.write(header + "\n")
+        f.write("-" * len(header) + "\n")
+
+        for r in rows:
+
+            label, tx, ty, tm, td, dx, dy, dz = r
+
+            line = (
+                f"{label:40s} "
+                f"{tx:8.3f} "
+                f"{ty:8.3f} "
+                f"{tm:9.3f} "
+                f"{td:9.3f} | "
+                f"{dx:10.3f} "
+                f"{dy:10.3f} "
+                f"{dz:10.3f}\n"
+            )
+
+            f.write(line)
+
+    print(f"\nSaved table to:\n{save_path}")
 
 
 # ============================================================
@@ -569,6 +742,16 @@ def test_visual_projection_view() -> None:
     err_rms = float(np.sqrt(np.mean(err ** 2)))
     err_med = float(np.median(err))
     err_p95 = float(np.percentile(err, 95))
+    
+    # save stats
+    save_path = corr_path.with_name(corr_path.stem + "_reprojection_errors.npz")
+
+    np.savez(
+        save_path,
+        e=err.astype(np.float64),
+    )
+    
+    print(f"\nSaved reprojection errors to:\n{save_path}")
 
     n_inl = int(inliers.sum()) if inliers is not None else N
 
@@ -600,8 +783,8 @@ def test_visual_projection_view() -> None:
 # ============================================================
 
 def main() -> None:
-    test_estimate_intrinsics_and_report_motion()
-    #test_visual_projection_view()
+    #test_estimate_intrinsics_and_report_motion()
+    test_visual_projection_view()
 
 
 if __name__ == "__main__":

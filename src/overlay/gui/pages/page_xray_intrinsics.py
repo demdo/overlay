@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+
 import numpy as np
 
 from PySide6.QtWidgets import (
@@ -63,7 +65,7 @@ class XrayIntrinsicsPage(StaticImagePage):
         # ======================================================
         # RIGHT: controls
         # ======================================================
-        self.btn_load = QPushButton("Load X-ray intrinsics (JSON)")
+        self.btn_load = QPushButton("Load X-ray intrinsics")
         self.btn_load.clicked.connect(self.load_intrinsics)
         self.btn_load.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.controls_content.addWidget(self.btn_load)
@@ -80,7 +82,6 @@ class XrayIntrinsicsPage(StaticImagePage):
         # ======================================================
         # SPECIAL-CASE UI: hide the entire image/viewport area
         # ======================================================
-        # Different templates name these differently; hide all common ones robustly.
         _hide_if_exists(self, "image_label")
         _hide_if_exists(self, "viewport")
         _hide_if_exists(self, "viewport_widget")
@@ -92,7 +93,6 @@ class XrayIntrinsicsPage(StaticImagePage):
         _hide_if_exists(self, "left_widget")
         _hide_if_exists(self, "workspace_widget")
 
-        # Also make sure no image is set (even if the widgets are hidden)
         try:
             self.set_viewport_background(active=False)
         except Exception:
@@ -108,17 +108,24 @@ class XrayIntrinsicsPage(StaticImagePage):
         return getattr(self.state, "K_xray", None) is not None
 
     def refresh(self) -> None:
-        # Stats only (init-safe: do NOT call on_complete_changed here)
         if self.is_complete():
+            K = self.state.K_xray
+        
+            lines = [
+                " ".join(f"{v:.2f}" for v in row)
+                for row in K
+            ]
+            
+            K_str = "\n".join(["np.array (3×3)"] + lines)
+            
             self.set_stats_rows([
-                ("K_xray", "np.array (3×3)"),
+                ("K_xray", K_str),
             ])
         else:
             self.set_stats_rows([
                 ("K_xray", "-"),
             ])
 
-        # Keep image/viewport off (even if template changes later)
         try:
             self.set_viewport_background(active=False)
         except Exception:
@@ -128,37 +135,85 @@ class XrayIntrinsicsPage(StaticImagePage):
         except Exception:
             pass
 
+    def _load_K_from_json(self, path: str) -> np.ndarray:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        K = np.array(data, dtype=float)
+        if K.shape != (3, 3):
+            raise ValueError("Intrinsics matrix in JSON must be 3×3.")
+        return K
+
+    def _load_K_from_npz(self, path: str) -> np.ndarray:
+        npz = np.load(path, allow_pickle=True)
+
+        # 1) First try common expected keys
+        preferred_keys = ["K_xray", "K"]
+        for key in preferred_keys:
+            if key in npz.files:
+                K = np.array(npz[key], dtype=float)
+                if K.shape == (3, 3):
+                    return K
+                raise ValueError(
+                    f"Array '{key}' found in NPZ, but has shape {K.shape} instead of (3, 3)."
+                )
+
+        # 2) Otherwise search all arrays for 3x3 candidates
+        candidates: list[tuple[str, np.ndarray]] = []
+        for key in npz.files:
+            arr = np.array(npz[key], dtype=float)
+            if arr.shape == (3, 3):
+                candidates.append((key, arr))
+
+        if len(candidates) == 1:
+            return candidates[0][1]
+
+        if len(candidates) > 1:
+            keys = ", ".join(key for key, _ in candidates)
+            raise ValueError(
+                "NPZ contains multiple 3×3 arrays. "
+                f"Could not decide which one is K_xray. Candidates: {keys}"
+            )
+
+        available = ", ".join(npz.files) if npz.files else "(no arrays)"
+        raise ValueError(
+            "No 3×3 intrinsics matrix found in NPZ. "
+            f"Available arrays: {available}"
+        )
+
     def load_intrinsics(self) -> None:
-        dlg = QFileDialog(self.window(), "Select X-ray intrinsics JSON")
+        dlg = QFileDialog(self.window(), "Select X-ray intrinsics file")
         dlg.setFileMode(QFileDialog.ExistingFile)
-        dlg.setNameFilter("JSON Files (*.json);;All Files (*)")
-    
-        # keep dialog style consistent + avoid native-dialog edge cases
+        dlg.setNameFilter(
+            "Supported Files (*.json *.npz);;JSON Files (*.json);;NPZ Files (*.npz);;All Files (*)"
+        )
+
         dlg.setOption(QFileDialog.DontUseNativeDialog, True)
-    
+
         if dlg.exec() != QFileDialog.Accepted:
             return
-    
+
         files = dlg.selectedFiles()
         path = files[0] if files else ""
         if not path:
             return
-    
+
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-    
-            K = np.array(data, dtype=float)
-            if K.shape != (3, 3):
-                raise ValueError("Intrinsics matrix must be 3×3.")
-    
+            suffix = Path(path).suffix.lower()
+
+            if suffix == ".json":
+                K = self._load_K_from_json(path)
+            elif suffix == ".npz":
+                K = self._load_K_from_npz(path)
+            else:
+                raise ValueError(
+                    "Unsupported file type. Please select a .json or .npz file."
+                )
+
             self.state.K_xray = K
-    
+
             self.refresh()
-            # Trigger UI update ONLY after actual user action (prevents init crash)
             self.on_complete_changed()
-    
+
         except Exception as e:
             QMessageBox.critical(self, "Failed to load X-ray intrinsics", str(e))
-            
-            

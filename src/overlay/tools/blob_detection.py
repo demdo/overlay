@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Union, Sequence, Optional
 
 
+
 # ============================================================
 # Parameter definition
 # ============================================================
@@ -200,9 +201,7 @@ def _merge_near_duplicates(
 
     c_kept = c[kept]
     scores_kept = scores[kept]
-
     pitch_px = estimate_pitch_nn(c_kept[:, :2])
-    print("pitch_px: ", pitch_px)
 
     c_final = _enforce_min_spacing(c_kept, scores_kept, min_sep=0.75 * pitch_px)
     return c_final.astype(np.float32)
@@ -212,31 +211,23 @@ def _merge_near_duplicates(
 # Public API
 # ============================================================
 
-def estimate_pitch_nn(
-    c_xy: np.ndarray,
-    axis: np.ndarray | None = None,
-) -> float:
+
+def estimate_pitch_nn(c_xy: np.ndarray) -> float:
     """
-    Estimate grid pitch from nearest-neighbor distances.
-
-    If axis is None:
-        -> isotropic pitch (original behaviour).
-
-    If axis is given:
-        -> pitch along the given direction (projection-based).
+    Estimate grid pitch from nearest-neighbor distances (isotropic).
 
     Parameters
     ----------
     c_xy : (N,2)
         Point coordinates.
-    axis : (2,) or None
-        Direction vector. If given, pitch is estimated along this axis.
 
     Returns
     -------
     float
         Estimated pitch in pixels. Returns NaN if not enough valid distances.
     """
+    import numpy as np
+
     xy = np.asarray(c_xy, dtype=np.float64)
     if xy.ndim != 2 or xy.shape[1] < 2:
         raise ValueError("c_xy must have shape (N,2).")
@@ -247,59 +238,21 @@ def estimate_pitch_nn(
         return np.nan
 
     eps = 1e-6
-
-    # ------------------------------------------------------------
-    # ORIGINAL BEHAVIOUR (no axis)  ← 100% unchanged logic
-    # ------------------------------------------------------------
-    if axis is None:
-        dmin = np.empty(n, dtype=np.float64)
-
-        for i in range(n):
-            dx = xy[:, 0] - xy[i, 0]
-            dy = xy[:, 1] - xy[i, 1]
-            d2 = dx * dx + dy * dy
-            d2[i] = np.inf
-            d2[d2 <= eps] = np.inf
-            m = np.min(d2)
-            dmin[i] = np.sqrt(m) if np.isfinite(m) else np.nan
-
-        dmin = dmin[np.isfinite(dmin)]
-        if dmin.size == 0:
-            return np.nan
-
-        return float(np.median(dmin))
-
-    # ------------------------------------------------------------
-    # NEW: Directional pitch estimation
-    # ------------------------------------------------------------
-    axis = np.asarray(axis, dtype=np.float64).ravel()
-    norm = np.linalg.norm(axis)
-    if norm <= 1e-12:
-        return np.nan
-    axis = axis / norm
-
     dmin = np.empty(n, dtype=np.float64)
 
     for i in range(n):
-        diff = xy - xy[i]            # (N,2)
-        proj = diff @ axis           # signed projection
+        dx = xy[:, 0] - xy[i, 0]
+        dy = xy[:, 1] - xy[i, 1]
 
-        proj[i] = np.inf
-        proj[np.abs(proj) <= eps] = np.inf
+        d2 = dx * dx + dy * dy
+        d2[i] = np.inf
+        d2[d2 <= eps] = np.inf
 
-        m = np.min(np.abs(proj))
-        dmin[i] = m if np.isfinite(m) else np.nan
+        m = np.min(d2)
+        dmin[i] = np.sqrt(m) if np.isfinite(m) else np.nan
 
     dmin = dmin[np.isfinite(dmin)]
-    if dmin.size < 10:
-        return np.nan
-
-    # robust trimming
-    lo = np.quantile(dmin, 0.10)
-    hi = np.quantile(dmin, 0.90)
-    dmin = dmin[(dmin >= lo) & (dmin <= hi)]
-
-    if dmin.size < 5:
+    if dmin.size == 0:
         return np.nan
 
     return float(np.median(dmin))
@@ -360,9 +313,8 @@ def detect_blobs_hough(
         return None
 
     circles = np.vstack(detections)
-
+    
     pitch_px = estimate_pitch_nn(circles[:, :2])
-    print("pitch_px: ", pitch_px)
     dist_thr = 0.50 * pitch_px
     
     circles = _merge_near_duplicates(

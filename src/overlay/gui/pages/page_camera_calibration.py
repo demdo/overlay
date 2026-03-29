@@ -115,13 +115,15 @@ class CameraCalibrationPage(LiveImagePage):
         self.btn_stop = QPushButton("Stop")
         self.btn_redo = QPushButton("Redo")
         self.btn_test = QPushButton("Accuracy test")
+        self.btn_rotate = QPushButton("Rotate 180°")
 
         self.btn_start.clicked.connect(self.start_clicked)
         self.btn_stop.clicked.connect(self.stop_clicked)
         self.btn_redo.clicked.connect(self.redo_clicked)
         self.btn_test.clicked.connect(self.test_clicked)
+        self.btn_rotate.clicked.connect(self.rotate_clicked)
 
-        for b in (self.btn_start, self.btn_stop, self.btn_redo, self.btn_test):
+        for b in (self.btn_start, self.btn_stop, self.btn_redo, self.btn_test, self.btn_rotate):
             b.setFocusPolicy(Qt.NoFocus)
             b.setMinimumHeight(44)
             b.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
@@ -138,6 +140,7 @@ class CameraCalibrationPage(LiveImagePage):
         flow.addWidget(self.btn_stop)
         flow.addWidget(self.btn_redo)
         flow.addWidget(self.btn_test)
+        flow.addWidget(self.btn_rotate)
 
         self.controls_content.addWidget(wrap)
 
@@ -218,7 +221,7 @@ class CameraCalibrationPage(LiveImagePage):
             self._update_panels()
             return self._live_frame
 
-        self._live_frame = np.asanyarray(cf.get_data())
+        self._live_frame = self.color_frame_to_bgr(cf)
 
         self._det = camcal.detect_charuco(
             self._live_frame,
@@ -365,6 +368,14 @@ class CameraCalibrationPage(LiveImagePage):
         self._update_buttons()
         self._update_panels()
         self.setFocus()
+        self.update_view()
+        
+    def rotate_clicked(self) -> None:
+        self.state.rotate_rgb = not self.state.rotate_rgb
+    
+        self._det = None
+        self._found = False
+    
         self.update_view()
 
     def test_clicked(self) -> None:

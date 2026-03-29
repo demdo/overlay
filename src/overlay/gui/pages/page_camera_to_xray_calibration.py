@@ -8,7 +8,8 @@ from PySide6.QtWidgets import QPushButton, QMessageBox, QSizePolicy
 
 from overlay.gui.state import SessionState
 from overlay.gui.pages.templates.templ_static_image import StaticImagePage
-from overlay.calib import calib_camera_to_xray as cam2x
+from overlay.calib.calib_camera_to_xray import calibrate_camera_to_xray
+from overlay.tracking.transforms import invert_transform
 from overlay.gui.widgets.widget_zoom_view import ZoomView
 
 
@@ -244,7 +245,7 @@ class CameraToXrayCalibrationPage(StaticImagePage):
             ransac_thr = 1.5
             self.state.pnp_ransac_threshold_px = float(ransac_thr)
 
-            pnp = cam2x._solve_xray_pnp(
+            pnp = calibrate_camera_to_xray(
                 points_xyz_camera=xyz_c,
                 points_uv_xray=uv_meas,
                 xray_intrinsics=Kx,
@@ -256,10 +257,22 @@ class CameraToXrayCalibrationPage(StaticImagePage):
             )
 
             # --------- persist ONLY allowed SessionState fields ----------
-            T_cx = np.asarray(pnp.T_4x4, dtype=np.float64)   # camera -> xray
-            T_xc = cam2x.invert_T(T_cx)                      # xray -> camera
+            T_cx = np.asarray(pnp.T_4x4, dtype=np.float64)  # camera -> xray
+            T_xc = invert_transform(T_cx)                   # xray -> camera
+              
             self.state.T_cx = T_cx
             self.state.T_xc = T_xc
+            
+            # debug
+            out_path = r"C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Data\T_cx_debug_new.npz"
+            np.savez(
+                out_path,
+                T_cx=T_cx,
+                T_xc=T_xc,
+                K_xray=Kx,
+                points_xyz_camera=xyz_c,
+                points_uv_xray=uv_meas,
+            )
             
             # --------- local diagnostics (page-only) ----------
             self._pnp_done = True

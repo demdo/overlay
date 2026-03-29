@@ -172,7 +172,7 @@ def decompose_homography(
     Kinv = np.linalg.inv(K)
 
     B = Kinv @ Hn
-
+    
     b1 = B[:, 0]
     b2 = B[:, 1]
     b3 = B[:, 2]
@@ -199,16 +199,16 @@ def decompose_homography(
 # ============================================================
 # Utility
 # ============================================================
-
+"""
 def rotation_matrix_to_euler_xyz_deg(R: np.ndarray) -> Tuple[float, float, float]:
-    """
-    Convert rotation matrix to XYZ Euler angles (degrees).
+    
+    #Convert rotation matrix to XYZ Euler angles (degrees).
 
-    Convention:
-        R = Rz * Ry * Rx  (intrinsic XYZ)
-    Returns:
-        (x_deg, y_deg, z_deg)
-    """
+    #Convention:
+    #    R = Rz * Ry * Rx  (intrinsic XYZ)
+    #Returns:
+    #    (x_deg, y_deg, z_deg)
+    
 
     sy = np.sqrt(R[0, 0]**2 + R[1, 0]**2)
     singular = sy < 1e-9
@@ -228,30 +228,31 @@ def rotation_matrix_to_euler_xyz_deg(R: np.ndarray) -> Tuple[float, float, float
     z_deg = np.degrees(z)
 
     return float(x_deg), float(y_deg), float(z_deg)
+"""
 
-
+"""
 def relative_board_angles_deg(
     R_ref: np.ndarray,
     R: np.ndarray,
     *,
     xray_axes: bool = False,
 ) -> Tuple[float, float, float]:
-    """
-    Relative rotation angles (deg) of pose R w.r.t. reference pose R_ref,
-    expressed in the BOARD coordinate system of the reference.
+    
+    #Relative rotation angles (deg) of pose R w.r.t. reference pose R_ref,
+    #expressed in the BOARD coordinate system of the reference.
 
-    Returns (tilt_xg_deg, tilt_yg_deg, inplane_zg_deg) using XYZ Euler angles.
+    #Returns (tilt_xg_deg, tilt_yg_deg, inplane_zg_deg) using XYZ Euler angles.
 
-    If xray_axes=True, we re-interpret the in-plane board axes to match a
-    "X-ray image view" convention where:
-        x_g points UP in the X-ray image      => x' = -y
-        y_g points RIGHT in the X-ray image   => y' =  x
-        z_g unchanged                         => z' =  z
+    #If xray_axes=True, we re-interpret the in-plane board axes to match a
+    #"X-ray image view" convention where:
+    #    x_g points UP in the X-ray image      => x' = -y
+    #    y_g points RIGHT in the X-ray image   => y' =  x
+    #    z_g unchanged                         => z' =  z
 
-    Additionally, in xray_axes mode we flip the signs of tilt_xg and tilt_yg
-    to match the right-hand-rule interpretation you apply when judging the
-    rotation directly from the X-ray view / setup.
-    """
+    #Additionally, in xray_axes mode we flip the signs of tilt_xg and tilt_yg
+    #to match the right-hand-rule interpretation you apply when judging the
+    #rotation directly from the X-ray view / setup.
+    
     R_ref = np.asarray(R_ref, dtype=np.float64)
     R = np.asarray(R, dtype=np.float64)
 
@@ -277,6 +278,46 @@ def relative_board_angles_deg(
         tilt_yg_deg = -tilt_yg_deg
 
     return float(tilt_xg_deg), float(tilt_yg_deg), float(inplane_zg_deg)
+"""
+
+def relative_board_tilt_from_normal_deg(
+    R_ref: np.ndarray,
+    R: np.ndarray,
+    *,
+    xray_axes: bool = False,
+) -> tuple[float, float, float]:
+    """
+    Return (tilt_xg_deg, tilt_yg_deg, tilt_mag_deg) from the plane normal,
+    expressed in the reference board frame.
+
+    This avoids Euler cross-coupling and matches the intuition of "tilt about x/y".
+    """
+    R_ref = np.asarray(R_ref, dtype=np.float64)
+    R = np.asarray(R, dtype=np.float64)
+
+    R_rel = R_ref.T @ R
+
+    if xray_axes:
+        S = np.array([
+            [0.0,  1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0,  0.0, 1.0],
+        ], dtype=np.float64)
+        R_rel = S.T @ R_rel @ S
+
+    # normal of board plane (z axis of board) in reference frame
+    n = R_rel @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    nx, ny, nz = n.tolist()
+
+    # Avoid sign flips by enforcing nz >= 0 (optional but often helpful)
+    if nz < 0:
+        nx, ny, nz = -nx, -ny, -nz
+
+    tilt_x = np.arctan2(ny, nz)
+    tilt_y = -np.arctan2(nx, nz)
+    tilt_mag = np.arctan2(np.sqrt(nx*nx + ny*ny), nz)
+
+    return float(np.degrees(tilt_x)), float(np.degrees(tilt_y)), float(np.degrees(tilt_mag))
 
 
 def relative_shift_board_mm(

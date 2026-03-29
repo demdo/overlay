@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import pydicom
 
 from PySide6.QtWidgets import (
     QPushButton, QFileDialog, QMessageBox, QSizePolicy
@@ -13,19 +14,38 @@ from overlay.gui.state import SessionState
 from overlay.gui.pages.templates.templ_static_image import StaticImagePage
 from overlay.gui.widgets.widget_xray_marker_selection import XrayMarkerSelectionWidget
 
+from overlay.tools.blob_detection import HoughCircleParams
 from overlay.tools.xray_marker_selection import (
-    detector_mask,
-    sort_circles_grid,
-    select_marker_roi_from_grid,
+    run_xray_marker_detection,
+    compute_roi_from_grid,
 )
-from overlay.tools.blob_detection import HoughCircleParams, detect_blobs_hough
+
+
+def _rot180_image(img: np.ndarray) -> np.ndarray:
+    return cv2.rotate(img, cv2.ROTATE_180)
+
+
+def _uv_rot180_to_raw(uv_rot: np.ndarray, width: int, height: int) -> np.ndarray:
+    uv_rot = np.asarray(uv_rot, dtype=np.float64).reshape(-1, 2)
+    uv_raw = uv_rot.copy()
+    uv_raw[:, 0] = (width - 1) - uv_rot[:, 0]
+    uv_raw[:, 1] = (height - 1) - uv_rot[:, 1]
+    return uv_raw
+
+
+def _uv_raw_to_rot180(uv_raw: np.ndarray, width: int, height: int) -> np.ndarray:
+    uv_raw = np.asarray(uv_raw, dtype=np.float64).reshape(-1, 2)
+    uv_rot = uv_raw.copy()
+    uv_rot[:, 0] = (width - 1) - uv_raw[:, 0]
+    uv_rot[:, 1] = (height - 1) - uv_raw[:, 1]
+    return uv_rot
 
 
 class XrayMarkerSelectionPage(StaticImagePage):
     """
     Step — X-ray marker selection
 
-    IMPORTANT (your constraint):
+    IMPORTANT:
     - MUST NOT add any new SessionState fields dynamically.
     - SessionState fields used here (already defined in state.py):
         * xray_image, xray_image_path
@@ -33,7 +53,7 @@ class XrayMarkerSelectionPage(StaticImagePage):
         * xray_marker_overlay_bgr
         * marker_radius_px
     - Everything else stays LOCAL to this page:
-        * circles_grid
+        * circles
         * pick_radius_px
     """
 
@@ -44,8 +64,8 @@ class XrayMarkerSelectionPage(StaticImagePage):
         self.on_complete_changed = on_complete_changed
 
         # ---------------- local (page-only) runtime ----------------
-        self._circles_grid: np.ndarray | None = None     # (nrows, ncols, 3) with NaNs
-        self._pick_radius_px: float | None = None        # interaction radius for selection
+        self._circles: np.ndarray | None = None       # (N,3)
+        self._pick_radius_px: float | None = None     # interaction radius
 
         # ======================================================
         # LEFT: replace template image_label with interactive widget
@@ -99,7 +119,6 @@ class XrayMarkerSelectionPage(StaticImagePage):
     # ---------------- Completion ----------------
 
     def is_complete(self) -> bool:
-        # use the dedicated state flag (no dynamic getattr needed)
         return self.state.has_xray_points_confirmed
 
     # ---------------- Refresh ----------------
@@ -112,7 +131,7 @@ class XrayMarkerSelectionPage(StaticImagePage):
         # --------------------------------------------------
         if img is None:
             self.marker_widget.set_image(None)
-            self.marker_widget.set_grid(None)
+            self.marker_widget.set_circles(None)
             self.marker_widget.set_locked(False)
 
             self.set_stats_rows([
@@ -130,10 +149,10 @@ class XrayMarkerSelectionPage(StaticImagePage):
         # --------------------------------------------------
         self.marker_widget.set_image(img)
 
-        if self._circles_grid is not None and self._pick_radius_px is not None:
-            self.marker_widget.set_grid(self._circles_grid, float(self._pick_radius_px))
+        if self._circles is not None and self._pick_radius_px is not None:
+            self.marker_widget.set_circles(self._circles, float(self._pick_radius_px))
         else:
-            self.marker_widget.set_grid(None)
+            self.marker_widget.set_circles(None)
 
         confirmed = bool(self.state.xray_points_confirmed)
 
@@ -141,23 +160,23 @@ class XrayMarkerSelectionPage(StaticImagePage):
         self.btn_load.setEnabled(False)
 
         # Detect: only once (unless you reload image)
-        already_detected = self._circles_grid is not None
+        already_detected = self._circles is not None
         self.btn_detect.setEnabled(not already_detected)
 
         # Reset: only if at least 1 anchor selected
-        selected_cells = self.marker_widget.get_selected_cells()
-        self.btn_reset.setEnabled(len(selected_cells) > 0)
+        selected_idx = self.marker_widget.get_selected_indices()
+        self.btn_reset.setEnabled(len(selected_idx) > 0)
 
         # Lock interaction after confirmation
         self.marker_widget.set_locked(confirmed)
 
         # Stats
-        if self._circles_grid is None:
+        if self._circles is None:
             detected_txt = "-"
             selected_txt = "- / 3"
         else:
-            n_detected = int(np.isfinite(self._circles_grid[..., 0]).sum())
-            n_selected = len(selected_cells)
+            n_detected = int(len(self._circles))
+            n_selected = len(selected_idx)
             detected_txt = str(n_detected)
             selected_txt = f"{n_selected} / 3"
 
@@ -173,53 +192,55 @@ class XrayMarkerSelectionPage(StaticImagePage):
         dlg.setFileMode(QFileDialog.ExistingFile)
         dlg.setNameFilter("Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.dcm *.ima);;All Files (*)")
         dlg.setOption(QFileDialog.DontUseNativeDialog, True)
-
+    
         if dlg.exec() != QFileDialog.Accepted:
             return
-
+    
         files = dlg.selectedFiles()
         path = files[0] if files else ""
         if not path:
             return
-
+    
         try:
+            # --------------------------------------------------
+            # Load image (pydicom assumed imported at top)
+            # --------------------------------------------------
             if path.lower().endswith((".dcm", ".ima")):
-                try:
-                    import pydicom  # lazy import (keeps page import-safe)
-                except Exception as e:
-                    raise RuntimeError("pydicom is required to open .dcm/.ima files. Install with: pip install pydicom") from e
-
                 ds = pydicom.dcmread(path)
                 img = ds.pixel_array.astype(np.float32)
                 img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
                 img = img.astype(np.uint8)
             else:
                 img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-
+    
             if img is None:
                 raise ValueError("Could not read image.")
-
-            # --- store only EXISTING SessionState fields ---
+    
+            # --------------------------------------------------
+            # Store in EXISTING SessionState
+            # --------------------------------------------------
             self.state.xray_image = img
             self.state.xray_image_path = path
-
+    
             # reset dependent EXISTING state fields
             self.state.xray_points_uv = None
             self.state.xray_points_confirmed = False
             self.state.xray_marker_overlay_bgr = None
             self.state.marker_radius_px = None
-
-            # reset local (page-only) detection products
-            self._circles_grid = None
+    
+            # --------------------------------------------------
+            # Reset local (page-only)
+            # --------------------------------------------------
+            self._circles = None
             self._pick_radius_px = None
-
+    
             self.marker_widget.clear_selection()
-            self.marker_widget.set_roi_cells([])
+            self.marker_widget.set_roi_indices([])
             self.marker_widget.set_locked(False)
-
+    
             self.refresh()
             self.on_complete_changed()
-
+    
         except Exception as e:
             QMessageBox.critical(self, "Failed to load X-ray image", str(e))
 
@@ -236,97 +257,50 @@ class XrayMarkerSelectionPage(StaticImagePage):
                 min_radius=2,
                 max_radius=7,
                 dp=1.2,
-                minDist=16,
+                minDist=8,
                 param1=120,
-                param2=12,
+                param2=9,
                 invert=True,
                 median_ks=(3, 5),
             )
 
-            use_clahe = True
-            clahe_clip = 2.0
-            clahe_tiles = (12, 12)
-            row_tol_px = 13.0
+            res = run_xray_marker_detection(
+                img,
+                hough_params=params,
+                use_clahe=True,
+                clahe_clip=2.0,
+                clahe_tiles=(12, 12),
+                use_mask=False,
+            )
 
-            img_proc = img.copy()
-            if use_clahe:
-                clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=clahe_tiles)
-                img_proc = clahe.apply(img_proc)
-
-            mask = detector_mask(img_proc)
-            img_masked = img_proc.copy()
-            img_masked[mask == 0] = 0
-
-            circles_out = detect_blobs_hough(img_masked, params)
-            if circles_out is None or len(circles_out) == 0:
+            if res.circles is None or len(res.circles) == 0:
                 QMessageBox.warning(self, "Marker detection", "No circles detected.")
                 return
 
-            circles_out = np.asarray(circles_out, dtype=np.float32)
-            circles_sorted = sort_circles_grid(circles_out, row_tol_px=row_tol_px)
-            if circles_sorted is None or len(circles_sorted) == 0:
-                QMessageBox.warning(self, "Marker detection", "No circles after sorting.")
-                return
+            circles = np.asarray(res.circles, dtype=np.float64).reshape(-1, 3)
 
-            r_med = float(np.median(circles_sorted[:, 2]))
-            y_thresh_px = 2.5 * r_med
-
-            c = circles_sorted.copy().astype(np.float32)
-            current = c[:1].copy()
-            y_ref = float(c[0, 1])
-            rows = []
-
-            for k in range(1, len(c)):
-                pt = c[k]
-                if abs(float(pt[1]) - y_ref) > y_thresh_px:
-                    sort_idx = np.argsort(current[:, 0])
-                    rows.append(current[sort_idx])
-                    current = pt.reshape(1, -1)
-                    y_ref = float(pt[1])
-                else:
-                    current = np.vstack([current, pt])
-                    y_ref = float(np.mean(current[:, 1]))
-
-            sort_idx = np.argsort(current[:, 0])
-            rows.append(current[sort_idx])
-            nrows = len(rows)
-
-            center_row_idx = int(np.argmax([len(row) for row in rows]))
-            ncols = len(rows[center_row_idx])
-
-            circles_grid = np.full((nrows, ncols, 3), np.nan, dtype=np.float32)
-            for i, row in enumerate(rows):
-                n_points = len(row)
-                left_pad = (ncols - n_points) // 2
-                padded_row = np.full((ncols, 3), np.nan, dtype=np.float32)
-                padded_row[left_pad:left_pad + n_points] = row
-                circles_grid[i] = padded_row
-
-            radii = circles_grid[..., 2]
+            radii = circles[:, 2]
             finite_r = radii[np.isfinite(radii)]
-
-            # store TRUE detected radius in EXISTING state field
             if finite_r.size:
                 self.state.marker_radius_px = float(np.median(finite_r))
             else:
                 self.state.marker_radius_px = None
 
-            # keep pick radius LOCAL (interaction only)
             if self.state.marker_radius_px is not None:
                 pick_radius_px = 0.6 * float(self.state.marker_radius_px)
             else:
                 pick_radius_px = 20.0
 
-            self._circles_grid = circles_grid
+            self._circles = circles
             self._pick_radius_px = float(pick_radius_px)
 
-            # reset selection/confirmation + overlay (EXISTING state fields)
+            # reset selection/confirmation + overlay
             self.state.xray_points_uv = None
             self.state.xray_points_confirmed = False
             self.state.xray_marker_overlay_bgr = None
 
             self.marker_widget.clear_selection()
-            self.marker_widget.set_roi_cells([])
+            self.marker_widget.set_roi_indices([])
             self.marker_widget.set_locked(False)
 
             self.refresh()
@@ -337,10 +311,11 @@ class XrayMarkerSelectionPage(StaticImagePage):
 
     # ---------------- Confirm flow ----------------
 
-    def on_selection_proposed(self, payload):
-        cells = payload.get("cells", None)
-        if cells is None or len(cells) != 3:
+    def on_selection_proposed(self, selected_idx):
+        if selected_idx is None or len(selected_idx) != 3:
             return
+
+        selected_idx = [int(k) for k in selected_idx]
 
         ans = QMessageBox.question(
             self,
@@ -354,27 +329,36 @@ class XrayMarkerSelectionPage(StaticImagePage):
             self.state.xray_points_confirmed = False
             self.state.xray_marker_overlay_bgr = None
             self.marker_widget.clear_selection()
-            self.marker_widget.set_roi_cells([])
+            self.marker_widget.set_roi_indices([])
             self.marker_widget.set_locked(False)
             self.refresh()
             self.on_complete_changed()
             return
 
-        if self._circles_grid is None:
+        if self._circles is None or self._pick_radius_px is None:
+            self.marker_widget.clear_selection()
+            self.marker_widget.set_roi_indices([])
+            self.marker_widget.set_locked(False)
+            self.refresh()
+            self.on_complete_changed()
             return
 
-        xy, roi_cells_set = select_marker_roi_from_grid(
-            circles_grid=self._circles_grid,
-            selected_cells=cells,
+        margin_px = 1.1 * float(self._pick_radius_px)
+
+        roi_uv, roi_idx, _dbg = compute_roi_from_grid(
+            circles=self._circles,
+            anchor_idx=selected_idx,
+            margin_px=margin_px,
+            gate_tol_pitch=0.40,
+            min_steps=2,
         )
 
-        self.state.xray_points_uv = np.asarray(xy, dtype=float)
+        self.state.xray_points_uv = np.asarray(roi_uv, dtype=float)
         self.state.xray_points_confirmed = True
 
-        self.marker_widget.set_roi_cells(list(roi_cells_set))
+        self.marker_widget.set_roi_indices(list(np.asarray(roi_idx, dtype=np.int64).tolist()))
         self.marker_widget.set_locked(True)
 
-        # Cache FULL-SIZE ROI overlay
         self.state.xray_marker_overlay_bgr = self._render_roi_overlay_bgr()
 
         self.refresh()
@@ -388,7 +372,7 @@ class XrayMarkerSelectionPage(StaticImagePage):
         self.state.xray_marker_overlay_bgr = None
 
         self.marker_widget.clear_selection()
-        self.marker_widget.set_roi_cells([])
+        self.marker_widget.set_roi_indices([])
         self.marker_widget.set_locked(False)
 
         self.refresh()
@@ -411,7 +395,6 @@ class XrayMarkerSelectionPage(StaticImagePage):
         img8 = img if img.dtype == np.uint8 else np.clip(img, 0, 255).astype(np.uint8)
         out = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
 
-        # use local pick radius if available
         if self._pick_radius_px is None:
             roi_r = 6.0
         else:

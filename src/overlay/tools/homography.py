@@ -49,166 +49,67 @@ def _largest_contiguous_run(vals_sorted_unique: List[int]) -> Tuple[int, int]:
 # ============================================================
 
 def build_planar_correspondences(
-    circles_grid: np.ndarray,
-    roi_cells: Iterable[Cell],
+    roi_uv: np.ndarray,
+    dbg: dict,
+    *,
     pitch_mm: float = 2.54,
-    row_tol_px: float = 12.0,
-) -> tuple[np.ndarray, np.ndarray, list[Cell]]:
+) -> tuple[np.ndarray, np.ndarray, dict]:
     """
-    Build (XY_mm, uv_px, cells_used) in GEOMETRIC row-wise ordering in IMAGE space.
+    Build (XY_mm, uv_px, meta) with GUARANTEED consistent ordering.
 
-    Key idea:
-    - roi_cells gives us which (i,j) to use
-    - but ordering is derived from their (u,v) coordinates (image geometry), not from (i,j)
-    - rows are formed by clustering v with tolerance row_tol_px
-    - columns by sorting u within each row
-    - XY becomes a clean grid: X = col*pitch, Y = row*pitch
+    Assumptions
+    ----------
+    - roi_uv is already ordered in grid row-major order:
+        row 0: left->right, then row 1, ...
+    - dbg contains 'nu' and 'nv' (grid steps along u and v), so that
+        N = (nv+1)*(nu+1) matches roi_uv length.
+
+    Returns
+    -------
+    XY_mm : np.ndarray
+        (N,2) float64 grid coordinates in mm, row-major order.
+    uv_px : np.ndarray
+        (N,2) float64 image coordinates in px (copy of roi_uv).
+    meta : dict
+        Contains inferred (nrows, ncols, nu, nv).
     """
-
-    if circles_grid is None or circles_grid.ndim != 3 or circles_grid.shape[2] < 2:
-        raise ValueError("circles_grid must have shape (nrows, ncols, 3).")
-
-    H, W = circles_grid.shape[:2]
-
-    # collect finite uv for all roi cells
-    pts: list[tuple[float, float, int, int]] = []  # (u, v, i, j)
-    for (i, j) in set(roi_cells):
-        if not (0 <= i < H and 0 <= j < W):
-            continue
-        u, v = circles_grid[i, j, 0], circles_grid[i, j, 1]
-        if not (np.isfinite(u) and np.isfinite(v)):
-            continue
-        pts.append((float(u), float(v), int(i), int(j)))
-
-    if not pts:
+    uv = np.asarray(roi_uv, dtype=np.float64).reshape(-1, 2)
+    if uv.size == 0:
         return (
             np.empty((0, 2), dtype=np.float64),
             np.empty((0, 2), dtype=np.float64),
-            [],
+            dict(nrows=0, ncols=0, nu=None, nv=None),
         )
 
-    # sort by v then u (geometric)
-    pts.sort(key=lambda t: (t[1], t[0]))
+    nu = int(dbg.get("nu", -1))
+    nv = int(dbg.get("nv", -1))
+    if nu < 0 or nv < 0:
+        raise ValueError("dbg must contain integer 'nu' and 'nv'.")
 
-    # cluster into rows by v
-    rows: list[list[tuple[float, float, int, int]]] = []
-    cur: list[tuple[float, float, int, int]] = []
-    v_ref: float | None = None
+    ncols = nu + 1
+    nrows = nv + 1
 
-    for p in pts:
-        u, v, i, j = p
-        if v_ref is None:
-            cur = [p]
-            v_ref = v
-            continue
+    expected = nrows * ncols
+    got = int(uv.shape[0])
+    if got != expected:
+        raise ValueError(
+            f"ROI size mismatch: expected (nv+1)*(nu+1)={expected} points, got {got} "
+            f"(nv={nv}, nu={nu})."
+        )
 
-        if abs(v - v_ref) <= float(row_tol_px):
-            cur.append(p)
-            # keep row reference stable-ish (running mean)
-            v_ref = (v_ref * (len(cur) - 1) + v) / len(cur)
-        else:
-            rows.append(cur)
-            cur = [p]
-            v_ref = v
-
-    if cur:
-        rows.append(cur)
-
-    XY_list: list[list[float]] = []
-    uv_list: list[list[float]] = []
-    cells_used: list[Cell] = []
-
-    for r, row in enumerate(rows):
-        # left->right
-        row.sort(key=lambda t: t[0])
-        Y = float(r) * float(pitch_mm)
-
-        for c, (u, v, i, j) in enumerate(row):
-            X = float(c) * float(pitch_mm)
-            XY_list.append([X, Y])
-            uv_list.append([u, v])
-            cells_used.append((i, j))
-
-    return (
-        np.asarray(XY_list, dtype=np.float64),
-        np.asarray(uv_list, dtype=np.float64),
-        cells_used,
+    # Row-major grid to match uv row-major
+    jj, ii = np.meshgrid(
+        np.arange(ncols, dtype=np.float64),
+        np.arange(nrows, dtype=np.float64),
+        indexing="xy",
     )
+    X = jj * float(pitch_mm)
+    Y = ii * float(pitch_mm)
+    XY = np.stack([X, Y], axis=-1).reshape(-1, 2).astype(np.float64)
 
+    meta = dict(nrows=int(nrows), ncols=int(ncols), nu=int(nu), nv=int(nv))
+    return XY, uv, meta
 
-"""
-def build_planar_correspondences(
-    circles_grid: np.ndarray,
-    roi_cells: Iterable[Cell],
-    pitch_mm: float = 2.54,
-) -> tuple[np.ndarray, np.ndarray, list[Cell]]:
-    
-    #Build (XY_mm, uv_px, cells_used) in guaranteed row-major ordering.
-
-    #- Determine dominant contiguous i-block (rows).
-    #- Within that block, determine dominant contiguous j-block (cols).
-    #- Build dense rectangle (i0..i1, j0..j1).
-    #- Only return cells with finite uv.
-    #- XY starts at (0,0) for (i0,j0).
-
-    #Returns
-    #-------
-    #XY : (N,2) float64
-    #uv : (N,2) float64
-    #cells_used : list[(i,j)] in row-major order
-    
-    if circles_grid is None or circles_grid.ndim != 3 or circles_grid.shape[2] < 2:
-        raise ValueError("circles_grid must have shape (nrows, ncols, 3).")
-
-    roi = list(roi_cells)
-    if not roi:
-        return (
-            np.empty((0, 2), dtype=np.float64),
-            np.empty((0, 2), dtype=np.float64),
-            [],
-        )
-
-    # dominant i-run
-    i_vals = sorted({i for (i, _j) in roi})
-    i0, i1 = _largest_contiguous_run(i_vals)
-
-    roi_i = [(i, j) for (i, j) in roi if i0 <= i <= i1]
-    if not roi_i:
-        roi_i = roi
-        i0 = min(i for (i, _j) in roi_i)
-        i1 = max(i for (i, _j) in roi_i)
-
-    # dominant j-run inside i-run
-    j_vals = sorted({j for (_i, j) in roi_i})
-    j0, j1 = _largest_contiguous_run(j_vals)
-
-    H, W = circles_grid.shape[:2]
-
-    XY_list: list[list[float]] = []
-    uv_list: list[list[float]] = []
-    cells_used: list[Cell] = []
-
-    for i in range(i0, i1 + 1):
-        Y = (i - i0) * float(pitch_mm)
-        for j in range(j0, j1 + 1):
-            if not (0 <= i < H and 0 <= j < W):
-                continue
-
-            x, y = circles_grid[i, j, 0], circles_grid[i, j, 1]
-            if not (np.isfinite(x) and np.isfinite(y)):
-                continue
-
-            X = (j - j0) * float(pitch_mm)
-
-            XY_list.append([X, Y])
-            uv_list.append([float(x), float(y)])
-            cells_used.append((i, j))
-
-    XY = np.asarray(XY_list, dtype=np.float64)
-    uv = np.asarray(uv_list, dtype=np.float64)
-
-    return XY, uv, cells_used
-"""
 
 # ============================================================
 # Homography estimation
@@ -261,6 +162,107 @@ def estimate_homography_dlt(
         H = H / H[2, 2]
 
     return H
+
+
+# ============================================================
+# Plane-induced homography (X-ray -> Camera)
+# ============================================================
+
+def estimate_plane_induced_homography(
+    K_c: np.ndarray,
+    R_xc: np.ndarray,
+    t_xc: np.ndarray,
+    K_x: np.ndarray,
+    d_x: float,
+    *,
+    normalize: bool = True,
+) -> np.ndarray:
+    """
+    Compute plane-induced homography from X-ray image to camera image.
+    
+    This homography maps pixel coordinates from the X-ray image to
+    pixel coordinates in the RGB camera image, assuming all points lie
+    on a single plane in the X-ray frame defined by
+    
+        n_x^T X_x = d_x
+    
+    with
+    
+        n_x = [0, 0, 1]^T
+    
+    and d_x being the positive plane depth in the X-ray frame
+    (e.g. the pointer tip z-coordinate expressed in the X-ray frame).
+    
+    Mathematical formulation
+    ------------------------
+        H_xc = K_c ( R_xc + (t_xc n_x^T) / d_x ) K_x^{-1}
+    
+    such that:
+        u_c ~ H_xc * u_x
+    
+    Coordinate conventions
+    ----------------------
+    - R_xc, t_xc transform 3D points from X-ray frame to camera frame:
+    
+          X_c = R_xc X_x + t_xc
+    
+    - d_x is NOT the offset term of a plane written as n^T X + d = 0.
+      Instead, it is the positive depth parameter in the plane equation
+    
+          n_x^T X_x = d_x
+
+    Parameters
+    ----------
+    K_c : (3,3) float64
+        Intrinsic matrix of the RGB camera.
+
+    R_xc : (3,3) float64
+        Rotation from X-ray frame to camera frame.
+
+    t_xc : (3,) or (3,1) float64
+        Translation from X-ray origin to camera origin (in camera frame).
+
+    K_x : (3,3) float64
+        Intrinsic matrix of the X-ray imaging system.
+
+    d_x : float
+        Plane depth in X-ray frame.
+
+    normalize : bool, optional
+        If True, normalize H such that H[2,2] = 1.
+
+    Returns
+    -------
+    H_xc : (3,3) float64
+        Homography mapping X-ray pixels -> camera pixels.
+    """
+
+    K_c = np.asarray(K_c, dtype=np.float64)
+    R_xc = np.asarray(R_xc, dtype=np.float64)
+    K_x = np.asarray(K_x, dtype=np.float64)
+    t_xc = np.asarray(t_xc, dtype=np.float64).reshape(3, 1)
+
+    if K_c.shape != (3, 3) or K_x.shape != (3, 3):
+        raise ValueError("K_c and K_x must be (3,3).")
+    if R_xc.shape != (3, 3):
+        raise ValueError("R_xc must be (3,3).")
+    if t_xc.shape != (3, 1):
+        raise ValueError("t_xc must be shape (3,) or (3,1).")
+    if abs(d_x) < 1e-9:
+        raise ValueError("d_x must be non-zero.")
+
+    n_x = np.array([[0.0], [0.0], [1.0]], dtype=np.float64)
+    d_x = float(d_x) * 1e-3   # mm -> m
+
+    plane_term = (t_xc @ n_x.T) / float(d_x)
+    A = R_xc + plane_term
+
+    H_xc = K_c @ A @ np.linalg.inv(K_x)
+
+    if normalize and abs(H_xc[2, 2]) > 1e-12:
+        H_xc = H_xc / H_xc[2, 2]
+
+    return H_xc
 
 
 # ============================================================

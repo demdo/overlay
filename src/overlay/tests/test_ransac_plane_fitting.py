@@ -769,6 +769,17 @@ def main():
                     z_max=z_max,
                     seed=redo_seed,
                 )
+                
+                # DEBUG
+                if len(pts3d) > 0:
+                    z_vals = pts3d[:, 2]
+                    print("\nSampled 3D points (camera frame)")
+                    print(f"count: {len(pts3d)}")
+                    print(f"z range:   {np.min(z_vals):.4f} m .. {np.max(z_vals):.4f} m")
+                    print(f"z mean:    {np.mean(z_vals):.4f} m")
+                    print(f"xyz min:   [{pts3d[:,0].min():+.4f}, {pts3d[:,1].min():+.4f}, {pts3d[:,2].min():+.4f}] m")
+                    print(f"xyz max:   [{pts3d[:,0].max():+.4f}, {pts3d[:,1].max():+.4f}, {pts3d[:,2].max():+.4f}] m")
+                #
 
                 if len(pts3d) < 800:
                     print("Not enough points for plane fit. Try again.")
@@ -782,6 +793,47 @@ def main():
                     ransac_n=ransac_n,
                     num_iterations=ransac_iters,
                 )
+                
+                # DEBUG
+                a, b, c, d = [float(x) for x in plane_model]
+                n = np.array([a, b, c], dtype=np.float64)
+                n_norm = np.linalg.norm(n)
+                
+                plane_dist_m = abs(d) / max(n_norm, 1e-12)
+                
+                print(f"Plane distance from camera origin: {plane_dist_m:.4f} m")
+                print(f"Plane normal norm: {n_norm:.6f}")
+                print(f"Plane normal z-component: {c / max(n_norm, 1e-12):+.6f}")
+                
+                corners_uv = np.array([
+                    extremes["top_left"],
+                    extremes["top_right"],
+                    extremes["bottom_left"],
+                ], dtype=np.float64)
+                
+                K_rgb = np.array([[1360.416961, 0, 975.507938], [0, 1362.366079, 544.699398], [0, 0, 1]])
+                
+                corner_xyz = rpf.intersect_corners_with_plane(
+                    corners_uv=corners_uv,
+                    rgb_intrinsics=K_rgb,
+                    plane_model=plane_model,
+                )
+                
+                P_tl, P_tr, P_bl = corner_xyz
+                
+                print("\nReconstructed extreme corners (camera frame)")
+                print(f"P_tl = [{P_tl[0]:+.4f}, {P_tl[1]:+.4f}, {P_tl[2]:+.4f}] m")
+                print(f"P_tr = [{P_tr[0]:+.4f}, {P_tr[1]:+.4f}, {P_tr[2]:+.4f}] m")
+                print(f"P_bl = [{P_bl[0]:+.4f}, {P_bl[1]:+.4f}, {P_bl[2]:+.4f}] m")
+                
+                w_m = np.linalg.norm(P_tr - P_tl)
+                h_m = np.linalg.norm(P_bl - P_tl)
+                diag_m = np.linalg.norm(P_bl - P_tr)
+                
+                print(f"Top edge length     = {w_m*1000:.2f} mm")
+                print(f"Left edge length    = {h_m*1000:.2f} mm")
+                print(f"TR-BL distance      = {diag_m*1000:.2f} mm")
+                #
 
                 deviations = compute_deviations(pts3d, plane_model)
                 inlier_deviations = deviations[inliers] if len(inliers) else deviations
@@ -815,7 +867,7 @@ def main():
                 top_left = extremes["top_left"]
                 preview = draw_axes_top_left(preview, origin=(int(round(top_left[0])), int(round(top_left[1]))))
 
-                save_preview_same_dir(preview, "plane_fitting_01_corners_support.png")
+                #save_preview_same_dir(preview, "plane_fitting_01_corners_support.png")
 
                 cv2.imshow(PLANE_WIN, preview)
                 cv2.waitKey(10)

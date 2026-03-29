@@ -10,7 +10,7 @@ import cv2
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
-    QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QSizePolicy, QPushButton
+    QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QSizePolicy, QPushButton, QGridLayout
 )
 
 
@@ -195,25 +195,54 @@ class BaseImagePage(QWidget):
 
     
     def set_stats_rows(self, rows: list[tuple[str, str]]) -> None:
-        """
-        Fill the Stats box with rows like [("Blobs detected", "48"), ("Blobs selected", "3 / 3")].
-        Rebuilds the content so height matches number of rows.
-        """
-        # Clear old widgets from stats_content
+        # Clear old widgets
         while self.stats_content.count():
             item = self.stats_content.takeAt(0)
             w = item.widget()
             if w is not None:
                 w.setParent(None)
     
-        # Add new rows
         for k, v in rows:
-            lbl = QLabel(f"{k}: {v}")
-            lbl.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-            lbl.setWordWrap(False)
-            self.stats_content.addWidget(lbl, stretch=0)
     
-        # Ensure compact layout
+            # -----------------------------
+            # CASE 1: Multi-line → MATRIX
+            # -----------------------------
+            if "\n" in v:
+                lines = v.split("\n")
+    
+                # 1) Header row
+                header = QLabel(f"{k}: {lines[0]}")
+                header.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+                header.setWordWrap(False)
+                self.stats_content.addWidget(header, stretch=0)
+    
+                # 2) Matrix grid
+                grid_widget = QWidget()
+                grid = QGridLayout(grid_widget)
+                grid.setContentsMargins(0, 0, 0, 0)
+                grid.setHorizontalSpacing(12)  # Abstand zwischen Spalten
+                grid.setVerticalSpacing(0)
+    
+                for r, line in enumerate(lines[1:]):
+                    values = line.strip().split()
+    
+                    for c, val in enumerate(values):
+                        lbl = QLabel(val)
+                        lbl.setAlignment(Qt.AlignLeft)  # oder AlignRight
+                        lbl.setWordWrap(False)
+                        grid.addWidget(lbl, r, c)
+    
+                self.stats_content.addWidget(grid_widget, stretch=0)
+    
+            # -----------------------------
+            # CASE 2: Normal row
+            # -----------------------------
+            else:
+                lbl = QLabel(f"{k}: {v}")
+                lbl.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+                lbl.setWordWrap(False)
+                self.stats_content.addWidget(lbl, stretch=0)
+    
         self.stats_box.adjustSize()
         self.stats_box.updateGeometry()
 

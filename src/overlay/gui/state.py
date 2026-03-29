@@ -12,6 +12,7 @@ class SessionState:
     
     # --- Camera calibration ---
     K_rgb: Optional[np.ndarray] = None
+    rotate_rgb: bool = False
 
     # --- X-ray marker selection (interactive -> confirmed) ---
     xray_image: Optional[np.ndarray] = None
@@ -34,6 +35,19 @@ class SessionState:
     #   X_c = T_xc @ X_x   (X-ray -> Camera)
     T_cx: Optional[np.ndarray] = None  # Camera -> X-ray
     T_xc: Optional[np.ndarray] = None  # X-ray -> Camera
+    
+    # --- Accepted pointer-tip snapshot from camera-to-pointer measurement ---
+    tip_uv_c: Optional[np.ndarray] = None   # (2,) tip position in RGB image [px]
+    tip_xyz_c: Optional[np.ndarray] = None  # (3,) tip position in camera frame [mm]
+    
+    # --- Pointer pose diagnostics (for debugging d_x issues) ---
+    T_tc: Optional[np.ndarray] = None  # tip -> camera
+    
+    # --- Distance from X-ray source to target plane used in plane-induced homography ---
+    d_x: Optional[float] = None
+    
+    # --- Plane-induced homography for X-ray -> camera overlay ---
+    H_xc: Optional[np.ndarray] = None
     
     # ----------------
     # Convenience flags
@@ -73,3 +87,14 @@ class SessionState:
     @property
     def has_xray_to_cam(self) -> bool:
         return self.T_xc is not None
+    
+    @property
+    def has_d_x(self) -> bool:
+        return self.d_x is not None
+    
+    @property
+    def has_H_xc(self) -> bool:
+        return self.H_xc is not None
+    
+    
+    

@@ -230,9 +230,9 @@ class PlaneFittingPage(LiveImagePage):
             self._live_depth_vis_bgr = self._depth_u16_to_vis_bgr(depth_u16)
 
         if cf:
-            color = np.asanyarray(cf.get_data())
+            color = self.color_frame_to_bgr(cf)
             self._live_color = color
-
+        
             # Checkerboard detection ALWAYS on RGB (even if we display depth)
             gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
             found, _ = cbd.detect_classic_downscaled(gray, self.pattern_size, det_width=self.det_width)

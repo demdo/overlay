@@ -1,0 +1,117 @@
+# overlay/calib/calib_xray_to_pointer.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import numpy as np
+
+from overlay.tracking.transforms import (
+    as_transform,
+    invert_transform,
+    extract_translation,
+)
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def _pose_tip_to_xray(
+    T_xc: np.ndarray,
+    T_tc: np.ndarray,
+) -> np.ndarray:
+    """
+    Compose the transform from tip frame to xray frame.
+
+    Convention
+    ----------
+    T_ab means: transform from frame a to frame b
+
+    Therefore:
+    - T_xc : xray  -> camera
+    - T_tc : tip   -> camera
+
+    We need:
+    - T_cx : camera -> xray = inv(T_xc)
+    - T_tx : tip    -> xray
+
+    Composition:
+        T_tx = T_cx @ T_tc
+    """
+    T_xc = as_transform(T_xc, "T_xc")
+    T_tc = as_transform(T_tc, "T_tc")
+    
+    T_cx = invert_transform(T_xc)
+
+    # T_xc / T_cx come from cam<->xray calibration in meters,
+    # T_tc comes from pointer calibration in millimeters.
+    # Bring T_cx translation to millimeters before composition.
+    T_cx = T_cx.copy()
+    T_cx[:3, 3] *= 1e3   # m -> mm
+
+    T_tx = T_cx @ T_tc
+    return T_tx
+
+
+# ============================================================
+# Public API
+# ============================================================
+
+@dataclass(frozen=True)
+class ExtractDepthResult:
+    T_tx: np.ndarray
+    tip_xyz_x_mm: np.ndarray
+    d_x_mm: float
+
+
+def extract_depth(
+    T_xc: np.ndarray,
+    T_tc: np.ndarray,
+) -> ExtractDepthResult:
+    """
+    Extract tip depth d_x in the xray frame.
+
+    Parameters
+    ----------
+    T_xc : np.ndarray
+        4x4 transform from xray frame to camera frame.
+    T_tc : np.ndarray
+        4x4 transform from tip frame to camera frame.
+
+    Returns
+    -------
+    ExtractDepthResult
+        T_tx       : tip -> xray
+        tip_xyz_x_mm : tip origin expressed in xray coordinates
+        d_x_mm     : extracted depth value in xray frame
+
+    Notes
+    -----
+    With the convention T_ab = "from a to b" and column-vector transforms,
+
+        p_b = T_ab @ p_a
+
+    we need the tip pose in xray coordinates:
+
+        T_tx = T_cx @ T_tc
+             = inv(T_xc) @ T_tc
+
+    Since T_tx maps tip -> xray, its translation is directly the tip origin
+    expressed in the xray frame. Therefore:
+
+        tip_xyz_x_mm = translation(T_tx)
+        d_x_mm       = tip_xyz_x_mm[2]
+    """
+    T_xc = as_transform(T_xc, "T_xc")
+    T_tc = as_transform(T_tc, "T_tc")
+
+    T_tx = _pose_tip_to_xray(T_xc=T_xc, T_tc=T_tc)
+
+    tip_xyz_x_mm = extract_translation(T_tx)
+    d_x_mm = float(tip_xyz_x_mm[2])
+
+    return ExtractDepthResult(
+        T_tx=T_tx,
+        tip_xyz_x_mm=tip_xyz_x_mm,
+        d_x_mm=d_x_mm,
+    )
