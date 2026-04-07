@@ -168,3 +168,75 @@ def fit_plane_from_points(
     return ransac_plane_open3d(points_xyz, distance_threshold, ransac_n, num_iterations)
 
 
+def fit_plane_stable(
+    points_xyz: np.ndarray,
+    distance_threshold: float = 0.0015,   # 1.5 mm
+    ransac_n: int = 8,
+    num_iterations: int = 3000,
+    n_runs: int = 10,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Run RANSAC plane fitting n_runs times and return the spherically averaged
+    plane normal + the inlier set of the best run.
+
+    All normals are flipped to a consistent hemisphere before averaging
+    (convention: n_z < 0, i.e. normal points toward the camera).
+
+    Parameters
+    ----------
+    points_xyz        : (N, 3) point cloud
+    distance_threshold: RANSAC inlier threshold in metres
+    ransac_n          : minimum sample size per RANSAC iteration
+    num_iterations    : RANSAC iterations per run
+    n_runs            : number of independent RANSAC runs to average
+
+    Returns
+    -------
+    plane  : (4,) normalised [a, b, c, d]
+    inliers: (M,) int64 inlier indices from the best run
+    """
+    normals: list[np.ndarray] = []
+    offsets: list[float] = []
+    best_inliers = np.array([], dtype=np.int64)
+    reference_normal: np.ndarray | None = None
+
+    for _ in range(n_runs):
+        plane_raw, inliers = ransac_plane_open3d(
+            points_xyz, distance_threshold, ransac_n, num_iterations
+        )
+        n_vec = plane_raw[:3]
+        norm = float(np.linalg.norm(n_vec))
+        if norm < 1e-9:
+            continue
+
+        n_vec = n_vec / norm
+        d_val = float(plane_raw[3]) / norm
+
+        # Establish sign convention on first valid run,
+        # then keep all subsequent runs consistent with it.
+        if reference_normal is None:
+            if n_vec[2] > 0.0:          # normal points away from camera → flip
+                n_vec, d_val = -n_vec, -d_val
+            reference_normal = n_vec.copy()
+        else:
+            if np.dot(n_vec, reference_normal) < 0.0:
+                n_vec, d_val = -n_vec, -d_val
+
+        normals.append(n_vec)
+        offsets.append(d_val)
+
+        if len(inliers) > len(best_inliers):
+            best_inliers = inliers
+
+    if not normals:
+        raise RuntimeError("fit_plane_stable: all RANSAC runs failed.")
+
+    # Spherical mean on S²: sum → normalise (Fréchet mean approximation)
+    mean_n = np.mean(normals, axis=0)
+    mean_n /= np.linalg.norm(mean_n)
+    mean_d = float(np.mean(offsets))
+
+    plane_out = np.array([mean_n[0], mean_n[1], mean_n[2], mean_d], dtype=np.float64)
+    return plane_out, best_inliers
+
+

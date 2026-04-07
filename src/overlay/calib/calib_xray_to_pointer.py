@@ -1,5 +1,3 @@
-# overlay/calib/calib_xray_to_pointer.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -40,12 +38,12 @@ def _pose_tip_to_xray(
     """
     T_xc = as_transform(T_xc, "T_xc")
     T_tc = as_transform(T_tc, "T_tc")
-    
+
     T_cx = invert_transform(T_xc)
 
-    # T_xc / T_cx come from cam<->xray calibration in meters,
-    # T_tc comes from pointer calibration in millimeters.
-    # Bring T_cx translation to millimeters before composition.
+    # T_xc / T_cx come from camera<->xray calibration in meters,
+    # while T_tc comes from pointer calibration in millimeters.
+    # Convert the translation part of T_cx to millimeters before composition.
     T_cx = T_cx.copy()
     T_cx[:3, 3] *= 1e3   # m -> mm
 
@@ -69,7 +67,7 @@ def extract_depth(
     T_tc: np.ndarray,
 ) -> ExtractDepthResult:
     """
-    Extract tip depth d_x in the xray frame.
+    Express the pointer tip in the xray frame and extract d_x from its z-coordinate.
 
     Parameters
     ----------
@@ -81,9 +79,9 @@ def extract_depth(
     Returns
     -------
     ExtractDepthResult
-        T_tx       : tip -> xray
-        tip_xyz_x_mm : tip origin expressed in xray coordinates
-        d_x_mm     : extracted depth value in xray frame
+        T_tx         : tip -> xray
+        tip_xyz_x_mm : tip origin expressed in xray coordinates [mm]
+        d_x_mm       : z-coordinate of the tip in the xray frame [mm]
 
     Notes
     -----
@@ -91,16 +89,20 @@ def extract_depth(
 
         p_b = T_ab @ p_a
 
-    we need the tip pose in xray coordinates:
+    the tip pose in xray coordinates is
 
         T_tx = T_cx @ T_tc
              = inv(T_xc) @ T_tc
 
     Since T_tx maps tip -> xray, its translation is directly the tip origin
-    expressed in the xray frame. Therefore:
+    expressed in the xray frame:
 
         tip_xyz_x_mm = translation(T_tx)
-        d_x_mm       = tip_xyz_x_mm[2]
+
+    Under the project convention, d_x is taken directly as the xray-frame
+    z-coordinate of the tip:
+
+        d_x_mm = tip_xyz_x_mm[2]
     """
     T_xc = as_transform(T_xc, "T_xc")
     T_tc = as_transform(T_tc, "T_tc")

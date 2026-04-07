@@ -9,7 +9,6 @@ from PySide6.QtWidgets import QPushButton, QMessageBox, QSizePolicy
 from overlay.gui.state import SessionState
 from overlay.gui.pages.templates.templ_static_image import StaticImagePage
 from overlay.calib.calib_camera_to_xray import calibrate_camera_to_xray
-from overlay.tracking.transforms import invert_transform
 from overlay.gui.widgets.widget_zoom_view import ZoomView
 
 
@@ -46,6 +45,8 @@ class CameraToXrayCalibrationPage(StaticImagePage):
         self._reproj_p95_in_px: float | None = None
         self._n_points: int | None = None
         self._n_inliers: int | None = None
+        self._R_cx: np.ndarray | None = None             # (3,3)
+        self._t_cx: np.ndarray | None = None             # (3,)
 
         # ======================================================
         # LEFT: replace template image_label with zoomable view
@@ -95,6 +96,58 @@ class CameraToXrayCalibrationPage(StaticImagePage):
     def on_enter(self) -> None:
         self.refresh()
 
+    # ---------------- Stats helpers ----------------
+
+    def _default_stats_rows(self) -> list[tuple[str, str]]:
+        """
+        Stats layout shown before any solve has been run.
+        All rows that are method-agnostic are present; values are "-".
+        """
+        return [
+            ("Median",                  "-"),
+            ("P95",                     "-"),
+            ("Avg. reprojection error", "-"),
+            ("", ""),
+            ("R_cx",                    "-"),
+            ("", ""),
+            ("t_cx",                    "-"),
+        ]
+
+    def _result_stats_rows(self) -> list[tuple[str, str]]:
+        """
+        Stats layout shown after a successful solve.
+        Only method-agnostic fields are included; R_cx and t_cx always shown.
+        """
+        med  = self._reproj_median_px
+        mean = self._reproj_mean_px
+        p95  = self._reproj_p95_in_px
+
+        rows: list[tuple[str, str]] = [
+            ("Median",                  "-" if med  is None else f"{float(med):.3f} px"),
+            ("P95",                     "-" if p95  is None else f"{float(p95):.3f} px"),
+            ("Avg. reprojection error", "-" if mean is None else f"{float(mean):.3f} px"),
+        ]
+
+        rows.append(("", ""))
+        if self._R_cx is not None:
+            R = self._R_cx
+            R_lines = "\n".join(
+                " ".join(f"{v:+.4f}" for v in row)
+                for row in R
+            )
+            rows.append(("R_cx", "np.array (3×3)\n" + R_lines))
+        else:
+            rows.append(("R_cx", "-"))
+
+        rows.append(("", ""))
+        if self._t_cx is not None:
+            t = self._t_cx.reshape(3)
+            rows.append(("t_cx", f"[{t[0]:+.3f}, {t[1]:+.3f}, {t[2]:+.3f}]^T"))
+        else:
+            rows.append(("t_cx", "-"))
+
+        return rows
+
     # ---------------- Refresh ----------------
 
     def refresh(self) -> None:
@@ -111,13 +164,7 @@ class CameraToXrayCalibrationPage(StaticImagePage):
             self.zoom_view.reset_zoom()
             self.zoom_view.setEnabled(False)
 
-            self.set_stats_rows([
-                ("Inliers", "-"),
-                ("RANSAC threshold", "-"),
-                ("Median", "-"),
-                ("P95", "-"),
-                ("Avg. reprojection error", "-"),
-            ])
+            self.set_stats_rows(self._default_stats_rows())
 
             self.btn_run.setEnabled(False)
             self._update_zoom_button()
@@ -129,18 +176,12 @@ class CameraToXrayCalibrationPage(StaticImagePage):
         self.set_viewport_background(active=True)
         self.zoom_view.set_image(img)
 
-        # Use marker radius if available; derive a reasonable pick radius locally
         marker_r = self.state.marker_radius_px
-        pick_r = None
-        if marker_r is not None:
-            pick_r = 0.6 * float(marker_r)
-        else:
-            pick_r = 20.0
+        pick_r = 0.6 * float(marker_r) if marker_r is not None else 20.0
 
-        uv_roi = self.state.xray_points_uv
-        uv_meas = self.state.xray_points_uv  # measured = marker selection
+        uv_roi  = self.state.xray_points_uv
+        uv_meas = self.state.xray_points_uv
 
-        # If we previously ran PnP in THIS session, use cached overlay
         pnp_done = bool(self._pnp_done and self._uv_projected is not None)
 
         # Outlier mask from cached inliers
@@ -159,8 +200,8 @@ class CameraToXrayCalibrationPage(StaticImagePage):
                 uv_roi=uv_roi,
                 uv_measured=uv_meas,
                 uv_projected=self._uv_projected,
-                pick_radius_px=pick_r,                         # cross sizing
-                marker_radius_px=1.2 * marker_r if marker_r is not None else None,  # circle sizing
+                pick_radius_px=pick_r,
+                marker_radius_px=1.2 * marker_r if marker_r is not None else None,
                 show_residuals=True,
                 outlier_mask=outlier_mask,
             )
@@ -178,34 +219,12 @@ class CameraToXrayCalibrationPage(StaticImagePage):
             self.zoom_view.reset_zoom()
             self.zoom_view.setEnabled(False)
 
-        # Run button enable (prerequisites)
         miss = self._missing()
         self.btn_run.setEnabled(len(miss) == 0)
 
-        # --------------------------------------------------
-        # Stats (use local cache only)
-        # --------------------------------------------------
-        if pnp_done and self._n_points is not None and self._n_inliers is not None:
-            thr = self.state.pnp_ransac_threshold_px
-            med = self._reproj_median_px
-            mean = self._reproj_mean_px
-            p95 = self._reproj_p95_in_px
-
-            self.set_stats_rows([
-                ("Inliers", f"{int(self._n_inliers)} / {int(self._n_points)}"),
-                ("RANSAC threshold", "-" if thr is None else f"{float(thr):.1f} px"),
-                ("Median", "-" if med is None else f"{float(med):.3f} px"),
-                ("P95", "-" if p95 is None else f"{float(p95):.3f} px"),
-                ("Avg. reprojection error", "-" if mean is None else f"{float(mean):.3f} px"),
-            ])
-        else:
-            self.set_stats_rows([
-                ("Inliers", "-"),
-                ("RANSAC threshold", "-" if self.state.pnp_ransac_threshold_px is None else f"{float(self.state.pnp_ransac_threshold_px):.1f} px"),
-                ("Median", "-"),
-                ("P95", "-"),
-                ("Avg. reprojection error", "-"),
-            ])
+        self.set_stats_rows(
+            self._result_stats_rows() if pnp_done else self._default_stats_rows()
+        )
 
         self._update_zoom_button()
 
@@ -228,9 +247,9 @@ class CameraToXrayCalibrationPage(StaticImagePage):
             return
 
         try:
-            Kx = np.asarray(self.state.K_xray, dtype=np.float64)
+            Kx      = np.asarray(self.state.K_xray, dtype=np.float64)
             uv_meas = np.asarray(self.state.xray_points_uv, dtype=np.float64).reshape(-1, 2)
-            xyz_c = np.asarray(self.state.xray_points_xyz_c, dtype=np.float64).reshape(-1, 3)
+            xyz_c   = np.asarray(self.state.xray_points_xyz_c, dtype=np.float64).reshape(-1, 3)
 
             if xyz_c.shape[0] != uv_meas.shape[0]:
                 QMessageBox.warning(
@@ -246,46 +265,34 @@ class CameraToXrayCalibrationPage(StaticImagePage):
             self.state.pnp_ransac_threshold_px = float(ransac_thr)
 
             pnp = calibrate_camera_to_xray(
-                points_xyz_camera=xyz_c,
-                points_uv_xray=uv_meas,
-                xray_intrinsics=Kx,
-                dist_coeffs=None,
-                use_ransac=True,
-                ransac_reproj_error_px=ransac_thr,
-                ransac_confidence=0.99,
-                ransac_iterations=5000,
-            )
-
-            # --------- persist ONLY allowed SessionState fields ----------
-            T_cx = np.asarray(pnp.T_4x4, dtype=np.float64)  # camera -> xray
-            T_xc = invert_transform(T_cx)                   # xray -> camera
-              
-            self.state.T_cx = T_cx
-            self.state.T_xc = T_xc
-            
-            # debug
-            out_path = r"C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Data\T_cx_debug_new.npz"
-            np.savez(
-                out_path,
-                T_cx=T_cx,
-                T_xc=T_xc,
                 K_xray=Kx,
                 points_xyz_camera=xyz_c,
                 points_uv_xray=uv_meas,
+                dist_coeffs=None,
+                pose_method="iterative_ransac",
+                ransac_reprojection_error_px=ransac_thr,
+                ransac_confidence=0.99,
+                ransac_iterations_count=5000,
             )
-            
+
+            # --------- persist ONLY allowed SessionState fields ----------
+            self.state.T_cx = pnp.T_cx
+            self.state.T_xc = pnp.T_xc
+
             # --------- local diagnostics (page-only) ----------
             self._pnp_done = True
             self._n_points = int(uv_meas.shape[0])
+            self._R_cx     = np.asarray(pnp.rotation, dtype=np.float64)
+            self._t_cx     = np.asarray(pnp.translation, dtype=np.float64).reshape(3)
 
             self._inlier_idx = np.asarray(pnp.inlier_idx, dtype=np.int64).reshape(-1)
-            self._n_inliers = int(self._inlier_idx.size)
+            self._n_inliers  = int(self._inlier_idx.size)
 
             self._reproj_errors_px = np.asarray(pnp.reproj_errors_px, dtype=np.float64).reshape(-1)
-            self._reproj_mean_px = float(pnp.reproj_mean_px)
+            self._reproj_mean_px   = float(pnp.reproj_mean_px)
             self._reproj_median_px = float(pnp.reproj_median_px)
 
-            # P95 on inliers (as you did before)
+            # P95 on inliers
             self._reproj_p95_in_px = None
             if self._reproj_errors_px.size > 0 and self._inlier_idx.size > 0:
                 idx = self._inlier_idx.copy()
@@ -295,12 +302,9 @@ class CameraToXrayCalibrationPage(StaticImagePage):
                     if e_in.size > 0:
                         self._reproj_p95_in_px = float(np.percentile(e_in, 95))
 
-            # projected points for overlay (page-only)
             self._uv_projected = np.asarray(pnp.uv_proj, dtype=np.float64).reshape(-1, 2)
 
-            # start unzoomed after successful run
             self.zoom_view.reset_zoom()
-
             self.refresh()
             self.on_complete_changed()
 

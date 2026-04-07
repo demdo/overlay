@@ -226,7 +226,6 @@ def estimate_pitch_nn(c_xy: np.ndarray) -> float:
     float
         Estimated pitch in pixels. Returns NaN if not enough valid distances.
     """
-    import numpy as np
 
     xy = np.asarray(c_xy, dtype=np.float64)
     if xy.ndim != 2 or xy.shape[1] < 2:

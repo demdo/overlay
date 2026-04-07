@@ -1,10 +1,14 @@
-# overlay/pose/pose_solvers.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 import cv2
 import numpy as np
+
+from overlay.tools.homography import (
+    estimate_homography_dlt,
+    decompose_homography_to_pose,
+    project_homography,
+)
 
 
 # ============================================================
@@ -150,8 +154,21 @@ def _refine_pose_iterative(
 
 
 # ============================================================
-# Result type
+# Result types
 # ============================================================
+
+@dataclass(frozen=True)
+class IppeCandidateResult:
+    candidate_index: int
+    rvec: np.ndarray
+    tvec: np.ndarray
+    R: np.ndarray
+    uv_proj: np.ndarray
+    reproj_errors_px: np.ndarray
+    reproj_mean_px: float
+    reproj_median_px: float
+    reproj_max_px: float
+
 
 @dataclass(frozen=True)
 class PoseSolveResult:
@@ -173,6 +190,165 @@ class PoseSolveResult:
     reproj_median_px: float
     reproj_max_px: float
 
+    all_candidates: list[IppeCandidateResult] | None = None
+
+
+# ============================================================
+# IPPE candidate selection
+# ============================================================
+
+@dataclass(frozen=True)
+class _IppeCandidate:
+    """
+    Intermediate representation of a single IPPE solution before selection.
+
+    Attributes
+    ----------
+    rvec : (3,1) float64
+    tvec : (3,1) float64
+    R : (3,3) float64 – rotation matrix derived from rvec
+    reproj_mean_px : float – mean reprojection error over all correspondences
+    """
+
+    rvec: np.ndarray
+    tvec: np.ndarray
+    R: np.ndarray
+    reproj_mean_px: float
+
+
+def _build_ippe_candidates(
+    object_points_xyz: np.ndarray,
+    image_points_uv: np.ndarray,
+    K: np.ndarray,
+    dist: np.ndarray,
+) -> list[_IppeCandidate]:
+    """
+    Run cv2.solvePnPGeneric with SOLVEPNP_IPPE and collect all returned
+    solutions as ``_IppeCandidate`` objects.
+
+    Raises
+    ------
+    RuntimeError
+        If OpenCV reports failure or returns no candidates.
+    """
+    success, rvecs, tvecs, _ = cv2.solvePnPGeneric(
+        objectPoints=object_points_xyz,
+        imagePoints=image_points_uv,
+        cameraMatrix=K,
+        distCoeffs=dist,
+        flags=cv2.SOLVEPNP_IPPE,
+    )
+
+    if not success or rvecs is None or tvecs is None or len(rvecs) == 0:
+        raise RuntimeError("SOLVEPNP_IPPE failed.")
+
+    if len(rvecs) != len(tvecs):
+        raise RuntimeError("IPPE returned inconsistent candidate counts.")
+
+    candidates: list[_IppeCandidate] = []
+
+    for rv_raw, tv_raw in zip(rvecs, tvecs):
+        rv = np.asarray(rv_raw, dtype=np.float64).reshape(3, 1)
+        tv = np.asarray(tv_raw, dtype=np.float64).reshape(3, 1)
+        R, _ = cv2.Rodrigues(rv)
+
+        _, mean_px, _, _, _ = compute_reprojection_error_px(
+            object_points_xyz=object_points_xyz,
+            image_points_uv=image_points_uv,
+            rvec=rv,
+            tvec=tv,
+            K=K,
+            dist=dist,
+        )
+
+        candidates.append(_IppeCandidate(rvec=rv, tvec=tv, R=R, reproj_mean_px=mean_px))
+
+    return candidates
+
+
+def _export_ippe_candidate_result(
+    candidate: _IppeCandidate,
+    object_points_xyz: np.ndarray,
+    image_points_uv: np.ndarray,
+    K: np.ndarray,
+    dist: np.ndarray,
+    candidate_index: int,
+) -> IppeCandidateResult:
+    """
+    Convert one internal _IppeCandidate to a debug-friendly result object.
+    """
+    uv_proj, mean_px, median_px, max_px, per_point_px = compute_reprojection_error_px(
+        object_points_xyz=object_points_xyz,
+        image_points_uv=image_points_uv,
+        rvec=candidate.rvec,
+        tvec=candidate.tvec,
+        K=K,
+        dist=dist,
+    )
+
+    return IppeCandidateResult(
+        candidate_index=int(candidate_index),
+        rvec=np.asarray(candidate.rvec, dtype=np.float64).reshape(3, 1),
+        tvec=np.asarray(candidate.tvec, dtype=np.float64).reshape(3, 1),
+        R=np.asarray(candidate.R, dtype=np.float64).reshape(3, 3),
+        uv_proj=uv_proj,
+        reproj_errors_px=per_point_px,
+        reproj_mean_px=float(mean_px),
+        reproj_median_px=float(median_px),
+        reproj_max_px=float(max_px),
+    )
+
+
+def _select_ippe_candidate(candidates: list[_IppeCandidate]) -> int:
+    """
+    Select the physically correct IPPE solution via an early-exit decision
+    tree that encodes the empirically verified coordinate-system geometry of
+    the X-ray / camera setup.
+
+    Coordinate system (empirically verified)
+    -----------------------------------------
+    X-Ray frame  :  x_x → table down,  y_x → table left,  z_x → intensifier up
+    Camera frame :  y_c → right,        z_c → table down
+
+    Criteria (evaluated in order, first discriminating criterion wins)
+    -------------------------------------------------------------------
+    1. tz > 0      X-Ray origin is in front of the camera.
+    2. R[2,2] < 0  The z-axes of the X-Ray and camera frames point in
+                   opposite directions.
+    3. ty < 0      The camera sits to the right of the intensifier.
+
+    Fallback
+    --------
+    If all three criteria are tied, the candidate with the smaller mean
+    reprojection error is chosen.
+    """
+    if len(candidates) != 2:
+        raise ValueError(
+            f"Expected exactly 2 IPPE candidates, got {len(candidates)}."
+        )
+
+    s0, s1 = candidates[0], candidates[1]
+
+    # Criterion 1: tz > 0
+    c1 = [s.tvec[2, 0] > 0 for s in candidates]
+    if c1[0] != c1[1]:
+        return 0 if c1[0] else 1
+    if not c1[0]:
+        return 0 if s0.reproj_mean_px <= s1.reproj_mean_px else 1
+
+    # Criterion 2: R[2,2] < 0
+    c2 = [s.R[2, 2] < 0 for s in candidates]
+    if c2[0] != c2[1]:
+        return 0 if c2[0] else 1
+
+    # Criterion 3: ty < 0
+    c3 = [s.tvec[1, 0] < 0 for s in candidates]
+    if c3[0] != c3[1]:
+        return 0 if c3[0] else 1
+
+    # Fallback: smaller reprojection error
+    return 0 if s0.reproj_mean_px <= s1.reproj_mean_px else 1
+
 
 # ============================================================
 # Core solvers
@@ -191,9 +367,6 @@ def _solve_pose_iterative(
 ) -> PoseSolveResult:
     """
     Internal helper for classical solvePnP with SOLVEPNP_ITERATIVE.
-
-    This function is single-frame only.
-    No temporal prior or Kalman filtering is used here.
     """
     object_points_xyz = np.asarray(object_points_xyz, dtype=np.float64).reshape(-1, 3)
     image_points_uv = np.asarray(image_points_uv, dtype=np.float64).reshape(-1, 2)
@@ -280,6 +453,7 @@ def _solve_pose_iterative(
         reproj_mean_px=mean_px,
         reproj_median_px=median_px,
         reproj_max_px=max_px,
+        all_candidates=None,
     )
 
 
@@ -296,15 +470,6 @@ def _solve_pose_iterative_ransac(
 ) -> PoseSolveResult:
     """
     Internal helper for solvePnPRansac with SOLVEPNP_ITERATIVE.
-
-    This function is single-frame only.
-    No temporal prior or Kalman filtering is used here.
-
-    Notes
-    -----
-    RANSAC is used for robust initial pose estimation in the presence of
-    outlier correspondences. The resulting pose may optionally be refined
-    afterwards with SOLVEPNP_ITERATIVE on the full correspondence set.
     """
     object_points_xyz = np.asarray(object_points_xyz, dtype=np.float64).reshape(-1, 3)
     image_points_uv = np.asarray(image_points_uv, dtype=np.float64).reshape(-1, 2)
@@ -373,6 +538,7 @@ def _solve_pose_iterative_ransac(
         reproj_mean_px=mean_px,
         reproj_median_px=median_px,
         reproj_max_px=max_px,
+        all_candidates=None,
     )
 
 
@@ -385,20 +551,8 @@ def _solve_pose_ippe(
     refine_with_iterative: bool = True,
 ) -> PoseSolveResult:
     """
-    Internal helper for IPPE-based pose estimation with reprojection-based
+    Internal helper for IPPE-based pose estimation with geometry-aware
     candidate selection and optional iterative refinement.
-
-    Procedure
-    ---------
-    1. Compute IPPE pose candidates with cv2.solvePnPGeneric(..., SOLVEPNP_IPPE)
-    2. Evaluate all returned candidates by reprojection error
-    3. Select the best candidate
-    4. Optionally refine the selected candidate with SOLVEPNP_ITERATIVE
-
-    Notes
-    -----
-    This function is single-frame only.
-    No temporal prior or Kalman filtering is used here.
     """
     object_points_xyz = np.asarray(object_points_xyz, dtype=np.float64).reshape(-1, 3)
     image_points_uv = np.asarray(image_points_uv, dtype=np.float64).reshape(-1, 2)
@@ -408,49 +562,30 @@ def _solve_pose_ippe(
     if object_points_xyz.shape[0] < 4:
         raise ValueError("At least 4 correspondences are required.")
 
-    success, rvecs, tvecs, _ = cv2.solvePnPGeneric(
-        objectPoints=object_points_xyz,
-        imagePoints=image_points_uv,
-        cameraMatrix=K,
-        distCoeffs=dist,
-        flags=cv2.SOLVEPNP_IPPE,
+    candidates = _build_ippe_candidates(
+        object_points_xyz=object_points_xyz,
+        image_points_uv=image_points_uv,
+        K=K,
+        dist=dist,
     )
 
-    if not success or rvecs is None or tvecs is None or len(rvecs) == 0:
-        raise RuntimeError("SOLVEPNP_IPPE failed.")
-
-    if len(rvecs) != len(tvecs):
-        raise RuntimeError("IPPE returned inconsistent candidate counts.")
-
-    best_idx: int | None = None
-    best_mean_px: float | None = None
-    best_rvec: np.ndarray | None = None
-    best_tvec: np.ndarray | None = None
-
-    for i, (rv, tv) in enumerate(zip(rvecs, tvecs)):
-        rv = np.asarray(rv, dtype=np.float64).reshape(3, 1)
-        tv = np.asarray(tv, dtype=np.float64).reshape(3, 1)
-
-        _, mean_px, _, _, _ = compute_reprojection_error_px(
+    all_candidates = [
+        _export_ippe_candidate_result(
+            candidate=c,
             object_points_xyz=object_points_xyz,
             image_points_uv=image_points_uv,
-            rvec=rv,
-            tvec=tv,
             K=K,
             dist=dist,
+            candidate_index=i,
         )
+        for i, c in enumerate(candidates)
+    ]
 
-        if best_mean_px is None or mean_px < best_mean_px:
-            best_mean_px = mean_px
-            best_idx = i
-            best_rvec = rv
-            best_tvec = tv
+    best_idx = _select_ippe_candidate(candidates)
+    best = candidates[best_idx]
 
-    if best_rvec is None or best_tvec is None or best_idx is None:
-        raise RuntimeError("IPPE candidate selection failed.")
-
-    rvec = best_rvec
-    tvec = best_tvec
+    rvec = best.rvec
+    tvec = best.tvec
 
     if refine_with_iterative:
         rvec, tvec = _refine_pose_iterative(
@@ -494,6 +629,81 @@ def _solve_pose_ippe(
         reproj_mean_px=mean_px,
         reproj_median_px=median_px,
         reproj_max_px=max_px,
+        all_candidates=all_candidates,
+    )
+
+
+def _solve_pose_homography(
+    object_points_xyz: np.ndarray,
+    image_points_uv: np.ndarray,
+    K: np.ndarray,
+    dist_coeffs: np.ndarray | None = None,
+    *,
+    refine_with_iterative: bool = False,
+) -> PoseSolveResult:
+    """
+    Internal helper for planar pose estimation via DLT homography decomposition.
+    """
+    object_points_xyz = np.asarray(object_points_xyz, dtype=np.float64).reshape(-1, 3)
+    image_points_uv = np.asarray(image_points_uv, dtype=np.float64).reshape(-1, 2)
+    K = np.asarray(K, dtype=np.float64).reshape(3, 3)
+    dist = normalize_dist_coeffs(dist_coeffs)
+
+    if object_points_xyz.shape[0] < 4:
+        raise ValueError("At least 4 correspondences are required.")
+
+    board_xy = object_points_xyz[:, :2]
+
+    H = estimate_homography_dlt(image_points_uv, board_xy)
+    R, t, _ = decompose_homography_to_pose(H, K)
+
+    rvec, _ = cv2.Rodrigues(R)
+    rvec = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
+    tvec = np.asarray(t, dtype=np.float64).reshape(3, 1)
+
+    if refine_with_iterative:
+        rvec, tvec = _refine_pose_iterative(
+            object_points_xyz=object_points_xyz,
+            image_points_uv=image_points_uv,
+            K=K,
+            dist=dist,
+            rvec_init=rvec,
+            tvec_init=tvec,
+        )
+
+    uv_proj, _, _, _, per_point_px = compute_reprojection_error_px(
+        object_points_xyz=object_points_xyz,
+        image_points_uv=image_points_uv,
+        rvec=rvec,
+        tvec=tvec,
+        K=K,
+        dist=dist,
+    )
+
+    inliers = None
+    inlier_idx = _compute_inlier_idx(inliers, num_points=len(image_points_uv))
+    mean_px, median_px, max_px = _compute_reprojection_stats_from_subset(
+        per_point_px,
+        inlier_idx,
+    )
+
+    return PoseSolveResult(
+        rvec=rvec,
+        tvec=tvec,
+        method="homography",
+        raw_pnp_flag=-1,
+        used_extrinsic_guess=False,
+        candidate_index=None,
+        refined_with_iterative=bool(refine_with_iterative),
+        refinement_pnp_flag=int(cv2.SOLVEPNP_ITERATIVE) if refine_with_iterative else None,
+        inliers=inliers,
+        inlier_idx=inlier_idx,
+        uv_proj=uv_proj,
+        reproj_errors_px=per_point_px,
+        reproj_mean_px=mean_px,
+        reproj_median_px=median_px,
+        reproj_max_px=max_px,
+        all_candidates=None,
     )
 
 
@@ -514,18 +724,6 @@ def solve_pose(
 ) -> PoseSolveResult:
     """
     Dispatch pose estimation by method name.
-
-    Supported methods
-    -----------------
-    - "iterative": classical PnP
-    - "iterative_ransac": classical PnP with RANSAC initialization
-    - "ippe": planar PnP with IPPE candidate selection
-
-    Notes
-    -----
-    - All methods operate on a single frame.
-    - Temporal filtering (e.g. Kalman) must be applied externally.
-    - All methods may optionally be followed by iterative refinement.
     """
     method = str(pose_method).lower().strip()
 
@@ -562,7 +760,16 @@ def solve_pose(
             refine_with_iterative=refine_with_iterative,
         )
 
+    if method == "homography":
+        return _solve_pose_homography(
+            object_points_xyz=object_points_xyz,
+            image_points_uv=image_points_uv,
+            K=K,
+            dist_coeffs=dist_coeffs,
+            refine_with_iterative=refine_with_iterative,
+        )
+
     raise ValueError(
         f"Unknown pose_method '{pose_method}'. "
-        f"Expected 'iterative', 'iterative_ransac', or 'ippe'."
+        f"Expected 'iterative', 'iterative_ransac', 'ippe', or 'homography'."
     )

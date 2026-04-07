@@ -255,3 +255,135 @@ class AdaptiveKalmanFilterCV3D:
             ).reshape(3, 3).copy()
 
         return pos_filt
+    
+    
+class PlaneKalmanFilter:
+    """
+    Kalman filter for a static plane defined by (a, b, c, d) with ax+by+cz+d=0.
+
+    The plane is assumed static (constant model), so the process noise Q is
+    very small. The filter mainly smooths repeated RANSAC estimates of the
+    same physical plane.
+
+    The normal (a, b, c) is re-normalised after each update to stay on S².
+    Sign consistency is enforced so the normal always points toward the camera
+    (negative z-component convention, matching the RealSense coordinate frame).
+
+    Measurements whose normal deviates more than outlier_angle_deg from the
+    current state are rejected entirely — the state is returned unchanged.
+    This handles rare RANSAC failures that land in a false minimum far from
+    the true plane orientation.
+    """
+
+    def __init__(
+        self,
+        *,
+        process_noise: float = 1e-7,
+        measurement_noise: float = 1e-4,
+        outlier_angle_deg: float = 1.5,
+    ) -> None:
+        self.process_noise = float(process_noise)
+        self.measurement_noise = float(measurement_noise)
+        self.outlier_angle_deg = float(outlier_angle_deg)
+
+        self._state: np.ndarray | None = None   # (4,)
+        self._P = np.eye(4, dtype=np.float64)   # covariance
+
+        self._Q = np.eye(4, dtype=np.float64) * self.process_noise
+        self._R = np.eye(4, dtype=np.float64) * self.measurement_noise
+
+    # ------------------------------------------------------------------ #
+    #  Public API                                                          #
+    # ------------------------------------------------------------------ #
+
+    def reset(self) -> None:
+        self._state = None
+        self._P = np.eye(4, dtype=np.float64)
+
+    @property
+    def is_initialized(self) -> bool:
+        return self._state is not None
+
+    @property
+    def state(self) -> np.ndarray | None:
+        """Return a copy of the current filtered plane (a, b, c, d) or None."""
+        return self._state.copy() if self._state is not None else None
+
+    def update(self, plane: np.ndarray) -> np.ndarray:
+        """
+        Ingest a new RANSAC plane estimate and return the filtered plane.
+
+        Parameters
+        ----------
+        plane : (4,) array  [a, b, c, d]  (need not be normalised)
+
+        Returns
+        -------
+        filtered_plane : (4,) array, normalised so that ||(a,b,c)|| = 1
+        """
+        plane = self._normalise(np.asarray(plane, dtype=np.float64))
+        plane = self._enforce_sign(plane)
+
+        if self._state is None:
+            self._state = plane.copy()
+            self._P = np.eye(4, dtype=np.float64)  # reset covariance on first use
+            return self._state.copy()
+
+        # --- Ausreißer-Reject ---
+        # Messungen die mehr als outlier_angle_deg vom aktuellen State abweichen
+        # werden komplett verworfen — typischerweise RANSAC false minima.
+        # Der State bleibt unverändert; P wächst weiter durch Q (predict-only).
+        angle = float(np.degrees(np.arccos(
+            np.clip(np.dot(plane[:3], self._state[:3]), -1.0, 1.0)
+        )))
+        if angle > self.outlier_angle_deg:
+            print(f"[PlaneKF] Outlier rejected: {angle:.3f}° > {self.outlier_angle_deg}°")
+            self._P = self._P + self._Q  # covariance wächst weiter
+            return self._state.copy()
+
+        # --- predict (static model: state unchanged, P grows by Q) -------
+        P_pred = self._P + self._Q
+
+        # --- update -------------------------------------------------------
+        y = plane - self._state                        # innovation
+        S = P_pred + self._R                           # innovation covariance
+        K = P_pred @ np.linalg.inv(S)                 # Kalman gain
+
+        self._state = self._state + K @ y
+        self._P = (np.eye(4, dtype=np.float64) - K) @ P_pred
+
+        # Re-normalise: Kalman update moves the normal off S²
+        self._state = self._normalise(self._state)
+
+        return self._state.copy()
+
+    # ------------------------------------------------------------------ #
+    #  Private helpers                                                     #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _normalise(plane: np.ndarray) -> np.ndarray:
+        """Normalise so ||(a, b, c)|| = 1; d is scaled accordingly."""
+        n_norm = float(np.linalg.norm(plane[:3]))
+        if n_norm < 1e-9:
+            raise ValueError("Plane normal is near-zero — invalid plane.")
+        return plane / n_norm
+
+    def _enforce_sign(self, plane: np.ndarray) -> np.ndarray:
+        """
+        Ensure the normal is sign-consistent with the previous state.
+
+        If no previous state exists, fall back to the RealSense convention:
+        the board is in front of the camera, so the normal should point
+        *toward* the camera, i.e. n_z < 0 in camera frame.
+        """
+        if self._state is not None:
+            if np.dot(plane[:3], self._state[:3]) < 0.0:
+                return -plane
+        else:
+            if plane[2] > 0.0:   # n_z > 0  →  normal points away from camera
+                return -plane
+        return plane
+    
+    
+    

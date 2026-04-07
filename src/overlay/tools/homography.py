@@ -9,6 +9,52 @@ import cv2
 Cell = Tuple[int, int]
 
 
+def build_board_xyz_canonical(
+    *,
+    nu: int,
+    nv: int,
+    pitch_mm: float = 2.54,
+) -> np.ndarray:
+    """
+    Build canonical board coordinates (3D, z=0) in mm.
+
+    Canonical board frame (DEFINED ONCE FOR ENTIRE PROJECT)
+    ------------------------------------------------------
+    - origin  : bottom-left board corner (point 1)
+    - +x_b    : upward on the board
+    - +y_b    : to the right on the board
+    - +z_b    : into plane (right-handed)
+
+    Grid layout
+    -----------
+    - ncols = nu + 1
+    - nrows = nv + 1
+    - row-major ordering:
+        first row front->back, then next row
+
+    Returns
+    -------
+    XYZ : (N,3) float64
+        Board coordinates in mm
+    """
+
+    ncols = int(nu) + 1
+    nrows = int(nv) + 1
+
+    jj, ii = np.meshgrid(
+        np.arange(ncols, dtype=np.float64),
+        np.arange(nrows, dtype=np.float64),
+        indexing="xy",
+    )
+
+    X = jj * float(pitch_mm)   # +x_b → right
+    Y = ii * float(pitch_mm)   # +y_b → down
+    Z = np.zeros_like(X)
+
+    XYZ = np.stack([X, Y, Z], axis=-1).reshape(-1, 3).astype(np.float64)
+    return XYZ
+
+
 # ============================================================
 # Internal helper
 # ============================================================
@@ -341,5 +387,86 @@ def homography_reproj_stats(
     rmse_e = float(np.sqrt(np.mean(e * e)))
     return mean_e, med_e, rmse_e
 
+
+
+def decompose_homography_to_pose(
+    H: np.ndarray,
+    K: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Decompose a planar homography into pose (R, t).
+
+    Assumes that H maps planar board coordinates (X, Y, 0)
+    to image coordinates:
+
+        [u, v, 1]^T ~ H [X, Y, 1]^T
+
+    and that the camera model is:
+
+        H = K [r1 r2 t]
+
+    where:
+        R = [r1 r2 r3] is a rotation matrix
+        t is translation
+
+    Parameters
+    ----------
+    H : (3,3)
+        Homography mapping board -> image.
+    K : (3,3)
+        Intrinsic matrix.
+
+    Returns
+    -------
+    R : (3,3)
+        Rotation matrix (board -> camera).
+    t : (3,)
+        Translation vector.
+    T : (4,4)
+        Homogeneous transform.
+    """
+
+    H = np.asarray(H, dtype=np.float64)
+    K = np.asarray(K, dtype=np.float64)
+
+    if H.shape != (3, 3):
+        raise ValueError(f"H must be (3,3), got {H.shape}")
+    if K.shape != (3, 3):
+        raise ValueError(f"K must be (3,3), got {K.shape}")
+
+    # remove intrinsics
+    K_inv = np.linalg.inv(K)
+    B = K_inv @ H
+
+    b1 = B[:, 0]
+    b2 = B[:, 1]
+    b3 = B[:, 2]
+
+    # scale (robust)
+    scale = 2.0 / (np.linalg.norm(b1) + np.linalg.norm(b2))
+
+    r1 = scale * b1
+    r2 = scale * b2
+    r3 = np.cross(r1, r2)
+
+    t = scale * b3
+
+    # enforce orthonormal rotation via SVD
+    R_approx = np.column_stack((r1, r2, r3))
+    U, _, Vt = np.linalg.svd(R_approx)
+    R = U @ Vt
+
+    # fix improper rotation
+    if np.linalg.det(R) < 0:
+        U[:, -1] *= -1.0
+        R = U @ Vt
+        t *= -1.0
+
+    # build transform
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = t
+
+    return R, t, T
 
 
