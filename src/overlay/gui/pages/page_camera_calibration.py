@@ -5,6 +5,7 @@ from typing import Optional
 
 import numpy as np
 import cv2
+import datetime
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QPushButton, QMessageBox, QWidget, QSizePolicy
@@ -13,6 +14,10 @@ from overlay.gui.widgets.widget_flow_layout import FlowLayout
 from overlay.gui.state import SessionState
 from overlay.gui.pages.templates.templ_live_image import LiveImagePage
 from overlay.calib import calib_camera as camcal
+
+
+# --- DEBUG / EXPORT ---
+SAVE_CAMERA_CALIBRATION_TEST = False
 
 
 def _draw_text_box(
@@ -103,6 +108,8 @@ class CameraCalibrationPage(LiveImagePage):
         # adopt intrinsics from state if already present (so button gating works)
         if getattr(self.state, "K_rgb", None) is not None:
             self._K = np.asarray(self.state.K_rgb, dtype=np.float64)
+        if getattr(self.state, "dist_rgb", None) is not None:
+            self._dist = np.asarray(self.state.dist_rgb, dtype=np.float64)
 
         self._update_buttons()
         self._update_panels()
@@ -115,15 +122,13 @@ class CameraCalibrationPage(LiveImagePage):
         self.btn_stop = QPushButton("Stop")
         self.btn_redo = QPushButton("Redo")
         self.btn_test = QPushButton("Accuracy test")
-        self.btn_rotate = QPushButton("Rotate 180°")
 
         self.btn_start.clicked.connect(self.start_clicked)
         self.btn_stop.clicked.connect(self.stop_clicked)
         self.btn_redo.clicked.connect(self.redo_clicked)
         self.btn_test.clicked.connect(self.test_clicked)
-        self.btn_rotate.clicked.connect(self.rotate_clicked)
 
-        for b in (self.btn_start, self.btn_stop, self.btn_redo, self.btn_test, self.btn_rotate):
+        for b in (self.btn_start, self.btn_stop, self.btn_redo, self.btn_test):
             b.setFocusPolicy(Qt.NoFocus)
             b.setMinimumHeight(44)
             b.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
@@ -140,7 +145,6 @@ class CameraCalibrationPage(LiveImagePage):
         flow.addWidget(self.btn_stop)
         flow.addWidget(self.btn_redo)
         flow.addWidget(self.btn_test)
-        flow.addWidget(self.btn_rotate)
 
         self.controls_content.addWidget(wrap)
 
@@ -253,9 +257,15 @@ class CameraCalibrationPage(LiveImagePage):
                 detector_params=self.detector_params,
                 min_charuco_corners=self.MIN_CHARUCO_LIVE_FOUND,
             )
+            
             if (not ok) or det2.charuco_corners is None or det2.charuco_ids is None:
                 vis = _draw_text_box(vis, ["Accuracy test failed: pose not found"], color=(0, 0, 255))
                 return vis
+            
+            # --- SAVE ONCE ---
+            if ok and det2.charuco_corners is not None and det2.charuco_ids is not None:
+                if SAVE_CAMERA_CALIBRATION_TEST:
+                    self._save_test_result(det2, rvec, tvec)
 
             if det2.aruco_ids is not None and len(det2.aruco_ids) > 0:
                 cv2.aruco.drawDetectedMarkers(vis, det2.aruco_corners, det2.aruco_ids)
@@ -355,6 +365,7 @@ class CameraCalibrationPage(LiveImagePage):
 
         # clear session outputs
         self.state.K_rgb = None
+        self.state.dist_rgb = None
 
         self._det = None
         self._found = False
@@ -369,16 +380,11 @@ class CameraCalibrationPage(LiveImagePage):
         self._update_panels()
         self.setFocus()
         self.update_view()
-        
-    def rotate_clicked(self) -> None:
-        self.state.rotate_rgb = not self.state.rotate_rgb
-    
-        self._det = None
-        self._found = False
-    
-        self.update_view()
 
     def test_clicked(self) -> None:
+        global SAVE_CAMERA_CALIBRATION_TEST
+        SAVE_CAMERA_CALIBRATION_TEST = True
+        
         if self._K is None or self._dist is None:
             QMessageBox.information(self, "Accuracy test", "No intrinsics yet. Capture 10 images first.")
             return
@@ -471,10 +477,54 @@ class CameraCalibrationPage(LiveImagePage):
         self._rms = float(rms)
 
         self.state.K_rgb = self._K.copy()
+        self.state.dist_rgb = self._dist.copy()
 
         self._avg_reproj_px = None
         self._last_stats_rows = None
         return True
+    
+    def _save_test_result(self, det2, rvec, tvec):
+        global SAVE_CAMERA_CALIBRATION_TEST
+    
+        if not SAVE_CAMERA_CALIBRATION_TEST:
+            return
+    
+        try:
+            K = self._K
+            dist = self._dist
+    
+            uv_meas = det2.charuco_corners.reshape(-1, 2)
+            obj_pts = camcal._charuco_object_points(self.board, det2.charuco_ids)
+    
+            uv_proj, _ = cv2.projectPoints(obj_pts, rvec, tvec, K, dist)
+            uv_proj = uv_proj.reshape(-1, 2)
+    
+            residuals_uv = uv_proj - uv_meas
+            residual_norm = np.linalg.norm(residuals_uv, axis=1)
+    
+            mean_px = float(np.mean(residual_norm))
+            N = int(len(residual_norm))
+    
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = f"camera_calibration_test_{ts}.npz"
+    
+            np.savez(
+                out_path,
+                test_mean_reproj_px=mean_px,
+                test_num_charuco=N,
+                test_detected_uv=uv_meas,
+                test_projected_uv=uv_proj,
+                test_residuals_uv=residuals_uv,
+                test_residual_norm_px=residual_norm,
+                K_rgb=K,
+                dist_rgb=dist,
+            )
+    
+            SAVE_CAMERA_CALIBRATION_TEST = False
+            print(f"[CameraCalibration] Saved test result -> {out_path}")
+    
+        except Exception as e:
+            print(f"[CameraCalibration] Save failed: {e}")
 
     # ---------------- UI updates ----------------
 
@@ -486,12 +536,10 @@ class CameraCalibrationPage(LiveImagePage):
         have_intr = (self._K is not None and self._dist is not None)
         self.btn_test.setEnabled(self._mode == "live" and have_intr and len(self._views) >= self.N_VIEWS)
 
-     # ---------------- Lifecycle (Wizard) ----------------
+    # ---------------- Lifecycle (Wizard) ----------------
 
     def on_enter(self) -> None:
         pass
 
     def on_leave(self) -> None:
         super().on_leave()
-
-

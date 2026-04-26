@@ -53,7 +53,7 @@ HOUGH_PARAMS = HoughCircleParams(
     dp=1.2,
     minDist=8,
     param1=120,
-    param2=9,
+    param2=7,
     invert=True,
     median_ks=(3, 5),
 )
@@ -237,7 +237,7 @@ def draw_state(
                 vis,
                 (int(round(x)), int(round(y))),
                 max(2, int(round(r))),
-                (120, 120, 120),
+                (0, 255, 0),
                 1,
             )
 

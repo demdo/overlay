@@ -239,6 +239,42 @@ def _print_pose_result(
     print(f"tx = {t[0]:+.6f}")
     print(f"ty = {t[1]:+.6f}")
     print(f"tz = {t[2]:+.6f}")
+    
+    print("\n--- T_xc (xray -> camera) ---")
+    _print_matrix("T_xc", _invert_T(T_cx))
+    
+    t_xc = _invert_T(T_cx)[:3, 3]
+    print("\nt_xc [mm]:")
+    print(f"tx = {t_xc[0]:+.6f}")
+    print(f"ty = {t_xc[1]:+.6f}")
+    print(f"tz = {t_xc[2]:+.6f}")
+    
+    
+def dump_points_txt(path, board_xyz, xyz_cam):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("IDX | Xb [mm]   Yb [mm]   Zb [mm] || Xc [mm]   Yc [mm]   Zc [mm]\n")
+        f.write("-" * 90 + "\n")
+
+        for i in range(len(board_xyz)):
+            xb, yb, zb = board_xyz[i]
+            xc, yc, zc = xyz_cam[i]
+            f.write(
+                f"{i:3d} | "
+                f"{xb:9.3f} {yb:9.3f} {zb:9.3f} || "
+                f"{xc:9.3f} {yc:9.3f} {zc:9.3f}\n"
+            )
+
+        f.write("\n")
+        f.write("BOARD XYZ stats:\n")
+        f.write(f"  min = {np.min(board_xyz, axis=0)}\n")
+        f.write(f"  max = {np.max(board_xyz, axis=0)}\n")
+        f.write(f"  mean= {np.mean(board_xyz, axis=0)}\n")
+
+        f.write("\n")
+        f.write("CAMERA XYZ stats:\n")
+        f.write(f"  min = {np.min(xyz_cam, axis=0)}\n")
+        f.write(f"  max = {np.max(xyz_cam, axis=0)}\n")
+        f.write(f"  mean= {np.mean(xyz_cam, axis=0)}\n")
 
 
 # ============================================================
@@ -302,6 +338,8 @@ def main() -> None:
 
     T_bx_raw = _compose_T_bx(board_xyz, uv_raw, K_xray)
     T_cx_raw = T_bx_raw @ T_cb
+    T_xc_raw = _invert_T(T_cx_raw)
+    t_xc_raw = T_xc_raw[:3, 3]
 
     _print_pose_result(
         label="uv_raw",
@@ -320,6 +358,8 @@ def main() -> None:
 
     T_bx_final = _compose_T_bx(board_xyz, uv_final, K_xray)
     T_cx_final = T_bx_final @ T_cb
+    T_xc_final = _invert_T(T_cx_final)
+    t_xc_final = T_xc_final[:3, 3]
 
     _print_pose_result(
         label="uv_final (flipped)",
@@ -330,6 +370,8 @@ def main() -> None:
     )
 
     print("\n[INFO] Fertig.")
+    
+    dump_points_txt("debug_points_board_camera.txt", board_xyz, xyz_mm)
 
 
 if __name__ == "__main__":

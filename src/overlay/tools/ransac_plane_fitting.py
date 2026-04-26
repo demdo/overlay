@@ -5,9 +5,12 @@ RANSAC_plane_fitting.py
 Helper utilities for RANSAC plane fitting and visualization math.
 """
 
+from __future__ import annotations
+
 import numpy as np
 import open3d as o3d
 import pyrealsense2 as rs
+import cv2
 
 
 def rect_from_pts(pts_uv: np.ndarray, w: int, h: int, pad: int) -> tuple[int, int, int, int]:
@@ -74,35 +77,62 @@ def deviations(pts: np.ndarray, plane: np.ndarray) -> np.ndarray:
     return np.abs(pts @ n + plane[3]) / denom
 
 
-def intersect_corners_with_plane(
-    corners_uv: np.ndarray,
+def intersect_pixels_with_plane(
+    uv_points: np.ndarray,
     rgb_intrinsics: np.ndarray,
     plane_model: np.ndarray,
+    dist_coeffs: np.ndarray | None = None,
 ) -> np.ndarray:
     """
-    Intersect pixel rays with the calibration plane to recover 3D corner positions.
+    Intersect pixel rays with the calibration plane to recover 3D positions.
 
-    corners_uv: (3, 2) array [u, v] for top-left, top-right, bottom-left.
+    Parameters
+    ----------
+    uv_points : (N, 2)
+        Pixel coordinates [u, v].
+    rgb_intrinsics : (3, 3)
+        Camera intrinsic matrix.
+    plane_model : (4,)
+        Plane coefficients [a, b, c, d] such that:
+            a*x + b*y + c*z + d = 0
+    dist_coeffs : optional
+        OpenCV distortion coefficients. If provided, points are first
+        undistorted to normalized image coordinates via cv2.undistortPoints.
+
+    Returns
+    -------
+    xyz : (N, 3)
+        3D intersection points in the camera frame.
     """
-    corners_uv = np.asarray(corners_uv, dtype=np.float64)
-    if corners_uv.shape != (3, 2):
-        raise ValueError("corners_uv must have shape (3, 2).")
+    uv_points = np.asarray(uv_points, dtype=np.float64).reshape(-1, 2)
+    if uv_points.ndim != 2 or uv_points.shape[1] != 2:
+        raise ValueError(f"uv_points must have shape (N, 2), got {uv_points.shape}")
 
     K = np.asarray(rgb_intrinsics, dtype=np.float64)
     if K.shape != (3, 3):
         raise ValueError("rgb_intrinsics must be a 3x3 matrix.")
-    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-    a, b, c, d = [float(x) for x in plane_model]
 
-    xyz = np.zeros((3, 3), dtype=np.float64)
-    for i, (u, v) in enumerate(corners_uv):
-        x = (u - cx) / fx
-        y = (v - cy) / fy
+    plane = np.asarray(plane_model, dtype=np.float64).reshape(4)
+    a, b, c, d = [float(x) for x in plane]
+
+    if dist_coeffs is not None:
+        dist_coeffs = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
+        uv_cv = uv_points.reshape(-1, 1, 2)
+        xy_norm = cv2.undistortPoints(uv_cv, K, dist_coeffs, P=None).reshape(-1, 2)
+    else:
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        x = (uv_points[:, 0] - cx) / fx
+        y = (uv_points[:, 1] - cy) / fy
+        xy_norm = np.stack([x, y], axis=1)
+
+    xyz = np.zeros((uv_points.shape[0], 3), dtype=np.float64)
+    for i, (x, y) in enumerate(xy_norm):
         denom = a * x + b * y + c
         if abs(denom) < 1e-12:
-            raise ValueError("Corner ray is parallel to the fitted plane.")
+            raise ValueError("Pixel ray is parallel to the fitted plane.")
         z = -d / denom
         xyz[i] = np.array([x * z, y * z, z], dtype=np.float64)
+
     return xyz
 
 
@@ -138,13 +168,18 @@ def interpolate_marker_grid(
 # =========================
 # Open3D RANSAC plane fit
 # =========================
-def ransac_plane_open3d(points_xyz, distance_threshold: float, ransac_n: int, num_iterations: int):
+def ransac_plane_open3d(
+    points_xyz,
+    distance_threshold: float,
+    ransac_n: int,
+    num_iterations: int,
+):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points_xyz.astype(np.float64))
     plane_model, inliers = pcd.segment_plane(
         distance_threshold=distance_threshold,
         ransac_n=ransac_n,
-        num_iterations=num_iterations
+        num_iterations=num_iterations,
     )
     return np.asarray(plane_model, dtype=np.float64), np.asarray(inliers, dtype=np.int64)
 
@@ -238,5 +273,3 @@ def fit_plane_stable(
 
     plane_out = np.array([mean_n[0], mean_n[1], mean_n[2], mean_d], dtype=np.float64)
     return plane_out, best_inliers
-
-

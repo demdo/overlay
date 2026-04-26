@@ -9,6 +9,10 @@ import cv2
 Cell = Tuple[int, int]
 
 
+# ============================================================
+# Build correspondences
+# ============================================================
+
 def build_board_xyz_canonical(
     *,
     nu: int,
@@ -91,85 +95,25 @@ def _largest_contiguous_run(vals_sorted_unique: List[int]) -> Tuple[int, int]:
 
 
 # ============================================================
-# Build correspondences
-# ============================================================
-
-def build_planar_correspondences(
-    roi_uv: np.ndarray,
-    dbg: dict,
-    *,
-    pitch_mm: float = 2.54,
-) -> tuple[np.ndarray, np.ndarray, dict]:
-    """
-    Build (XY_mm, uv_px, meta) with GUARANTEED consistent ordering.
-
-    Assumptions
-    ----------
-    - roi_uv is already ordered in grid row-major order:
-        row 0: left->right, then row 1, ...
-    - dbg contains 'nu' and 'nv' (grid steps along u and v), so that
-        N = (nv+1)*(nu+1) matches roi_uv length.
-
-    Returns
-    -------
-    XY_mm : np.ndarray
-        (N,2) float64 grid coordinates in mm, row-major order.
-    uv_px : np.ndarray
-        (N,2) float64 image coordinates in px (copy of roi_uv).
-    meta : dict
-        Contains inferred (nrows, ncols, nu, nv).
-    """
-    uv = np.asarray(roi_uv, dtype=np.float64).reshape(-1, 2)
-    if uv.size == 0:
-        return (
-            np.empty((0, 2), dtype=np.float64),
-            np.empty((0, 2), dtype=np.float64),
-            dict(nrows=0, ncols=0, nu=None, nv=None),
-        )
-
-    nu = int(dbg.get("nu", -1))
-    nv = int(dbg.get("nv", -1))
-    if nu < 0 or nv < 0:
-        raise ValueError("dbg must contain integer 'nu' and 'nv'.")
-
-    ncols = nu + 1
-    nrows = nv + 1
-
-    expected = nrows * ncols
-    got = int(uv.shape[0])
-    if got != expected:
-        raise ValueError(
-            f"ROI size mismatch: expected (nv+1)*(nu+1)={expected} points, got {got} "
-            f"(nv={nv}, nu={nu})."
-        )
-
-    # Row-major grid to match uv row-major
-    jj, ii = np.meshgrid(
-        np.arange(ncols, dtype=np.float64),
-        np.arange(nrows, dtype=np.float64),
-        indexing="xy",
-    )
-    X = jj * float(pitch_mm)
-    Y = ii * float(pitch_mm)
-    XY = np.stack([X, Y], axis=-1).reshape(-1, 2).astype(np.float64)
-
-    meta = dict(nrows=int(nrows), ncols=int(ncols), nu=int(nu), nv=int(nv))
-    return XY, uv, meta
-
-
-# ============================================================
 # Homography estimation
 # ============================================================
 
 
-def estimate_homography_dlt(
+def estimate_homography(
     uv_img: np.ndarray,
     XY_grid: np.ndarray,
+    *,
+    method: str = "dlt",
+    ransac_reproj_threshold_px: float = 2.0,
+    max_iters: int = 10000,
+    confidence: float = 0.999,
+    refine_with_all_inliers: bool = True,
 ) -> np.ndarray:
     """
     Estimate planar homography H mapping grid -> image.
 
-    Relation:
+    Relation
+    --------
         [u, v, 1]^T ~ H [X, Y, 1]^T
 
     Parameters
@@ -178,36 +122,109 @@ def estimate_homography_dlt(
         Image points (u,v) in pixels.
     XY_grid : (N,2)
         Corresponding planar grid coordinates (X,Y).
+    method : str
+        Estimation method:
+            - "dlt"    : plain least-squares homography (no outlier robustness)
+            - "ransac" : classical RANSAC
+            - "lmeds"  : Least Median of Squares
+            - "magsac" : USAC_MAGSAC if available, otherwise fallback to RANSAC
+    ransac_reproj_threshold_px : float
+        Reprojection threshold in pixels for robust methods.
+    max_iters : int
+        Maximum number of robust iterations.
+    confidence : float
+        Desired confidence for robust methods.
+    refine_with_all_inliers : bool
+        If True, re-estimate H with plain DLT on the inlier set returned by the
+        robust stage. Ignored for method="dlt".
 
     Returns
     -------
     H : (3,3) ndarray
         Homography matrix mapping grid -> image.
+
+    Notes
+    -----
+    - Input order remains:
+          XY_grid -> uv_img
+      i.e. H maps board/grid coordinates to image coordinates.
+    - The function intentionally returns only H, so existing downstream code
+      continues to work unchanged.
     """
 
-    uv_img = np.asarray(uv_img, dtype=np.float64)
-    XY_grid = np.asarray(XY_grid, dtype=np.float64)
+    uv_img = np.asarray(uv_img, dtype=np.float64).reshape(-1, 2)
+    XY_grid = np.asarray(XY_grid, dtype=np.float64).reshape(-1, 2)
 
     if uv_img.shape != XY_grid.shape or uv_img.shape[1] != 2:
         raise ValueError("Inputs must both have shape (N,2) and match in size.")
     if uv_img.shape[0] < 4:
         raise ValueError("At least 4 correspondences are required.")
 
-    # grid -> image (pure DLT, no RANSAC)
-    H, _ = cv2.findHomography(
-        XY_grid,
-        uv_img,
-        method=0
-    )
+    method_key = str(method).strip().lower()
+
+    if method_key == "dlt":
+        cv_method = 0
+        use_robust = False
+
+    elif method_key == "ransac":
+        cv_method = cv2.RANSAC
+        use_robust = True
+
+    elif method_key == "lmeds":
+        cv_method = cv2.LMEDS
+        use_robust = True
+
+    elif method_key == "magsac":
+        cv_method = getattr(cv2, "USAC_MAGSAC", None)
+        if cv_method is None:
+            cv_method = cv2.RANSAC
+        use_robust = True
+
+    else:
+        raise ValueError(
+            f"Unknown homography method '{method}'. "
+            "Expected 'dlt', 'ransac', 'lmeds', or 'magsac'."
+        )
+
+    if use_robust:
+        H, mask = cv2.findHomography(
+            XY_grid,
+            uv_img,
+            method=cv_method,
+            ransacReprojThreshold=float(ransac_reproj_threshold_px),
+            maxIters=int(max_iters),
+            confidence=float(confidence),
+        )
+    else:
+        H, mask = cv2.findHomography(
+            XY_grid,
+            uv_img,
+            method=0,
+        )
 
     if H is None:
         raise RuntimeError("Homography estimation failed.")
 
-    # normalize scale (H[2,2] = 1)
+    # optional DLT refit on robust inliers
+    if use_robust and refine_with_all_inliers and mask is not None:
+        inlier_mask = np.asarray(mask, dtype=np.uint8).reshape(-1) > 0
+        XY_in = XY_grid[inlier_mask]
+        uv_in = uv_img[inlier_mask]
+
+        if XY_in.shape[0] >= 4:
+            H_refined, _ = cv2.findHomography(
+                XY_in,
+                uv_in,
+                method=0,
+            )
+            if H_refined is not None:
+                H = H_refined
+
+    # normalize scale
     if abs(H[2, 2]) > 1e-12:
         H = H / H[2, 2]
 
-    return H
+    return H.astype(np.float64)
 
 
 # ============================================================

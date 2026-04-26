@@ -1,5 +1,4 @@
-# overlay/gui/pages/page_plane_fitting.py
-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 from typing import Dict
 
@@ -30,13 +29,17 @@ from overlay.gui.pages.templates.templ_live_image import LiveImagePage
 
 
 # ============================================================
+# Save config
+# ============================================================
+SAVE_SNAPSHOTS = False
+
+# ============================================================
 # Where debug snapshots are saved
 # ============================================================
 DEBUG_SNAPSHOT_DIR = Path("debug_snapshots")
 
-# "full"        : ein NPZ pro Run mit allen Keys (bisheriges Verhalten)
-# "kalman_only" : ein NPZ pro Capture-Session, nur letzter Run,
-#                 nur points_xyz_camera_filt + K_xray
+# "full"        : ein NPZ pro Run mit allen Keys
+# "kalman_only" : nur letzter Run, nur points_xyz_camera_filt + K_xray
 SNAPSHOT_MODE: str = "full"
 
 
@@ -60,23 +63,28 @@ class PlaneFittingPage(LiveImagePage):
        on the same averaged depth map. Each cycle uses a different random seed so
        RANSAC point sampling varies.
 
-    Each cycle saves three plane estimates for offline comparison:
-        plane_abcd_single   — single raw ransac_plane_open3d call (true raw)
-        plane_abcd_raw      — fit_plane_stable (n_stable_runs RANSAC runs averaged)
-        plane_abcd_filtered — PlaneKalmanFilter output
+    Grid reconstruction modes
+    -------------------------
+    1) plane_3corners
+       - use TL / TR / BL
+       - intersect these 3 rays with the fitted plane
+       - interpolate full 11x11 grid in 3D
 
-    4. state.xray_points_xyz_c is set from the filtered plane of the final run.
+    2) plane_9corners_h
+       - use all 9 checkerboard corners
+       - estimate board->image homography in UV
+       - generate full 11x11 UV grid
+       - intersect all 121 rays with the fitted plane
 
     IMPORTANT:
     - This page MUST NOT add any new SessionState fields dynamically.
     - It ONLY writes fields that already exist in overlay/gui/state.py:
         * xray_points_xyz_c
         * plane_confirmed
+        * checkerboard_corners_uv
+        * checkerboard_corners_uv_9
+        * checkerboard_corners_confirmed
     """
-
-    # ------------------------------------------------------------------ #
-    #  Construction                                                        #
-    # ------------------------------------------------------------------ #
 
     def __init__(self, state: SessionState, on_complete_changed=None, parent=None):
         self.state = state
@@ -93,19 +101,26 @@ class PlaneFittingPage(LiveImagePage):
         self.min_points_for_fit = 800
 
         # ---------------- RANSAC ----------------
-        self.thresh_m = 0.001   # 1 mm inlier threshold
+        self.thresh_m = 0.001
         self.ransac_n = 8
         self.iters = 3000
-        self.n_stable_runs = 10  # RANSAC runs averaged inside fit_plane_stable
+        self.n_stable_runs = 10
 
         # ---------------- fit repetitions ----------------
-        # n_fit_runs independent cycles on the same averaged depth map,
-        # each with a different random seed. All are saved as snapshots;
-        # state is updated from the last run's filtered plane.
         self.n_fit_runs = 10
 
         # ---------------- local config ----------------
         self.steps_per_edge = 10
+        self.grid_rows = 11
+        self.grid_cols = 11
+        self.grid_pitch_mm = 2.54
+        self.corner_step = 5
+
+        # ---------------- grid reconstruction mode ----------------
+        self._grid_reconstruction_mode = "plane_3corners"
+        # alternatives:
+        #   "plane_3corners"
+        #   "plane_9corners_h"
 
         # ---------------- depth averaging ----------------
         self.use_temporal_filter = True
@@ -136,8 +151,8 @@ class PlaneFittingPage(LiveImagePage):
         self._snap_depth_intrinsics = None
         self._depth_scale_m: float = 1.0
 
-        self._ext_uv: np.ndarray | None = None   # (3,2): TL, TR, BL
-        self._corners_full: np.ndarray | None = None
+        self._ext_uv: np.ndarray | None = None        # (3,2): TL, TR, BL
+        self._corners_full: np.ndarray | None = None  # (9,1,2)
         self._rect: tuple[int, int, int, int] | None = None
         self._seed = 0
         self._show_depth = False
@@ -165,8 +180,8 @@ class PlaneFittingPage(LiveImagePage):
             "1) Press Start to open RGB-D\n"
             "2) Move checkerboard until FOUND\n"
             "3) Press SPACE to capture\n"
-            "4) Capture averages 30 depth frames\n"
-            "5) Confirm corners to run plane fitting"
+            "4) Confirm corners to run plane fitting\n"
+            "5) Choose grid reconstruction mode on the right"
         )
 
         self.set_viewport_background(active=False)
@@ -185,7 +200,7 @@ class PlaneFittingPage(LiveImagePage):
         self.update_view()
 
     # ------------------------------------------------------------------ #
-    #  UI                                                                  #
+    # UI
     # ------------------------------------------------------------------ #
 
     def _build_controls(self) -> None:
@@ -206,6 +221,19 @@ class PlaneFittingPage(LiveImagePage):
         self.chk_depth_tuning.toggled.connect(self._on_use_tuning_changed)
         self.chk_depth_tuning.setFocusPolicy(Qt.NoFocus)
 
+        self.chk_mode_3corners = QCheckBox("3 corners")
+        self.chk_mode_9corners_h = QCheckBox("9 corners + H")
+
+        self.chk_mode_3corners.setChecked(True)
+        self.chk_mode_9corners_h.setChecked(False)
+
+        self.chk_mode_3corners.toggled.connect(
+            lambda checked: self._on_grid_mode_toggled("plane_3corners", checked)
+        )
+        self.chk_mode_9corners_h.toggled.connect(
+            lambda checked: self._on_grid_mode_toggled("plane_9corners_h", checked)
+        )
+
         wrap = QWidget()
         wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         row = QHBoxLayout(wrap)
@@ -218,10 +246,41 @@ class PlaneFittingPage(LiveImagePage):
         col.setSpacing(8)
         col.addWidget(self.chk_show_depth)
         col.addWidget(self.chk_depth_tuning)
+        col.addSpacing(8)
+        col.addWidget(self.chk_mode_3corners)
+        col.addWidget(self.chk_mode_9corners_h)
         col.addStretch(1)
 
         row.addLayout(col, 1)
         self.controls_content.addWidget(wrap)
+
+    def _on_grid_mode_toggled(self, mode: str, checked: bool) -> None:
+        """
+        Keep the two mode checkboxes mutually exclusive.
+        If the active one is unchecked and none remain selected,
+        revert to 3-corner mode.
+        """
+        if checked:
+            self._grid_reconstruction_mode = mode
+
+            self.chk_mode_3corners.blockSignals(True)
+            self.chk_mode_9corners_h.blockSignals(True)
+
+            self.chk_mode_3corners.setChecked(mode == "plane_3corners")
+            self.chk_mode_9corners_h.setChecked(mode == "plane_9corners_h")
+
+            self.chk_mode_3corners.blockSignals(False)
+            self.chk_mode_9corners_h.blockSignals(False)
+            return
+
+        if not (
+            self.chk_mode_3corners.isChecked()
+            or self.chk_mode_9corners_h.isChecked()
+        ):
+            self.chk_mode_3corners.blockSignals(True)
+            self.chk_mode_3corners.setChecked(True)
+            self.chk_mode_3corners.blockSignals(False)
+            self._grid_reconstruction_mode = "plane_3corners"
 
     def _update_panels(self) -> None:
         rows = self.stats_rows()
@@ -247,7 +306,7 @@ class PlaneFittingPage(LiveImagePage):
         return out
 
     # ------------------------------------------------------------------ #
-    #  Template hooks                                                      #
+    # Template hooks
     # ------------------------------------------------------------------ #
 
     def get_frame(self) -> np.ndarray | None:
@@ -314,14 +373,18 @@ class PlaneFittingPage(LiveImagePage):
         if self._mode == "live":
             txt = "FOUND (press SPACE)" if self._found else "NOT FOUND"
             col = (0, 255, 0) if self._found else (0, 0, 255)
-            cv2.putText(vis, txt, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2,
-                        (0, 0, 0), 6, cv2.LINE_AA)
-            cv2.putText(vis, txt, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2,
-                        col, 2, cv2.LINE_AA)
+            cv2.putText(
+                vis, txt, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2,
+                (0, 0, 0), 6, cv2.LINE_AA
+            )
+            cv2.putText(
+                vis, txt, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2,
+                col, 2, cv2.LINE_AA
+            )
         return vis
 
     # ------------------------------------------------------------------ #
-    #  Depth image helpers                                                 #
+    # Depth image helpers
     # ------------------------------------------------------------------ #
 
     def _on_show_depth_changed(self, checked: bool) -> None:
@@ -356,13 +419,14 @@ class PlaneFittingPage(LiveImagePage):
         self.use_tuned_depth_settings = bool(checked)
         if self.pipeline is None:
             return
-        self._apply_depth_defaults()
+
         if self.use_tuned_depth_settings:
             self._apply_depth_tuning()
+
         self.update_view()
 
     # ------------------------------------------------------------------ #
-    #  Lifecycle                                                           #
+    # Lifecycle
     # ------------------------------------------------------------------ #
 
     def on_enter(self) -> None:
@@ -376,7 +440,7 @@ class PlaneFittingPage(LiveImagePage):
         super().on_leave()
 
     # ------------------------------------------------------------------ #
-    #  RealSense depth tuning                                              #
+    # RealSense depth tuning
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -500,13 +564,15 @@ class PlaneFittingPage(LiveImagePage):
             self._depth_scale_m = 1.0
 
     # ------------------------------------------------------------------ #
-    #  Actions                                                             #
+    # Actions
     # ------------------------------------------------------------------ #
 
     def start_clicked(self) -> None:
         if self.state.K_rgb is None:
             QMessageBox.information(
-                self, "Plane Fitting", "Missing K_rgb. Run Camera Calibration first."
+                self,
+                "Plane Fitting",
+                "Missing K_rgb. Run Camera Calibration first.",
             )
             return
 
@@ -518,9 +584,10 @@ class PlaneFittingPage(LiveImagePage):
                     depth_size=(1280, 720),
                     align_to="color",
                 )
-            self._apply_depth_defaults()
+
             if self.use_tuned_depth_settings:
                 self._apply_depth_tuning()
+
             self._read_depth_scale()
             self._setup_temporal_filter()
 
@@ -536,8 +603,10 @@ class PlaneFittingPage(LiveImagePage):
 
         self.state.xray_points_xyz_c = None
         self.state.plane_confirmed = False
+        self.state.checkerboard_corners_uv = None
+        self.state.checkerboard_corners_uv_9 = None
+        self.state.checkerboard_corners_confirmed = False
 
-        # Reset Kalman so each new session starts without prior history
         self._plane_kf.reset()
 
         self._stats = []
@@ -563,7 +632,7 @@ class PlaneFittingPage(LiveImagePage):
             self.on_complete_changed()
 
     # ------------------------------------------------------------------ #
-    #  Keyboard                                                            #
+    # Keyboard
     # ------------------------------------------------------------------ #
 
     def keyPressEvent(self, event):
@@ -575,7 +644,7 @@ class PlaneFittingPage(LiveImagePage):
         super().keyPressEvent(event)
 
     # ------------------------------------------------------------------ #
-    #  Depth averaging                                                     #
+    # Depth averaging
     # ------------------------------------------------------------------ #
 
     def _capture_averaged_depth(self) -> tuple[np.ndarray, object] | None:
@@ -651,7 +720,7 @@ class PlaneFittingPage(LiveImagePage):
         return np.asarray(pts3d, dtype=np.float64) if pts3d else np.empty((0, 3), dtype=np.float64)
 
     # ------------------------------------------------------------------ #
-    #  Main capture workflow                                               #
+    # Main capture workflow
     # ------------------------------------------------------------------ #
 
     def _capture(self) -> None:
@@ -660,7 +729,6 @@ class PlaneFittingPage(LiveImagePage):
 
         color = self._live_color.copy()
 
-        # Average depth once — all n_fit_runs share this same depth map
         avg_out = self._capture_averaged_depth()
         if avg_out is None:
             QMessageBox.warning(self, "Plane Fitting", "Could not capture averaged depth.")
@@ -669,7 +737,6 @@ class PlaneFittingPage(LiveImagePage):
         averaged_raw, last_df = avg_out
         intrinsics = last_df.profile.as_video_stream_profile().intrinsics
 
-        # Detect corners
         found, corners = cbd.detect_snapshot_full(
             color, pattern_size=self.pattern_size, det_width=self.det_width,
         )
@@ -718,6 +785,9 @@ class PlaneFittingPage(LiveImagePage):
             self._rect = None
             self._stats = []
             self._last_stats_rows = None
+            self.state.checkerboard_corners_uv = None
+            self.state.checkerboard_corners_uv_9 = None
+            self.state.checkerboard_corners_confirmed = False
             self.set_viewport_background(active=True)
             self.start_timer(self.FPS)
             self._update_buttons()
@@ -730,7 +800,12 @@ class PlaneFittingPage(LiveImagePage):
         self._rect = rpf.rect_from_pts(ext_uv, w, h, self.pad_px)
         self._seed = 0
 
-        # Run n_fit_runs cycles on the frozen depth map
+        self.state.checkerboard_corners_uv = ext_uv
+        self.state.checkerboard_corners_uv_9 = (
+            np.asarray(self._corners_full, dtype=np.float64).reshape(9, 2).copy()
+        )
+        self.state.checkerboard_corners_confirmed = True
+
         self._collect_fits()
 
         self._update_buttons()
@@ -739,39 +814,34 @@ class PlaneFittingPage(LiveImagePage):
         self.update_view()
 
     # ------------------------------------------------------------------ #
-    #  n_fit_runs independent cycles on the frozen depth map              #
+    # n_fit_runs independent cycles on the frozen depth map
     # ------------------------------------------------------------------ #
 
     def _collect_fits(self) -> None:
-        """
-        Run n_fit_runs independent cycles on the already-captured averaged depth map.
-        Each cycle uses a different random seed so RANSAC point sampling varies.
-
-        Each cycle produces three plane estimates:
-          1. plane_single   — single ransac_plane_open3d call (true raw, no averaging)
-          2. plane_raw      — fit_plane_stable (n_stable_runs RANSAC runs averaged)
-          3. plane_filtered — PlaneKalmanFilter applied to plane_raw
-
-        Snapshot behaviour depends on SNAPSHOT_MODE:
-          "full"        — all keys saved per run (bisheriges Verhalten)
-          "kalman_only" — only points_xyz_camera_filt + K_xray, once per session
-                          (last run only)
-
-        state.xray_points_xyz_c is set from the filtered plane of the final run.
-        """
         assert self._snap_depth_avg_raw is not None
         assert self._snap_depth_intrinsics is not None
         assert self._rect is not None and self._ext_uv is not None
+        assert self._corners_full is not None
         assert self.state.K_rgb is not None
 
         print(f"[PlaneFitting] Starting {self.n_fit_runs} fit runs on frozen depth map …")
         print(f"[PlaneFitting] SNAPSHOT_MODE = '{SNAPSHOT_MODE}'")
+        print(f"[PlaneFitting] Grid mode = '{self._grid_reconstruction_mode}'")
 
         last_marker_xyz_filtered: np.ndarray | None = None
         last_stats: list[str] = []
 
+        session_planes_raw: list[np.ndarray] = []
+        session_planes_filt: list[np.ndarray] = []
+        session_points_raw: list[np.ndarray] = []
+        session_points_filt: list[np.ndarray] = []
+        session_inlier_ratio: list[float] = []
+        session_mean_mm: list[float] = []
+        session_median_mm: list[float] = []
+        session_p95_mm: list[float] = []
+
         for run_idx in range(self.n_fit_runs):
-            seed = self._seed + run_idx   # unique seed per run
+            seed = self._seed + run_idx
 
             pts3d = self._sample_pts3d_from_averaged(
                 averaged_raw=self._snap_depth_avg_raw,
@@ -790,7 +860,6 @@ class PlaneFittingPage(LiveImagePage):
                 )
                 continue
 
-            # ── Level 1: single raw RANSAC (true raw, no averaging) ──────
             plane_single: np.ndarray | None = None
             try:
                 plane_single, _ = rpf.ransac_plane_open3d(
@@ -803,7 +872,6 @@ class PlaneFittingPage(LiveImagePage):
             except Exception as e:
                 print(f"[PlaneFitting]   run {run_idx + 1}: single RANSAC failed: {e}")
 
-            # ── Level 2: fit_plane_stable (n_stable_runs averaged) ───────
             plane_raw: np.ndarray | None = None
             inliers = np.array([], dtype=np.int64)
             try:
@@ -814,30 +882,39 @@ class PlaneFittingPage(LiveImagePage):
                     num_iterations=self.iters,
                     n_runs=self.n_stable_runs,
                 )
+                plane_raw = np.asarray(plane_raw, dtype=np.float64)
             except Exception as e:
                 print(f"[PlaneFitting]   run {run_idx + 1}: fit_plane_stable failed: {e}")
-                continue   # need plane_raw for Kalman — skip this run
+                continue
 
-            # ── Level 3: Kalman filter ────────────────────────────────────
-            plane_filtered = self._plane_kf.update(plane_raw)
+            plane_filtered = np.asarray(self._plane_kf.update(plane_raw), dtype=np.float64)
 
-            # Stats on inlier deviations (reported against plane_raw)
             dev = rpf.deviations(pts3d, plane_raw)
             dev_in = dev[inliers] if len(inliers) else dev
             mean = float(np.mean(dev_in))
-            med  = float(np.median(dev_in))
-            p95  = float(np.percentile(dev_in, 95))
+            med = float(np.median(dev_in))
+            p95 = float(np.percentile(dev_in, 95))
             inlier_ratio = len(inliers) / pts3d.shape[0]
 
-            # Marker grids from all three planes
-            marker_xyz_single   = self._plane_to_grid(plane_single)
-            marker_xyz_raw      = self._plane_to_grid(plane_raw)
+            marker_xyz_single = self._plane_to_grid(plane_single)
+            marker_xyz_raw = self._plane_to_grid(plane_raw)
             marker_xyz_filtered = self._plane_to_grid(plane_filtered)
 
-            # ── Snapshot speichern ────────────────────────────────────────
+            if plane_raw is not None:
+                session_planes_raw.append(plane_raw)
+            session_planes_filt.append(plane_filtered)
+            session_points_raw.append(marker_xyz_raw)
+            session_points_filt.append(marker_xyz_filtered)
+            session_inlier_ratio.append(inlier_ratio)
+            session_mean_mm.append(mean * 1000.0)
+            session_median_mm.append(med * 1000.0)
+            session_p95_mm.append(p95 * 1000.0)
+
             if SNAPSHOT_MODE == "full":
-                self._save_debug_snapshot(
+                self._save_snapshot(
+                    kind="run",
                     run_idx=run_idx,
+                    seed=seed,
                     plane_single=plane_single,
                     plane_raw=plane_raw,
                     plane_filtered=plane_filtered,
@@ -845,9 +922,18 @@ class PlaneFittingPage(LiveImagePage):
                     marker_xyz_raw=marker_xyz_raw,
                     marker_xyz_filtered=marker_xyz_filtered,
                     inlier_ratio=inlier_ratio,
+                    mean_mm=mean * 1000.0,
+                    median_mm=med * 1000.0,
+                    p95_mm=p95 * 1000.0,
                 )
             elif SNAPSHOT_MODE == "kalman_only" and run_idx == self.n_fit_runs - 1:
-                self._save_kalman_only_snapshot(marker_xyz_filtered)
+                self._save_snapshot(
+                    kind="run",
+                    run_idx=run_idx,
+                    seed=seed,
+                    plane_filtered=plane_filtered,
+                    marker_xyz_filtered=marker_xyz_filtered,
+                )
 
             last_marker_xyz_filtered = marker_xyz_filtered
             last_stats = [
@@ -863,7 +949,6 @@ class PlaneFittingPage(LiveImagePage):
                 f"mean {mean * 1000:.3f} mm"
             )
 
-        # Advance seed so a repeated SPACE-press samples differently
         self._seed += self.n_fit_runs
 
         if last_marker_xyz_filtered is None:
@@ -872,7 +957,18 @@ class PlaneFittingPage(LiveImagePage):
             )
             return
 
-        # Write to session state from the last (most Kalman-filtered) run
+        self._save_snapshot(
+            kind="session",
+            session_planes_raw=session_planes_raw,
+            session_planes_filt=session_planes_filt,
+            session_points_raw=session_points_raw,
+            session_points_filt=session_points_filt,
+            session_inlier_ratio=session_inlier_ratio,
+            session_mean_mm=session_mean_mm,
+            session_median_mm=session_median_mm,
+            session_p95_mm=session_p95_mm,
+        )
+
         self.state.xray_points_xyz_c = last_marker_xyz_filtered
         self.state.plane_confirmed = True
         self._stats = last_stats
@@ -884,155 +980,216 @@ class PlaneFittingPage(LiveImagePage):
         print(f"[PlaneFitting] Done. state.xray_points_xyz_c set from run {self.n_fit_runs}.")
 
     # ------------------------------------------------------------------ #
-    #  Helper: plane -> marker grid                                        #
+    # Helper: plane -> marker grid
     # ------------------------------------------------------------------ #
 
     def _plane_to_grid(self, plane: np.ndarray | None) -> np.ndarray:
-        """Intersect ext_uv rays with plane and interpolate marker grid."""
         if plane is None:
             return np.empty((0, 3), dtype=np.float64)
+
         try:
-            corner_xyz = rpf.intersect_corners_with_plane(
-                self._ext_uv, self.state.K_rgb, plane
+            if self._grid_reconstruction_mode == "plane_3corners":
+                corner_xyz = rpf.intersect_pixels_with_plane(
+                    self._ext_uv,
+                    self.state.K_rgb,
+                    plane,
+                    None,
+                )
+                return rpf.interpolate_marker_grid(
+                    corner_xyz,
+                    steps_per_edge=int(self.steps_per_edge),
+                )
+
+            if self._grid_reconstruction_mode == "plane_9corners_h":
+                corners_uv_9 = np.asarray(self._corners_full, dtype=np.float64).reshape(9, 2)
+                grid_uv = cbd.interpolate_grid_uv(
+                    corners_uv=corners_uv_9,
+                    nrows=int(self.grid_rows),
+                    ncols=int(self.grid_cols),
+                    pitch_mm=float(self.grid_pitch_mm),
+                    corner_step=int(self.corner_step),
+                )
+                return rpf.intersect_pixels_with_plane(
+                    grid_uv,
+                    self.state.K_rgb,
+                    plane,
+                    None,
+                )
+
+            raise ValueError(
+                f"Unknown grid reconstruction mode: {self._grid_reconstruction_mode}"
             )
-            return rpf.interpolate_marker_grid(
-                corner_xyz, steps_per_edge=int(self.steps_per_edge)
-            )
-        except Exception:
+
+        except Exception as e:
+            print(f"[PlaneFitting] _plane_to_grid failed: {e}")
             return np.empty((0, 3), dtype=np.float64)
 
     # ------------------------------------------------------------------ #
-    #  Snapshot saving                                                     #
+    # Single save function
     # ------------------------------------------------------------------ #
 
-    def _save_debug_snapshot(
+    def _save_snapshot(
         self,
-        run_idx: int,
-        plane_single: np.ndarray | None,
-        plane_raw: np.ndarray | None,
-        plane_filtered: np.ndarray | None,
-        marker_xyz_single: np.ndarray,
-        marker_xyz_raw: np.ndarray,
-        marker_xyz_filtered: np.ndarray,
+        *,
+        kind: str,
+        run_idx: int | None = None,
+        seed: int | None = None,
+        plane_single: np.ndarray | None = None,
+        plane_raw: np.ndarray | None = None,
+        plane_filtered: np.ndarray | None = None,
+        marker_xyz_single: np.ndarray | None = None,
+        marker_xyz_raw: np.ndarray | None = None,
+        marker_xyz_filtered: np.ndarray | None = None,
         inlier_ratio: float | None = None,
+        mean_mm: float | None = None,
+        median_mm: float | None = None,
+        p95_mm: float | None = None,
+        session_planes_raw: list[np.ndarray] | None = None,
+        session_planes_filt: list[np.ndarray] | None = None,
+        session_points_raw: list[np.ndarray] | None = None,
+        session_points_filt: list[np.ndarray] | None = None,
+        session_inlier_ratio: list[float] | None = None,
+        session_mean_mm: list[float] | None = None,
+        session_median_mm: list[float] | None = None,
+        session_p95_mm: list[float] | None = None,
     ) -> None:
-        """
-        Save one .npz per fit run with three plane levels.
+        if not SAVE_SNAPSHOTS:
+            return
 
-        Keys written
-        ------------
-        run_index                  : 0-based index of this run            (1,)
-
-        plane_abcd_single          : single ransac_plane_open3d output    (4,)
-        plane_abcd_raw             : fit_plane_stable output              (4,)
-        plane_abcd_filtered        : PlaneKalmanFilter output             (4,)
-
-        points_xyz_camera_single   : marker grid from plane_single        (N, 3)
-        points_xyz_camera          : marker grid from plane_raw           (N, 3)
-        points_xyz_camera_filt     : marker grid from plane_filtered      (N, 3)
-
-        inlier_ratio               : RANSAC inlier fraction (plane_raw)   (1,)
-        ext_uv                     : TL/TR/BL corners in image coords     (3, 2)
-        rgb_image                  : colour frame at capture time         (H, W, 3)
-        depth_avg_raw              : averaged depth (raw sensor units)    (H, W)
-        K_rgb                      : RGB camera intrinsic matrix          (3, 3)
-        K_xray                     : X-ray camera intrinsic matrix        (3, 3)
-        kalman_initialized         : 1 if Kalman had prior state, else 0  (1,)
-        """
         try:
             DEBUG_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._snapshot_counter += 1
-            fname = (
-                DEBUG_SNAPSHOT_DIR
-                / f"plane_snapshot_{ts}_c{self._snapshot_counter:02d}_r{run_idx:02d}.npz"
-            )
 
-            arrays: dict[str, np.ndarray] = {}
-
-            arrays["run_index"] = np.array([run_idx], dtype=np.int32)
-
-            # Plane parameters — all three levels
-            if plane_single is not None:
-                arrays["plane_abcd_single"] = np.asarray(plane_single, dtype=np.float64)
-            if plane_raw is not None:
-                arrays["plane_abcd_raw"] = np.asarray(plane_raw, dtype=np.float64)
-            if plane_filtered is not None:
-                arrays["plane_abcd_filtered"] = np.asarray(plane_filtered, dtype=np.float64)
-
-            # Marker grids — all three levels
-            arrays["points_xyz_camera_single"] = np.asarray(marker_xyz_single, dtype=np.float64)
-            arrays["points_xyz_camera"]        = np.asarray(marker_xyz_raw,     dtype=np.float64)
-            arrays["points_xyz_camera_filt"]   = np.asarray(marker_xyz_filtered, dtype=np.float64)
-
-            if inlier_ratio is not None:
-                arrays["inlier_ratio"] = np.array([inlier_ratio], dtype=np.float64)
-
-            if self._ext_uv is not None:
-                arrays["ext_uv"] = np.asarray(self._ext_uv, dtype=np.float64)
-
-            if self._snap_color is not None:
-                arrays["rgb_image"] = self._snap_color
-            if self._snap_depth_avg_raw is not None:
-                arrays["depth_avg_raw"] = np.asarray(
-                    self._snap_depth_avg_raw, dtype=np.float32
+            if kind == "run":
+                self._snapshot_counter += 1
+                fname = (
+                    DEBUG_SNAPSHOT_DIR
+                    / f"plane_snapshot_{ts}_c{self._snapshot_counter:02d}_r{int(run_idx):02d}.npz"
                 )
 
-            if self.state.K_rgb is not None:
-                arrays["K_rgb"] = np.asarray(self.state.K_rgb, dtype=np.float64)
-            K_xray = getattr(self.state, "K_xray", None)
-            if K_xray is not None:
-                arrays["K_xray"] = np.asarray(K_xray, dtype=np.float64)
+                arrays: dict[str, np.ndarray] = {}
 
-            arrays["kalman_initialized"] = np.array(
-                [1 if self._plane_kf.is_initialized else 0], dtype=np.int8
-            )
+                if run_idx is not None:
+                    arrays["run_index"] = np.array([run_idx], dtype=np.int32)
+                if seed is not None:
+                    arrays["seed"] = np.array([seed], dtype=np.int32)
 
-            np.savez(str(fname), **arrays)
-            print(f"[PlaneFitting]   snapshot saved: {fname.name}")
+                arrays["grid_reconstruction_mode"] = np.array(self._grid_reconstruction_mode)
+
+                if plane_single is not None:
+                    arrays["plane_abcd_single"] = np.asarray(plane_single, dtype=np.float64)
+                if plane_raw is not None:
+                    arrays["plane_abcd_raw"] = np.asarray(plane_raw, dtype=np.float64)
+                if plane_filtered is not None:
+                    arrays["plane_abcd_filtered"] = np.asarray(plane_filtered, dtype=np.float64)
+
+                if marker_xyz_single is not None:
+                    arrays["points_xyz_camera_single"] = np.asarray(marker_xyz_single, dtype=np.float64)
+                if marker_xyz_raw is not None:
+                    arrays["points_xyz_camera"] = np.asarray(marker_xyz_raw, dtype=np.float64)
+                if marker_xyz_filtered is not None:
+                    arrays["points_xyz_camera_filt"] = np.asarray(marker_xyz_filtered, dtype=np.float64)
+
+                if inlier_ratio is not None:
+                    arrays["inlier_ratio"] = np.array([inlier_ratio], dtype=np.float64)
+                if mean_mm is not None:
+                    arrays["mean_mm"] = np.array([mean_mm], dtype=np.float64)
+                if median_mm is not None:
+                    arrays["median_mm"] = np.array([median_mm], dtype=np.float64)
+                if p95_mm is not None:
+                    arrays["p95_mm"] = np.array([p95_mm], dtype=np.float64)
+
+                if self._ext_uv is not None:
+                    arrays["ext_uv"] = np.asarray(self._ext_uv, dtype=np.float64)
+
+                if self._corners_full is not None:
+                    arrays["corners_full_uv"] = np.asarray(self._corners_full, dtype=np.float64)
+
+                if self._snap_color is not None:
+                    arrays["rgb_image"] = self._snap_color
+
+                if self._snap_depth_avg_raw is not None:
+                    arrays["depth_avg_raw"] = np.asarray(self._snap_depth_avg_raw, dtype=np.float32)
+
+                if self.state.K_rgb is not None:
+                    arrays["K_rgb"] = np.asarray(self.state.K_rgb, dtype=np.float64)
+
+                if self.state.dist_rgb is not None:
+                    arrays["dist_rgb"] = np.asarray(self.state.dist_rgb, dtype=np.float64)
+
+                K_xray = getattr(self.state, "K_xray", None)
+                if K_xray is not None:
+                    arrays["K_xray"] = np.asarray(K_xray, dtype=np.float64)
+
+                arrays["kalman_initialized"] = np.array(
+                    [1 if self._plane_kf.is_initialized else 0], dtype=np.int8
+                )
+
+                np.savez(str(fname), **arrays)
+                print(f"[PlaneFitting]   snapshot saved: {fname.name}")
+                return
+
+            if kind == "session":
+                fname = DEBUG_SNAPSHOT_DIR / f"plane_session_{ts}.npz"
+
+                arrays: dict[str, np.ndarray] = {}
+                arrays["grid_reconstruction_mode"] = np.array(self._grid_reconstruction_mode)
+
+                if session_planes_raw is not None:
+                    arrays["planes_raw"] = np.asarray(session_planes_raw, dtype=np.float64)
+                if session_planes_filt is not None:
+                    arrays["planes_filt"] = np.asarray(session_planes_filt, dtype=np.float64)
+
+                if session_points_raw is not None:
+                    arrays["points_raw"] = np.array(session_points_raw, dtype=object)
+                if session_points_filt is not None:
+                    arrays["points_filt"] = np.array(session_points_filt, dtype=object)
+
+                if session_inlier_ratio is not None:
+                    arrays["inlier_ratio"] = np.asarray(session_inlier_ratio, dtype=np.float64)
+                if session_mean_mm is not None:
+                    arrays["mean_mm"] = np.asarray(session_mean_mm, dtype=np.float64)
+                if session_median_mm is not None:
+                    arrays["median_mm"] = np.asarray(session_median_mm, dtype=np.float64)
+                if session_p95_mm is not None:
+                    arrays["p95_mm"] = np.asarray(session_p95_mm, dtype=np.float64)
+
+                if self._ext_uv is not None:
+                    arrays["ext_uv"] = np.asarray(self._ext_uv, dtype=np.float64)
+
+                if self._corners_full is not None:
+                    arrays["corners_full_uv"] = np.asarray(self._corners_full, dtype=np.float64)
+
+                if self.state.K_rgb is not None:
+                    arrays["K_rgb"] = np.asarray(self.state.K_rgb, dtype=np.float64)
+
+                if self.state.dist_rgb is not None:
+                    arrays["dist_rgb"] = np.asarray(self.state.dist_rgb, dtype=np.float64)
+
+                K_xray = getattr(self.state, "K_xray", None)
+                if K_xray is not None:
+                    arrays["K_xray"] = np.asarray(K_xray, dtype=np.float64)
+
+                arrays["n_fit_runs"] = np.array([self.n_fit_runs], dtype=np.int32)
+                arrays["n_stable_runs"] = np.array([self.n_stable_runs], dtype=np.int32)
+
+                np.savez(str(fname), **arrays)
+                print(f"[PlaneFitting]   session summary saved: {fname.name}")
+                return
+
+            print(f"[WARN] Unknown snapshot kind: {kind}")
 
         except Exception as e:
             print(f"[WARN] Could not save snapshot: {e}")
 
-    def _save_kalman_only_snapshot(self, marker_xyz_filtered: np.ndarray) -> None:
-        """
-        Speichert ein kompaktes NPZ mit nur points_xyz_camera_filt und K_xray.
-        Wird nur im SNAPSHOT_MODE 'kalman_only' aufgerufen, einmal pro Session
-        (letzter Run).
-
-        Keys written
-        ------------
-        points_xyz_camera_filt  : marker grid from filtered plane  (N, 3)
-        K_xray                  : X-ray camera intrinsic matrix    (3, 3)
-        """
-        try:
-            DEBUG_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._snapshot_counter += 1
-            fname = (
-                DEBUG_SNAPSHOT_DIR
-                / f"plane_snapshot_kf_{ts}_c{self._snapshot_counter:02d}.npz"
-            )
-
-            arrays: dict[str, np.ndarray] = {}
-            arrays["points_xyz_camera_filt"] = np.asarray(
-                marker_xyz_filtered, dtype=np.float64
-            )
-            K_xray = getattr(self.state, "K_xray", None)
-            if K_xray is not None:
-                arrays["K_xray"] = np.asarray(K_xray, dtype=np.float64)
-
-            np.savez(str(fname), **arrays)
-            print(f"[PlaneFitting]   kalman_only snapshot saved: {fname.name}")
-
-        except Exception as e:
-            print(f"[WARN] Could not save kalman_only snapshot: {e}")
-
     # ------------------------------------------------------------------ #
-    #  Button state                                                        #
+    # Button state
     # ------------------------------------------------------------------ #
 
     def _update_buttons(self) -> None:
         self.btn_start.setEnabled(self._mode == "idle")
+        self.chk_show_depth.setEnabled(self._mode in ("live", "frozen"))
+        self.chk_depth_tuning.setEnabled(self.pipeline is None or self._mode == "live")
+        self.chk_mode_3corners.setEnabled(self._mode in ("idle", "live", "frozen"))
+        self.chk_mode_9corners_h.setEnabled(self._mode in ("idle", "live", "frozen"))

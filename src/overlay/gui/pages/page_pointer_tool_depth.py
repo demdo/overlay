@@ -199,17 +199,21 @@ class PointerToolDepthPage(LiveImagePage):
         self._live_color: np.ndarray | None = None
         self._frozen_vis: np.ndarray | None = None
 
-        self._prev_rvec: np.ndarray | None = None
-        self._prev_tvec: np.ndarray | None = None
-
         self._last_valid_result = None
         self._last_proposed_result = None
 
         self._stats: list[str] = []
         self._last_stats_rows: list[tuple[str, str]] | None = None
-        
+
+        # Match the debug script 1:1
         self._tip_kf = AdaptiveKalmanFilterCV3D(
             dt=1.0 / float(self.FPS),
+            q_pos_still=1e-4,
+            q_vel_still=1e-2,
+            r_still=8e-2,
+            q_pos_move=5e-3,
+            q_vel_move=3e-1,
+            r_move=2e-2,
         )
 
         super().__init__(parent)
@@ -231,11 +235,11 @@ class PointerToolDepthPage(LiveImagePage):
         self._update_buttons()
         self._update_panels()
         self.update_view()
-        
+
     # ---------------------------------------------------------
-    # Helpers 
+    # Helpers
     # ---------------------------------------------------------
-    
+
     def _filter_pointer_result(self, raw_result):
         """
         Apply Kalman filtering to the tip position only.
@@ -245,25 +249,25 @@ class PointerToolDepthPage(LiveImagePage):
             measurement_mm=raw_result.tip_point_camera_mm,
             rotation_camera=raw_result.rotation,
         ).reshape(3)
-    
+
         T_tc_f = np.asarray(raw_result.T_4x4, dtype=np.float64).copy()
         T_tc_f[:3, 3] = tip_xyz_f_mm
-    
+
         tvec_f = tip_xyz_f_mm.reshape(3, 1)
         translation_f = tvec_f.copy()
-    
+
         K = np.asarray(self.state.K_rgb, dtype=np.float64)
         dist = np.zeros((5, 1), dtype=np.float64)
-    
+
         tip_uv_f, _ = cv2.projectPoints(
-            np.zeros((1, 3), dtype=np.float64),   # tip origin in tip frame
+            np.zeros((1, 3), dtype=np.float64),  # tip origin in tip frame
             raw_result.rvec,
             tvec_f,
             K,
             dist,
         )
         tip_uv_f = tip_uv_f.reshape(2)
-    
+
         return replace(
             raw_result,
             tvec=tvec_f,
@@ -352,37 +356,35 @@ class PointerToolDepthPage(LiveImagePage):
     def get_frame(self) -> np.ndarray | None:
         if self._mode == "idle":
             return None
-    
+
         if self._mode == "frozen":
             return self._frozen_vis
-    
+
         if self.pipeline is None:
             return self._live_color
-    
+
         frames = self.pipeline.poll_for_frames()
         if not frames:
             return self._live_color
-    
+
         cf = frames.get_color_frame()
         if not cf:
             return self._live_color
-    
+
         img = self.color_frame_to_bgr(cf)
         if img is None:
             return self._live_color
-        
+
         self._live_color = img.copy()
-    
+
         # -----------------------------------------------------
         # PREVIEW: only live RGB, no tracking yet
         # -----------------------------------------------------
         if self._mode == "preview":
             self._found = False
             self._last_valid_result = None
-            self._prev_rvec = None
-            self._prev_tvec = None
             return img
-    
+
         # -----------------------------------------------------
         # TRACKING: run pointer pose estimation
         # -----------------------------------------------------
@@ -392,32 +394,26 @@ class PointerToolDepthPage(LiveImagePage):
                 aruco_dict=self.aruco_dict,
                 detector_params=self.detector_params,
             )
-    
+
             try:
                 raw_result = calibrate_camera_to_pointer(
                     image_bgr=img,
                     camera_intrinsics=self.state.K_rgb,
                     dist_coeffs=None,
                     pointer_model=self.pointer_model,
-                    rvec_init=self._prev_rvec,
-                    tvec_init=self._prev_tvec,
-                    use_extrinsic_guess=(
-                        self._prev_rvec is not None and self._prev_tvec is not None
-                    ),
+                    rvec_init=None,
+                    tvec_init=None,
+                    use_extrinsic_guess=False,
                     pose_method="ippe",
                     refine_with_iterative=True,
                 )
-    
-                # keep solver seed from raw pose result
-                self._prev_rvec = raw_result.rvec.copy()
-                self._prev_tvec = raw_result.tvec.copy()
-    
+
                 # apply Kalman filtering to tip position / translation
                 result = self._filter_pointer_result(raw_result)
-    
+
                 self._last_valid_result = result
                 self._found = True
-    
+
                 return self._build_tracking_vis(
                     img,
                     result,
@@ -426,13 +422,11 @@ class PointerToolDepthPage(LiveImagePage):
                     state_label="FOUND (press SPACE)",
                     box_color=(0, 255, 0),
                 )
-    
+
             except Exception:
-                self._prev_rvec = None
-                self._prev_tvec = None
                 self._last_valid_result = None
                 self._found = False
-    
+
                 vis = img.copy()
                 vis = _draw_text_box(
                     vis,
@@ -440,7 +434,7 @@ class PointerToolDepthPage(LiveImagePage):
                     color=(0, 0, 255),
                 )
                 return vis
-    
+
         return img
 
     def draw_overlay(self, frame_bgr: np.ndarray) -> np.ndarray:
@@ -458,7 +452,7 @@ class PointerToolDepthPage(LiveImagePage):
                 "Missing K_rgb. Run Camera Calibration first.",
             )
             return
-    
+
         if self.state.T_xc is None:
             QMessageBox.information(
                 self,
@@ -466,36 +460,34 @@ class PointerToolDepthPage(LiveImagePage):
                 "Missing T_xc. Complete Mode A first.",
             )
             return
-    
+
         if self._mode not in ("preview", "idle"):
             return
-    
+
         # clear accepted session outputs before new attempt
         self.state.d_x = None
         self.state.tip_uv_c = None
         self.state.tip_xyz_c = None
         self.state.T_tc = None
         self.state.H_xc = None
-    
+
         # reset local runtime for new tracking attempt
         self._stats = []
         self._last_stats_rows = None
         self._frozen_vis = None
-    
-        self._prev_rvec = None
-        self._prev_tvec = None
+
         self._last_valid_result = None
         self._last_proposed_result = None
         self._found = False
-    
+
         # reset Kalman filter
         self._tip_kf.reset()
-    
+
         self._mode = "tracking"
-    
+
         if callable(self.on_complete_changed):
             self.on_complete_changed()
-    
+
         self._update_buttons()
         self._update_panels()
         self.setFocus()
@@ -534,8 +526,6 @@ class PointerToolDepthPage(LiveImagePage):
         self._last_valid_result = None
         self._last_proposed_result = None
         self._found = False
-        self._prev_rvec = None
-        self._prev_tvec = None
         self._frozen_vis = None
         self._mode = "preview"
 

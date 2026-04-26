@@ -35,10 +35,10 @@ ROI:
 
     Therefore:
         - anchor selection is interpreted as [TL, TR, BL] in CAMERA VIEW
-        - uv_raw  = provisional ROI ordering in CAMERA VIEW
+        - uv_raw   = provisional ROI ordering in CAMERA VIEW
         - uv_final = LEFT-RIGHT mirrored version of uv_raw for X-ray usage
 
-    The affine ROI model is:
+    The affine ROI model is
 
         p = p_tl + alpha*u + beta*v
 
@@ -46,13 +46,17 @@ ROI:
         u = TR - TL
         v = BL - TL
 
-    Keep points by:
+    This affine model is used only for ROI selection and ordering.
+    No affine regularization, grid fitting, or point repositioning is performed.
+
+    Points are kept by:
       (A) affine inclusion: alpha,beta within [0..1] with margin
       (B) lattice proximity gate in PIXEL units using pitch from estimate_pitch_nn
 
 Notes
 -----
 - No circles_sorted, no circles_grid.
+- No affine regularization is applied to the returned ROI points.
 - estimate_pitch_nn is imported from overlay.tools.blob_detection.
 """
 
@@ -274,7 +278,8 @@ def _check_anchor_orientation(
     Returns
     -------
     ok : bool
-        True if the orientation is plausible for CAMERA VIEW semantics.
+        True if the anchor configuration is plausible for the expected
+        CAMERA VIEW semantics.
     warning_msg : str | None
         Warning text if the orientation is unexpected or degenerate.
     dbg : dict
@@ -355,24 +360,6 @@ def run_xray_marker_detection(
     """
     Detection-only pipeline:
         CLAHE -> detector_mask -> mask image -> detect_blobs_hough
-
-    Parameters
-    ----------
-    img_gray : np.ndarray
-        Input grayscale image (H,W).
-    use_clahe, clahe_clip, clahe_tiles : preprocessing
-        CLAHE parameters.
-    use_mask : bool
-        If True, suppress non-detector regions using a broad mask.
-    blur_ks, thr_mode, adaptive_block, adaptive_C, close_ks, close_iter : mask params
-        Parameters for detector mask construction.
-    hough_params : any
-        Passed through to detect_blobs_hough(..., params=hough_params).
-
-    Returns
-    -------
-    XrayMarkerDetectionResult
-        Contains debug images and circles (N,3) [x,y,r] or None.
     """
     if img_gray.ndim != 2:
         raise ValueError("img_gray must be grayscale (H,W).")
@@ -435,123 +422,32 @@ def compute_roi_from_grid(
     """
     Compute a marker ROI from circle detections using 3 ORDERED anchor indices.
 
-    Anchor convention
-    -----------------
-    The anchors must be selected in this exact order:
+    The three anchors must be provided in this order:
+        [TL, TR, BL]
+    with roles defined in CAMERA VIEW semantics.
 
-        1) TL
-        2) TR
-        3) BL
+    The function uses an affine parameterization induced by these anchors to:
+        - define the ROI support region
+        - gate detections by lattice proximity
+        - assign a consistent ordering
 
-    IMPORTANT:
-    These roles refer to the CAMERA VIEW / top-view of the board.
-
-    In other words, the user selects TL, TR and BL as they would appear from
-    the camera / top-view perspective, and this directly defines uv_raw.
-
-    The X-ray system, however, observes the board effectively from the opposite
-    side (source side / from below). Therefore, uv_raw must be mirrored
-    LEFT-RIGHT to obtain the final uv_xray ordering.
-
-    Affine ROI model
-    ----------------
-    The three anchors define an affine coordinate system:
-
-        p = p_tl + alpha * u + beta * v
-
-    with:
-        u = (TR - TL)
-        v = (BL - TL)
-
-    All detected circles are projected into this affine system.
-
-    Filtering
+    Important
     ---------
-    Points are retained if they satisfy:
-
-    1) Geometric inclusion:
-       alpha, beta lie within the affine ROI box [0..1] (with margin)
-
-    2) Lattice proximity:
-       Points must lie close to a regular grid defined by the estimated pitch
-       (in pixel units), using a tolerance proportional to the pitch.
-
-    Ordering
-    --------
-    First, provisional grid indices are computed in CAMERA VIEW semantics:
-
-        - rows follow TL -> BL
-        - columns follow TL -> TR
-
-    This ordering is stored as uv_raw.
-
-    Then a LEFT-RIGHT mirror is applied to obtain uv_final, which is the final
-    uv_xray ordering used by the X-ray geometry.
-
-    Sanity check
-    ------------
-    The clicked anchors are checked using:
-
-        u = TR - TL
-        v = BL - TL
-
-    Expected for the current setup in CAMERA VIEW:
-        - u_x > 0
-        - v_y > 0
-        - cross_z(u, v) > 0
-
-    Debug note
-    ----------
-    For debugging purposes, this function stores BOTH ROI orderings in a single
-    NPZ file:
-
-        - uv_raw   : provisional ROI ordering in CAMERA VIEW
-        - uv_final : final ROI ordering after LEFT-RIGHT mirroring
-
-    The NPZ is meant only for debugging / inspection and does not affect the
-    returned values.
-
-    Compatibility note
-    ------------------
-    For backward compatibility with existing debug scripts, dbg also contains:
-
-        - grid_i
-        - grid_j
-
-    These correspond to the FINAL ordering, i.e. the same ordering as roi_uv.
-
-    Parameters
-    ----------
-    circles : np.ndarray
-        (N,3) array [x,y,r]. Only x,y are used for ROI computation.
-    anchor_idx : Sequence[int]
-        Exactly three indices into circles defining the ROI anchors
-        in the order [TL, TR, BL] (camera-view semantics).
-    margin_px : float
-        Geometric margin around the affine [0..1] box in pixels.
-    gate_tol_pitch : float
-        Lattice gate tolerance in units of pitch (typical 0.35..0.50).
-    min_steps : int
-        Minimum number of grid steps along each edge.
+    No affine regularization is applied.
+    No ideal grid is fitted back onto the detections.
+    All returned ROI points are measured blob centers.
 
     Returns
     -------
-    roi_uv : np.ndarray
-        (M,2) float64 ROI points [u,v] ordered in final uv_xray row-major order.
-    roi_idx : np.ndarray
-        (M,) int64 indices into the input circles corresponding to roi_uv.
-    dbg : dict
-        Diagnostics including pitch estimate, ROI dimensions (nu,nv),
-        gating statistics, anchor indices, orientation diagnostics,
-        and the path to the debug NPZ if saving succeeded.
+    uv_final : np.ndarray
+        Final ROI points in X-ray ordering, shape (N,2). These are measured points
+        only, not regularized points.
 
-    Notes
-    -----
-    - Anchor roles are defined in the camera/front-view coordinate system.
-    - The user selects TL, TR, BL from the top-view / camera-view perspective.
-    - uv_raw stores this camera-view ordering.
-    - uv_final is obtained by LEFT-RIGHT mirroring uv_raw.
-    - The function does not attempt to correct incorrect anchor ordering.
+    roi_idx : np.ndarray
+        Indices of the selected ROI detections in the original circles array.
+
+    dbg : dict
+        Debug information for ROI extraction, ordering, and orientation checks.
     """
     c = np.asarray(circles, dtype=np.float64).reshape(-1, 3)
     if c.shape[0] < 3:
@@ -580,7 +476,6 @@ def compute_roi_from_grid(
         inv = {int(old): int(new) for new, old in enumerate(map_back)}
         idx_eff = np.array([inv[int(i)] for i in idx], dtype=int)
 
-    # anchor order fixed by user selection in CAMERA VIEW: [TL, TR, BL]
     p_tl = xy[idx_eff[0], :]
     p_tr = xy[idx_eff[1], :]
     p_bl = xy[idx_eff[2], :]
@@ -650,42 +545,27 @@ def compute_roi_from_grid(
     nu = int(best[0])
     nv = int(best[1])
 
-    # provisional CAMERA VIEW indices
     j_cam = np.rint(alpha_roi * nu).astype(np.int32)
     i_cam = np.rint(beta_roi * nv).astype(np.int32)
 
     j_cam = np.clip(j_cam, 0, nu)
     i_cam = np.clip(i_cam, 0, nv)
 
-    # DEBUG: provisional ordering BEFORE X-ray mirroring
     order_raw = np.lexsort((j_cam, i_cam))
     roi_idx_local_raw = roi_idx_local_all[order_raw]
     uv_raw = xy[roi_idx_local_raw].astype(np.float64)
 
-    # --------------------------------------------------------
-    # IMPORTANT GEOMETRY NOTE
-    # --------------------------------------------------------
-    # uv_raw corresponds to CAMERA VIEW (top view of the board).
-    #
-    # The X-ray system observes the board effectively from the
-    # opposite side (source below -> detector above), which causes
-    # a handedness change of the planar point ordering.
-    #
-    # Therefore the final X-ray ordering is obtained by a
-    # LEFT-RIGHT mirror only:
-    #   - columns are mirrored
-    #   - rows stay unchanged
-    # --------------------------------------------------------
-
-    # final uv_xray ordering: LEFT-RIGHT mirror only
     j_xray = nu - j_cam
     i_xray = i_cam
 
     order_final = np.lexsort((j_xray, i_xray))
     roi_idx_local = roi_idx_local_all[order_final]
-    roi_uv = xy[roi_idx_local].astype(np.float64)
 
-    uv_final = roi_uv.copy()
+    grid_i_final = i_xray[order_final].astype(np.int32)
+    grid_j_final = j_xray[order_final].astype(np.int32)
+
+    roi_uv_raw_final = xy[roi_idx_local].astype(np.float64)
+    uv_final = roi_uv_raw_final.copy()
 
     if map_back is None:
         roi_idx = roi_idx_local
@@ -702,6 +582,7 @@ def compute_roi_from_grid(
         np.savez(
             debug_npz_path,
             uv_raw=uv_raw,
+            uv_raw_final=roi_uv_raw_final,
             uv_final=uv_final,
             roi_idx_raw=roi_idx_raw,
             roi_idx_final=roi_idx,
@@ -709,8 +590,8 @@ def compute_roi_from_grid(
             anchor_idx_effective=np.asarray(idx_eff, dtype=int),
             grid_i_raw=i_cam[order_raw],
             grid_j_raw=j_cam[order_raw],
-            grid_i_final=i_xray[order_final],
-            grid_j_final=j_xray[order_final],
+            grid_i_final=grid_i_final,
+            grid_j_final=grid_j_final,
         )
         debug_npz_saved = True
     except Exception as e:
@@ -734,15 +615,13 @@ def compute_roi_from_grid(
         anchor_idx_effective=np.asarray(idx_eff, dtype=int).tolist(),
         anchor_role=["TL", "TR", "BL"],
 
-        # explicit raw/final debug keys
         grid_i_raw=i_cam[order_raw].tolist(),
         grid_j_raw=j_cam[order_raw].tolist(),
-        grid_i_final=i_xray[order_final].tolist(),
-        grid_j_final=j_xray[order_final].tolist(),
+        grid_i_final=grid_i_final.tolist(),
+        grid_j_final=grid_j_final.tolist(),
 
-        # backward-compatible aliases expected by older debug scripts
-        grid_i=i_xray[order_final].tolist(),
-        grid_j=j_xray[order_final].tolist(),
+        grid_i=grid_i_final.tolist(),
+        grid_j=grid_j_final.tolist(),
 
         orientation_ok=bool(orientation_ok),
         orientation_warning=orientation_warning,
@@ -754,11 +633,14 @@ def compute_roi_from_grid(
         orientation_cond_ux=bool(orientation_dbg["cond_ux"]),
         orientation_cond_vy=bool(orientation_dbg["cond_vy"]),
         orientation_cond_cross=bool(orientation_dbg["cond_cross"]),
+
         debug_uv_raw=uv_raw.tolist(),
+        debug_uv_raw_final=roi_uv_raw_final.tolist(),
         debug_uv_final=uv_final.tolist(),
+
         debug_npz_path=debug_npz_path,
         debug_npz_saved=bool(debug_npz_saved),
         debug_npz_error=debug_npz_error,
     )
 
-    return roi_uv, roi_idx, dbg
+    return uv_final, roi_idx, dbg

@@ -1,33 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-debug_depth.py
+debug_depth_eval.py
 
-Live comparison of pointer depth d_x using:
-    - iterative + refinement
-    - IPPE + refinement
-    - IPPE + refinement + Kalman filtering on the 3D tip position in camera coordinates
+Evaluation script for pointer-tool depth d_x using only:
 
-Workflow
---------
-- live RGB video
-- all pose methods run every frame
-- press SPACE once:
-    * set angular reference from the current ITERATIVE pose
-    * clear old samples
-    * reset Kalman filter
-    * start continuous recording
-- while recording:
-    * every valid frame is saved automatically
-- press 's':
-    * save all recorded samples to disk
-    * stop recording
-- press ESC / q:
-    * quit
+    1) iterative + refinement
+    2) IPPE + refinement + Kalman filtering on the 3D tip position in camera coordinates
 
-Important simplification
-------------------------
-- only K_rgb is loaded from disk
-- T_xc is assumed to be the identity matrix
+Behavior:
+- SPACE: set reference, clear old samples, reset KF, start recording
+- q/ESC: save recorded data to disk and quit
+
+Saved output:
+- one .npz file containing all recorded arrays + metadata
 """
 
 from __future__ import annotations
@@ -42,25 +27,39 @@ import pyrealsense2 as rs
 from overlay.calib.calib_camera_to_pointer import calibrate_camera_to_pointer
 from overlay.calib.calib_xray_to_pointer import extract_depth
 from overlay.tracking.pose_filters import AdaptiveKalmanFilterCV3D
+from overlay.tracking.transforms import invert_transform
+
+
+# ============================================================
+# Global config
+# ============================================================
+
+SAVE_RESULTS = True
+SAVE_DIR = Path("debug_outputs/pointer_depth_eval")
+
+K_RGB = np.array(
+    [
+        [1.36041301e03, 0.0, 9.76230766e02],
+        [0.0, 1.36041301e03, 5.48233972e02],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+
+T_CX = np.array(
+    [
+        [0.99826878, -0.03444292, -0.04767723, 0.00271865],
+        [-0.02366857, -0.97731641, 0.21045765, -0.10833699],
+        [-0.05384452, -0.20896485, -0.97643968, 1.09274608],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
 
 
 # ============================================================
 # Helpers
 # ============================================================
-
-def load_rgb_intrinsics(npz_path: str | Path) -> np.ndarray:
-    data = np.load(npz_path, allow_pickle=True)
-
-    if "K_rgb" not in data:
-        raise KeyError("NPZ does not contain 'K_rgb'.")
-
-    K_rgb = np.asarray(data["K_rgb"], dtype=np.float64)
-
-    if K_rgb.shape != (3, 3):
-        raise ValueError(f"K_rgb must have shape (3,3), got {K_rgb.shape}")
-
-    return K_rgb
-
 
 def draw_text_lines(
     img: np.ndarray,
@@ -87,14 +86,49 @@ def draw_text_lines(
             thickness,
             cv2.LINE_AA,
         )
-
     return out
 
 
+def draw_tip_marker(
+    img: np.ndarray,
+    tip_uv: np.ndarray | None,
+    *,
+    color: tuple[int, int, int],
+    marker_type: int,
+    label: str,
+) -> None:
+    if tip_uv is None:
+        return
+
+    tip_uv = np.asarray(tip_uv, dtype=np.float64).reshape(2)
+    if not np.isfinite(tip_uv).all():
+        return
+
+    u, v = np.round(tip_uv).astype(int)
+
+    cv2.drawMarker(
+        img,
+        (int(u), int(v)),
+        color,
+        markerType=marker_type,
+        markerSize=26,
+        thickness=2,
+        line_type=cv2.LINE_AA,
+    )
+
+    cv2.putText(
+        img,
+        label,
+        (int(u) + 10, int(v) - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
 def rotation_angle_deg(R: np.ndarray) -> float:
-    """
-    Return the angle of a relative rotation matrix in degrees.
-    """
     R = np.asarray(R, dtype=np.float64).reshape(3, 3)
     trace = float(np.trace(R))
     cos_theta = (trace - 1.0) / 2.0
@@ -103,71 +137,89 @@ def rotation_angle_deg(R: np.ndarray) -> float:
     return float(np.degrees(theta))
 
 
-def make_output_path() -> Path:
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    return Path(__file__).resolve().parent / f"debug_depth_compare_{ts}.npz"
+def project_tip_uv_from_camera_xyz(
+    tip_xyz_c_mm: np.ndarray,
+    K_rgb: np.ndarray,
+) -> np.ndarray:
+    point_xyz = np.asarray(tip_xyz_c_mm, dtype=np.float64).reshape(1, 3)
+    K_rgb = np.asarray(K_rgb, dtype=np.float64).reshape(3, 3)
+    dist = np.zeros((5, 1), dtype=np.float64)
+
+    uv, _ = cv2.projectPoints(
+        point_xyz,
+        np.zeros((3, 1), dtype=np.float64),
+        np.zeros((3, 1), dtype=np.float64),
+        K_rgb,
+        dist,
+    )
+    return uv.reshape(2)
 
 
-# ============================================================
-# Save
-# ============================================================
-
-def save_results(
-    out_path: Path,
+def save_recording(
     *,
-    angles_deg: list[float],
-    d_x_iter_mm: list[float],
-    d_x_ippe_mm: list[float],
-    d_x_ippe_kf_mm: list[float],
-    frame_indices: list[int],
-) -> None:
-    np.savez(
+    save_dir: Path,
+    times_s: list[float],
+    frame_idx_list: list[int],
+    angle_deg_list: list[float],
+    iter_tip_xyz_c_list: list[list[float]],
+    iter_tip_uv_list: list[list[float]],
+    iter_dx_list: list[float],
+    iter_reproj_mean_list: list[float],
+    ippe_kf_tip_xyz_c_list: list[list[float]],
+    ippe_kf_tip_uv_list: list[list[float]],
+    ippe_kf_dx_list: list[float],
+    ippe_reproj_mean_list: list[float],
+    ippe_reproj_median_list: list[float],
+    ippe_reproj_max_list: list[float],
+    ippe_solution_index_list: list[int],
+    n_markers_list: list[int],
+    kf_motion_score_list: list[float],
+    kf_tip_step_mm_list: list[float],
+    kf_rot_step_deg_list: list[float],
+    K_rgb: np.ndarray,
+    T_cx: np.ndarray,
+    T_xc: np.ndarray,
+) -> Path | None:
+    if len(times_s) == 0:
+        print("[SAVE] No samples recorded. Nothing saved.")
+        return None
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    out_path = save_dir / f"pointer_depth_eval_{timestamp}.npz"
+
+    np.savez_compressed(
         out_path,
-        angles_deg=np.asarray(angles_deg, dtype=np.float64),
-        d_x_iter_mm=np.asarray(d_x_iter_mm, dtype=np.float64),
-        d_x_ippe_mm=np.asarray(d_x_ippe_mm, dtype=np.float64),
-        d_x_ippe_kf_mm=np.asarray(d_x_ippe_kf_mm, dtype=np.float64),
-        frame_indices=np.asarray(frame_indices, dtype=np.int64),
+        times_s=np.asarray(times_s, dtype=np.float64),
+        frame_idx=np.asarray(frame_idx_list, dtype=np.int32),
+        angle_deg=np.asarray(angle_deg_list, dtype=np.float64),
+
+        iter_tip_xyz_c_mm=np.asarray(iter_tip_xyz_c_list, dtype=np.float64),
+        iter_tip_uv=np.asarray(iter_tip_uv_list, dtype=np.float64),
+        iter_d_x_mm=np.asarray(iter_dx_list, dtype=np.float64),
+        iter_reproj_mean_px=np.asarray(iter_reproj_mean_list, dtype=np.float64),
+
+        ippe_kf_tip_xyz_c_mm=np.asarray(ippe_kf_tip_xyz_c_list, dtype=np.float64),
+        ippe_kf_tip_uv=np.asarray(ippe_kf_tip_uv_list, dtype=np.float64),
+        ippe_kf_d_x_mm=np.asarray(ippe_kf_dx_list, dtype=np.float64),
+
+        ippe_reproj_mean_px=np.asarray(ippe_reproj_mean_list, dtype=np.float64),
+        ippe_reproj_median_px=np.asarray(ippe_reproj_median_list, dtype=np.float64),
+        ippe_reproj_max_px=np.asarray(ippe_reproj_max_list, dtype=np.float64),
+        ippe_solution_index=np.asarray(ippe_solution_index_list, dtype=np.int32),
+        n_markers=np.asarray(n_markers_list, dtype=np.int32),
+
+        kf_motion_score=np.asarray(kf_motion_score_list, dtype=np.float64),
+        kf_tip_step_mm=np.asarray(kf_tip_step_mm_list, dtype=np.float64),
+        kf_rot_step_deg=np.asarray(kf_rot_step_deg_list, dtype=np.float64),
+
+        K_rgb=np.asarray(K_rgb, dtype=np.float64),
+        T_cx=np.asarray(T_cx, dtype=np.float64),
+        T_xc=np.asarray(T_xc, dtype=np.float64),
     )
 
-
-def save_results_extended(
-    out_path: Path,
-    *,
-    angles_deg,
-    d_x_iter_mm,
-    d_x_ippe_mm,
-    d_x_ippe_kf_mm,
-    tip_iter_xyz_mm,
-    tip_ippe_xyz_mm,
-    tip_ippe_kf_xyz_mm,
-    reproj_iter_px,
-    reproj_ippe_px,
-    num_markers_iter,
-    num_markers_ippe,
-    ippe_solution_index,
-    kf_motion_score,
-    kf_tip_step_mm,
-    kf_rot_step_deg,
-):
-    np.savez(
-        out_path,
-        angles_deg=np.asarray(angles_deg, dtype=np.float64),
-        d_x_iter_mm=np.asarray(d_x_iter_mm, dtype=np.float64),
-        d_x_ippe_mm=np.asarray(d_x_ippe_mm, dtype=np.float64),
-        d_x_ippe_kf_mm=np.asarray(d_x_ippe_kf_mm, dtype=np.float64),
-        tip_iter_xyz_mm=np.asarray(tip_iter_xyz_mm, dtype=np.float64),
-        tip_ippe_xyz_mm=np.asarray(tip_ippe_xyz_mm, dtype=np.float64),
-        tip_ippe_kf_xyz_mm=np.asarray(tip_ippe_kf_xyz_mm, dtype=np.float64),
-        reproj_iter_px=np.asarray(reproj_iter_px, dtype=np.float64),
-        reproj_ippe_px=np.asarray(reproj_ippe_px, dtype=np.float64),
-        num_markers_iter=np.asarray(num_markers_iter, dtype=np.int32),
-        num_markers_ippe=np.asarray(num_markers_ippe, dtype=np.int32),
-        ippe_solution_index=np.asarray(ippe_solution_index, dtype=np.int32),
-        kf_motion_score=np.asarray(kf_motion_score, dtype=np.float64),
-        kf_tip_step_mm=np.asarray(kf_tip_step_mm, dtype=np.float64),
-        kf_rot_step_deg=np.asarray(kf_rot_step_deg, dtype=np.float64),
-    )
+    print(f"[SAVE] Saved recording to: {out_path}")
+    return out_path
 
 
 # ============================================================
@@ -175,18 +227,21 @@ def save_results_extended(
 # ============================================================
 
 def main() -> None:
-    npz_path = r"overlay_debug_20260324_171105.npz"
-    K_rgb = load_rgb_intrinsics(npz_path)
-
-    T_xc = np.eye(4, dtype=np.float64)
+    K_rgb = K_RGB.copy()
+    T_cx = T_CX.copy()
+    T_xc = invert_transform(T_cx)
 
     print("=" * 80)
-    print("Loaded setup")
+    print("HARDCODED SETUP")
     print("=" * 80)
     print("K_rgb:")
     print(K_rgb)
     print()
-    print("T_xc = Identity")
+    print("T_cx:")
+    print(T_cx)
+    print()
+    print("T_xc = inv(T_cx):")
+    print(T_xc)
     print()
 
     pipeline = rs.pipeline()
@@ -198,17 +253,11 @@ def main() -> None:
     print("Pipeline started.")
     print()
 
-    # Previous pose for iterative solvePnP
     prev_rvec_iter: np.ndarray | None = None
     prev_tvec_iter: np.ndarray | None = None
-
-    # Reference rotation for angle computation
     R_ref_iter: np.ndarray | None = None
-
-    # Recording state
     recording = False
 
-    # Kalman filter for IPPE + refinement tip position in camera coordinates
     dt = 1.0 / 30.0
     kf_ippe_tip = AdaptiveKalmanFilterCV3D(
         dt=dt,
@@ -220,50 +269,38 @@ def main() -> None:
         r_move=2e-2,
     )
 
-    # Current valid live values
-    current_result_iter = None
-    current_result_ippe = None
-    current_dx_iter_mm: float | None = None
-    current_dx_ippe_mm: float | None = None
-    current_dx_ippe_kf_mm: float | None = None
-    current_angle_deg: float | None = None
-    current_tip_ippe_kf_xyz_mm: np.ndarray | None = None
-
-    # Optional filter debug values
-    current_motion_score_ippe_kf: float | None = None
-    current_tip_step_mm: float | None = None
-    current_rot_step_deg: float | None = None
-
-    # Recorded arrays
-    angles_deg: list[float] = []
-    d_x_iter_mm: list[float] = []
-    d_x_ippe_mm: list[float] = []
-    d_x_ippe_kf_mm: list[float] = []
-    frame_indices: list[int] = []
-
-    # Extended debug arrays
-    tip_iter_xyz_mm: list[list[float]] = []
-    tip_ippe_xyz_mm: list[list[float]] = []
-    tip_ippe_kf_xyz_mm: list[list[float]] = []
-
-    reproj_iter_px: list[float] = []
-    reproj_ippe_px: list[float] = []
-
-    num_markers_iter: list[int] = []
-    num_markers_ippe: list[int] = []
-
-    ippe_solution_index: list[int] = []
-    kf_motion_score: list[float] = []
-    kf_tip_step_mm: list[float] = []
-    kf_rot_step_deg: list[float] = []
-
     frame_idx = 0
-    out_path = make_output_path()
+    t0_record: float | None = None
+
+    # --------------------------------------------------
+    # Buffers to save
+    # --------------------------------------------------
+    times_s: list[float] = []
+    frame_idx_list: list[int] = []
+    angle_deg_list: list[float] = []
+
+    iter_tip_xyz_c_list: list[list[float]] = []
+    iter_tip_uv_list: list[list[float]] = []
+    iter_dx_list: list[float] = []
+    iter_reproj_mean_list: list[float] = []
+
+    ippe_kf_tip_xyz_c_list: list[list[float]] = []
+    ippe_kf_tip_uv_list: list[list[float]] = []
+    ippe_kf_dx_list: list[float] = []
+
+    ippe_reproj_mean_list: list[float] = []
+    ippe_reproj_median_list: list[float] = []
+    ippe_reproj_max_list: list[float] = []
+    ippe_solution_index_list: list[int] = []
+    n_markers_list: list[int] = []
+
+    kf_motion_score_list: list[float] = []
+    kf_tip_step_mm_list: list[float] = []
+    kf_rot_step_deg_list: list[float] = []
 
     print("Controls:")
-    print("  SPACE : set reference + clear old samples + reset Kalman + start recording")
-    print("  s     : save recorded samples and stop recording")
-    print("  q/ESC : quit")
+    print("  SPACE : set reference + clear old samples + reset KF + start recording")
+    print("  q/ESC : save recording + quit")
     print()
 
     try:
@@ -275,15 +312,27 @@ def main() -> None:
 
             frame_idx += 1
             img_bgr = np.asanyarray(color_frame.get_data())
-            status_lines: list[str] = []
 
             iter_error = None
             ippe_error = None
 
             result_iter = None
-            result_ippe = None
             depth_iter = None
+
+            result_ippe = None
             depth_ippe = None
+
+            current_angle_deg = None
+            current_dx_iter_mm = None
+            current_dx_ippe_kf_mm = None
+
+            current_motion_score_ippe_kf = None
+            current_tip_step_mm = None
+            current_rot_step_deg = None
+
+            tip_uv_iter = None
+            tip_uv_ippe_kf = None
+            tip_ippe_kf_xyz_c = None
 
             # --------------------------------------------------
             # ITERATIVE + REFINEMENT
@@ -310,9 +359,10 @@ def main() -> None:
                     T_tc=result_iter.T_4x4,
                 )
 
+                current_dx_iter_mm = float(depth_iter.d_x_mm)
+                tip_uv_iter = np.asarray(result_iter.tip_uv, dtype=np.float64).reshape(2)
+
             except Exception as e:
-                import traceback
-                traceback.print_exc()
                 iter_error = str(e)
                 prev_rvec_iter = None
                 prev_tvec_iter = None
@@ -332,14 +382,35 @@ def main() -> None:
                     refine_with_iterative=True,
                 )
 
-                depth_ippe = extract_depth(
-                    T_xc=T_xc,
-                    T_tc=result_ippe.T_4x4,
+                tip_ippe_cam_filt = kf_ippe_tip.filter(
+                    measurement_mm=result_ippe.tip_point_camera_mm,
+                    rotation_camera=result_ippe.rotation,
                 )
 
+                tip_ippe_kf_xyz_c = np.asarray(
+                    tip_ippe_cam_filt,
+                    dtype=np.float64,
+                ).reshape(3)
+
+                T_tc_ippe_kf = np.asarray(result_ippe.T_4x4, dtype=np.float64).copy()
+                T_tc_ippe_kf[:3, 3] = tip_ippe_kf_xyz_c.reshape(3)
+
+                depth_ippe = extract_depth(
+                    T_xc=T_xc,
+                    T_tc=T_tc_ippe_kf,
+                )
+                current_dx_ippe_kf_mm = float(depth_ippe.d_x_mm)
+
+                tip_uv_ippe_kf = project_tip_uv_from_camera_xyz(
+                    tip_ippe_kf_xyz_c,
+                    K_rgb,
+                )
+
+                current_motion_score_ippe_kf = getattr(kf_ippe_tip, "last_motion_score", None)
+                current_tip_step_mm = getattr(kf_ippe_tip, "last_tip_step_mm", None)
+                current_rot_step_deg = getattr(kf_ippe_tip, "last_rot_step_deg", None)
+
             except Exception as e:
-                import traceback
-                traceback.print_exc()
                 ippe_error = str(e)
 
             # --------------------------------------------------
@@ -347,242 +418,177 @@ def main() -> None:
             # --------------------------------------------------
             if result_iter is not None:
                 R_iter = result_iter.T_4x4[:3, :3]
-
                 if R_ref_iter is None:
-                    angle_deg = 0.0
+                    current_angle_deg = 0.0
                 else:
                     R_rel = R_ref_iter.T @ R_iter
-                    angle_deg = rotation_angle_deg(R_rel)
-            else:
-                angle_deg = None
-
-            current_result_iter = result_iter
-            current_result_ippe = result_ippe
-            current_dx_iter_mm = float(depth_iter.d_x_mm) if depth_iter is not None else None
-            current_dx_ippe_mm = float(depth_ippe.d_x_mm) if depth_ippe is not None else None
-            current_angle_deg = float(angle_deg) if angle_deg is not None else None
+                    current_angle_deg = rotation_angle_deg(R_rel)
 
             # --------------------------------------------------
-            # IPPE + REFINEMENT + KALMAN
+            # Recording
             # --------------------------------------------------
-            current_dx_ippe_kf_mm = None
-            current_tip_ippe_kf_xyz_mm = None
-            current_motion_score_ippe_kf = None
-            current_tip_step_mm = None
-            current_rot_step_deg = None
+            valid_for_record = (
+                recording
+                and result_iter is not None
+                and depth_iter is not None
+                and result_ippe is not None
+                and tip_ippe_kf_xyz_c is not None
+                and current_dx_ippe_kf_mm is not None
+                and tip_uv_ippe_kf is not None
+                and current_angle_deg is not None
+            )
 
-            if result_ippe is not None:
-                tip_ippe_cam_filt = kf_ippe_tip.filter(
-                    measurement_mm=result_ippe.tip_point_camera_mm,
-                    rotation_camera=result_ippe.rotation,
-                )
+            if valid_for_record:
+                t_now = time.perf_counter()
+                if t0_record is None:
+                    t0_record = t_now
 
-                current_tip_ippe_kf_xyz_mm = np.asarray(
-                    tip_ippe_cam_filt,
+                times_s.append(float(t_now - t0_record))
+                frame_idx_list.append(int(frame_idx))
+                angle_deg_list.append(float(current_angle_deg))
+
+                tip_iter_xyz_c = np.asarray(
+                    result_iter.tip_point_camera_mm,
                     dtype=np.float64,
                 ).reshape(3)
+                iter_tip_xyz_c_list.append(tip_iter_xyz_c.tolist())
+                iter_tip_uv_list.append(np.asarray(result_iter.tip_uv, dtype=np.float64).reshape(2).tolist())
+                iter_dx_list.append(float(depth_iter.d_x_mm))
+                iter_reproj_mean_list.append(float(result_iter.reproj_mean_px))
 
-                current_dx_ippe_kf_mm = float(current_tip_ippe_kf_xyz_mm[2])
+                ippe_kf_tip_xyz_c_list.append(tip_ippe_kf_xyz_c.tolist())
+                ippe_kf_tip_uv_list.append(np.asarray(tip_uv_ippe_kf, dtype=np.float64).reshape(2).tolist())
+                ippe_kf_dx_list.append(float(current_dx_ippe_kf_mm))
 
-                current_motion_score_ippe_kf = getattr(
-                    kf_ippe_tip,
-                    "last_motion_score",
-                    None,
-                )
-                current_tip_step_mm = getattr(
-                    kf_ippe_tip,
-                    "last_tip_step_mm",
-                    None,
-                )
-                current_rot_step_deg = getattr(
-                    kf_ippe_tip,
-                    "last_rot_step_deg",
-                    None,
-                )
+                ippe_reproj_mean_list.append(float(result_ippe.reproj_mean_px))
+                ippe_reproj_median_list.append(float(result_ippe.reproj_median_px))
+                ippe_reproj_max_list.append(float(result_ippe.reproj_max_px))
+                ippe_solution_index_list.append(int(result_ippe.ippe_solution_index))
+                n_markers_list.append(int(len(result_ippe.marker_ids_used)))
 
-            # --------------------------------------------------
-            # Automatic recording
-            # --------------------------------------------------
-            if (
-                recording
-                and current_angle_deg is not None
-                and current_dx_iter_mm is not None
-                and current_dx_ippe_mm is not None
-                and current_dx_ippe_kf_mm is not None
-            ):
-                angles_deg.append(current_angle_deg)
-                d_x_iter_mm.append(current_dx_iter_mm)
-                d_x_ippe_mm.append(current_dx_ippe_mm)
-                d_x_ippe_kf_mm.append(current_dx_ippe_kf_mm)
-                frame_indices.append(frame_idx)
-
-                tip_iter_xyz_mm.append(
-                    np.asarray(result_iter.tip_point_camera_mm, dtype=np.float64).reshape(3).tolist()
-                )
-                tip_ippe_xyz_mm.append(
-                    np.asarray(result_ippe.tip_point_camera_mm, dtype=np.float64).reshape(3).tolist()
-                )
-                tip_ippe_kf_xyz_mm.append(
-                    np.asarray(current_tip_ippe_kf_xyz_mm, dtype=np.float64).reshape(3).tolist()
-                )
-
-                reproj_iter_px.append(float(result_iter.reproj_mean_px))
-                reproj_ippe_px.append(float(result_ippe.reproj_mean_px))
-
-                num_markers_iter.append(int(len(result_iter.marker_ids_used)))
-                num_markers_ippe.append(int(len(result_ippe.marker_ids_used)))
-
-                ippe_solution_index.append(
-                    -1 if result_ippe.ippe_solution_index is None else int(result_ippe.ippe_solution_index)
-                )
-                kf_motion_score.append(
-                    np.nan if current_motion_score_ippe_kf is None else float(current_motion_score_ippe_kf)
-                )
-                kf_tip_step_mm.append(
-                    np.nan if current_tip_step_mm is None else float(current_tip_step_mm)
-                )
-                kf_rot_step_deg.append(
-                    np.nan if current_rot_step_deg is None else float(current_rot_step_deg)
-                )
+                kf_motion_score_list.append(float(current_motion_score_ippe_kf) if current_motion_score_ippe_kf is not None else np.nan)
+                kf_tip_step_mm_list.append(float(current_tip_step_mm) if current_tip_step_mm is not None else np.nan)
+                kf_rot_step_deg_list.append(float(current_rot_step_deg) if current_rot_step_deg is not None else np.nan)
 
             # --------------------------------------------------
             # Visualization
             # --------------------------------------------------
-            if result_iter is not None:
-                uv_iter = np.round(result_iter.tip_uv).astype(int)
-                cv2.drawMarker(
+            if tip_uv_iter is not None:
+                draw_tip_marker(
                     img_bgr,
-                    (int(uv_iter[0]), int(uv_iter[1])),
-                    (0, 0, 255),
-                    markerType=cv2.MARKER_CROSS,
-                    markerSize=26,
-                    thickness=2,
-                    line_type=cv2.LINE_AA,
+                    tip_uv_iter,
+                    color=(0, 0, 255),
+                    marker_type=cv2.MARKER_CROSS,
+                    label="iter",
                 )
 
-            if result_ippe is not None:
-                uv_ippe = np.round(result_ippe.tip_uv).astype(int)
-                cv2.drawMarker(
+            if tip_uv_ippe_kf is not None:
+                draw_tip_marker(
                     img_bgr,
-                    (int(uv_ippe[0]), int(uv_ippe[1])),
-                    (255, 255, 0),
-                    markerType=cv2.MARKER_TILTED_CROSS,
-                    markerSize=26,
-                    thickness=2,
-                    line_type=cv2.LINE_AA,
+                    tip_uv_ippe_kf,
+                    color=(255, 0, 255),
+                    marker_type=cv2.MARKER_CROSS,
+                    label="ippe_kf",
                 )
 
             status_lines = [
                 f"frame: {frame_idx}",
                 f"recording: {'ON' if recording else 'OFF'}",
-                f"saved samples: {len(angles_deg)}",
+                f"saved samples: {len(times_s)}",
                 f"angle rel. reference: {current_angle_deg:.2f} deg" if current_angle_deg is not None else "angle rel. reference: n/a",
             ]
 
             if result_iter is not None and current_dx_iter_mm is not None:
                 status_lines.append(
-                    f"iter+refine      d_x: {current_dx_iter_mm:.2f} mm   reproj: {result_iter.reproj_mean_px:.2f}px"
+                    f"iter+refine      d_x {current_dx_iter_mm:.2f} mm   reproj {result_iter.reproj_mean_px:.2f}px"
                 )
             else:
-                status_lines.append(f"iter+refine      FAILED: {iter_error}")
+                status_lines.append(f"iter+refine      FAILED {iter_error}")
 
-            if result_ippe is not None and current_dx_ippe_mm is not None:
+            if result_ippe is not None and current_dx_ippe_kf_mm is not None:
                 status_lines.append(
-                    f"ippe+refine      d_x: {current_dx_ippe_mm:.2f} mm   reproj: {result_ippe.reproj_mean_px:.2f}px   idx: {result_ippe.ippe_solution_index}"
+                    f"ippe+refine+kf   d_x {current_dx_ippe_kf_mm:.2f} mm   reproj {result_ippe.reproj_mean_px:.2f}px   idx {result_ippe.ippe_solution_index}"
                 )
             else:
-                status_lines.append(f"ippe+refine      FAILED: {ippe_error}")
-
-            if current_dx_ippe_kf_mm is not None:
-                status_lines.append(
-                    f"ippe+refine+kf   d_x: {current_dx_ippe_kf_mm:.2f} mm"
-                )
-            else:
-                status_lines.append("ippe+refine+kf   d_x: n/a")
+                status_lines.append(f"ippe+refine+kf   FAILED {ippe_error}")
 
             if current_motion_score_ippe_kf is not None:
                 status_lines.append(
-                    f"kf motion: {current_motion_score_ippe_kf:.2f}   tip_step: {current_tip_step_mm:.3f} mm   rot_step: {current_rot_step_deg:.3f} deg"
+                    f"kf motion {current_motion_score_ippe_kf:.2f}   tip_step {current_tip_step_mm:.3f} mm   rot_step {current_rot_step_deg:.3f} deg"
                 )
             else:
-                status_lines.append("kf motion: n/a")
+                status_lines.append("kf motion n/a")
 
-            status_lines.append("SPACE = start recording | s = save")
+            status_lines.append("SPACE = start recording   q/ESC = save and quit")
 
             vis = draw_text_lines(img_bgr, status_lines)
-            cv2.imshow("debug_depth_compare", vis)
+            cv2.imshow("debug_depth_eval", vis)
 
             key = cv2.waitKey(1) & 0xFF
 
             if key in (27, ord("q")):
+                if SAVE_RESULTS:
+                    save_recording(
+                        save_dir=SAVE_DIR,
+                        times_s=times_s,
+                        frame_idx_list=frame_idx_list,
+                        angle_deg_list=angle_deg_list,
+                        iter_tip_xyz_c_list=iter_tip_xyz_c_list,
+                        iter_tip_uv_list=iter_tip_uv_list,
+                        iter_dx_list=iter_dx_list,
+                        iter_reproj_mean_list=iter_reproj_mean_list,
+                        ippe_kf_tip_xyz_c_list=ippe_kf_tip_xyz_c_list,
+                        ippe_kf_tip_uv_list=ippe_kf_tip_uv_list,
+                        ippe_kf_dx_list=ippe_kf_dx_list,
+                        ippe_reproj_mean_list=ippe_reproj_mean_list,
+                        ippe_reproj_median_list=ippe_reproj_median_list,
+                        ippe_reproj_max_list=ippe_reproj_max_list,
+                        ippe_solution_index_list=ippe_solution_index_list,
+                        n_markers_list=n_markers_list,
+                        kf_motion_score_list=kf_motion_score_list,
+                        kf_tip_step_mm_list=kf_tip_step_mm_list,
+                        kf_rot_step_deg_list=kf_rot_step_deg_list,
+                        K_rgb=K_rgb,
+                        T_cx=T_cx,
+                        T_xc=T_xc,
+                    )
                 break
 
             elif key == ord(" "):
-                if current_result_iter is None:
-                    print("[SPACE] cannot start recording: tracking invalid.")
+                if result_iter is None:
+                    print("[SPACE] cannot start recording: iterative tracking invalid.")
                     continue
 
-                R_ref_iter = current_result_iter.T_4x4[:3, :3].copy()
+                R_ref_iter = result_iter.T_4x4[:3, :3].copy()
 
-                angles_deg.clear()
-                d_x_iter_mm.clear()
-                d_x_ippe_mm.clear()
-                d_x_ippe_kf_mm.clear()
-                frame_indices.clear()
+                times_s.clear()
+                frame_idx_list.clear()
+                angle_deg_list.clear()
 
-                tip_iter_xyz_mm.clear()
-                tip_ippe_xyz_mm.clear()
-                tip_ippe_kf_xyz_mm.clear()
+                iter_tip_xyz_c_list.clear()
+                iter_tip_uv_list.clear()
+                iter_dx_list.clear()
+                iter_reproj_mean_list.clear()
 
-                reproj_iter_px.clear()
-                reproj_ippe_px.clear()
+                ippe_kf_tip_xyz_c_list.clear()
+                ippe_kf_tip_uv_list.clear()
+                ippe_kf_dx_list.clear()
 
-                num_markers_iter.clear()
-                num_markers_ippe.clear()
+                ippe_reproj_mean_list.clear()
+                ippe_reproj_median_list.clear()
+                ippe_reproj_max_list.clear()
+                ippe_solution_index_list.clear()
+                n_markers_list.clear()
 
-                ippe_solution_index.clear()
-                kf_motion_score.clear()
-                kf_tip_step_mm.clear()
-                kf_rot_step_deg.clear()
+                kf_motion_score_list.clear()
+                kf_tip_step_mm_list.clear()
+                kf_rot_step_deg_list.clear()
 
                 kf_ippe_tip.reset()
-
+                t0_record = None
                 recording = True
-                print("[SPACE] reference set. Continuous recording started.")
 
-            elif key == ord("s"):
-                save_results(
-                    out_path,
-                    angles_deg=angles_deg,
-                    d_x_iter_mm=d_x_iter_mm,
-                    d_x_ippe_mm=d_x_ippe_mm,
-                    d_x_ippe_kf_mm=d_x_ippe_kf_mm,
-                    frame_indices=frame_indices,
-                )
-
-                out_path_ext = out_path.with_name(out_path.stem + "_extended.npz")
-                save_results_extended(
-                    out_path_ext,
-                    angles_deg=angles_deg,
-                    d_x_iter_mm=d_x_iter_mm,
-                    d_x_ippe_mm=d_x_ippe_mm,
-                    d_x_ippe_kf_mm=d_x_ippe_kf_mm,
-                    tip_iter_xyz_mm=tip_iter_xyz_mm,
-                    tip_ippe_xyz_mm=tip_ippe_xyz_mm,
-                    tip_ippe_kf_xyz_mm=tip_ippe_kf_xyz_mm,
-                    reproj_iter_px=reproj_iter_px,
-                    reproj_ippe_px=reproj_ippe_px,
-                    num_markers_iter=num_markers_iter,
-                    num_markers_ippe=num_markers_ippe,
-                    ippe_solution_index=ippe_solution_index,
-                    kf_motion_score=kf_motion_score,
-                    kf_tip_step_mm=kf_tip_step_mm,
-                    kf_rot_step_deg=kf_rot_step_deg,
-                )
-
-                recording = False
-                print(f"[s] saved {len(angles_deg)} samples to: {out_path}")
-                print(f"[s] extended data saved to: {out_path_ext}")
+                print("[SPACE] reference set, buffers cleared, KF reset, recording started.")
 
     finally:
         pipeline.stop()

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from overlay.tools.homography import estimate_homography_dlt, project_homography
+from overlay.tools.homography import estimate_homography, project_homography
 
 
 # ============================================================
@@ -218,7 +218,7 @@ def interpolate_grid_uv(
     grid_uv : (nrows * ncols, 2) ndarray, float64
         UV coordinates in row-major order: point (i, j) at index i*ncols + j.
     """
-    
+
     corners_uv = np.asarray(corners_uv, dtype=np.float64).reshape(9, 2)
     corners_uv = _sort_corners_row_major(np.asarray(corners_uv).reshape(9, 2))
 
@@ -233,7 +233,11 @@ def interpolate_grid_uv(
     )  # (9, 2)
 
     # H maps board_mm -> image_uv (least-squares, all 9 points)
-    H = estimate_homography_dlt(uv_img=corners_uv, XY_grid=corner_board_xy)
+    H = estimate_homography(
+        uv_img=corners_uv,
+        XY_grid=corner_board_xy,
+        method="dlt",
+    )
 
     # All nrows*ncols board coordinates
     all_board_xy = np.array(

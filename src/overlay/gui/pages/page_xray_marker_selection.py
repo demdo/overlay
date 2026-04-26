@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+from datetime import datetime
+
 import cv2
 import numpy as np
 import pydicom
@@ -17,6 +20,9 @@ from overlay.tools.xray_marker_selection import (
     run_xray_marker_detection,
     compute_roi_from_grid,
 )
+
+
+SAVE_XRAY_MARKER_SELECTION = False
 
 
 class XrayMarkerSelectionPage(StaticImagePage):
@@ -55,13 +61,17 @@ class XrayMarkerSelectionPage(StaticImagePage):
       where these roles are defined in CAMERA VIEW semantics, i.e. from the
       top-view / camera-view perspective of the board.
 
+    - compute_roi_from_grid(...) uses these anchors to define an affine ROI model
+      for selection and ordering only.
+
     - compute_roi_from_grid(...) first builds uv_raw in CAMERA VIEW ordering.
 
     - For the current setup, the X-ray geometry corresponds effectively to a
       view from the opposite side of the board. Therefore uv_raw is mirrored
       LEFT-RIGHT to obtain uv_final.
 
-    - This left-right mirroring is handled inside compute_roi_from_grid(...).
+    - No affine regularization or point repositioning is performed.
+      The stored points remain measured blob detections in RAW X-ray coordinates.
 
     Therefore:
     - selection = [TL, TR, BL] in CAMERA VIEW
@@ -116,8 +126,10 @@ class XrayMarkerSelectionPage(StaticImagePage):
             "IMPORTANT:\n"
             "- Select anchors by real board meaning from the top-view / camera-view\n"
             "- Do NOT select based only on naive X-ray image appearance\n"
-            "- compute_roi_from_grid(...) first builds uv_raw in CAMERA VIEW ordering\n"
+            "- compute_roi_from_grid(...) uses the anchors for ROI selection and ordering only\n"
+            "- uv_raw is first built in CAMERA VIEW ordering\n"
             "- uv_raw is then mirrored LEFT-RIGHT to obtain uv_final for X-ray usage\n"
+            "- No affine regularization or point repositioning is applied\n"
             "\n"
             "So:\n"
             "Select anchors by real board meaning in CAMERA VIEW,\n"
@@ -375,8 +387,8 @@ class XrayMarkerSelectionPage(StaticImagePage):
                         f"- (BL - TL) = ({vx:.3f}, {vy:.3f})\n"
                         f"- cross_z = {cross_z:.3f}\n\n"
                         "Expected for CAMERA VIEW selection [TL, TR, BL]:\n"
-                        f"- x-component of (TR - TL) > 0   -> {'OK' if cond_ux else 'NOT OK'}\n"
-                        f"- y-component of (BL - TL) > 0   -> {'OK' if cond_vy else 'NOT OK'}\n"
+                        f"- x-component of (TR - TL) < 0   -> {'OK' if cond_ux else 'NOT OK'}\n"
+                        f"- y-component of (BL - TL) < 0   -> {'OK' if cond_vy else 'NOT OK'}\n"
                         f"- cross_z((TR - TL), (BL - TL)) > 0   -> {'OK' if cond_cross else 'NOT OK'}\n\n"
                         "Do you want to continue anyway?"
                     ),
@@ -398,16 +410,23 @@ class XrayMarkerSelectionPage(StaticImagePage):
                     return
 
             roi_uv_final = np.asarray(roi_uv_final, dtype=np.float64).reshape(-1, 2)
+            roi_idx = np.asarray(roi_idx, dtype=np.int64).reshape(-1)
 
             # Stored in RAW X-ray coordinates, already ordered as final uv_xray
             # (i.e. uv_final after LEFT-RIGHT mirroring inside compute_roi_from_grid)
             self.state.xray_points_uv = roi_uv_final.astype(float)
             self.state.xray_points_confirmed = True
 
-            self.marker_widget.set_roi_indices(list(np.asarray(roi_idx, dtype=np.int64).tolist()))
+            self.marker_widget.set_roi_indices(list(roi_idx.tolist()))
             self.marker_widget.set_locked(True)
 
             self.state.xray_marker_overlay_bgr = self._render_roi_overlay_bgr()
+
+            self._save_xray_marker_selection(
+                selected_idx=selected_idx,
+                roi_idx=roi_idx,
+                dbg=dbg,
+            )
 
             self.refresh()
             self.on_complete_changed()
@@ -438,6 +457,61 @@ class XrayMarkerSelectionPage(StaticImagePage):
 
         self.refresh()
         self.on_complete_changed()
+
+    # ---------------- Save ----------------
+
+    def _save_xray_marker_selection(
+        self,
+        selected_idx: list[int] | np.ndarray,
+        roi_idx: np.ndarray,
+        dbg: dict,
+    ) -> None:
+        if not SAVE_XRAY_MARKER_SELECTION:
+            return
+
+        if self.state.xray_points_uv is None:
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        xray_path = self.state.xray_image_path
+        if xray_path:
+            xray_stem = os.path.splitext(os.path.basename(xray_path))[0]
+        else:
+            xray_stem = "xray"
+
+        out_name = f"xray_marker_selection_{timestamp}_{xray_stem}.npz"
+
+        np.savez(
+            out_name,
+            points_uv=np.asarray(self.state.xray_points_uv, dtype=np.float64),
+            anchor_indices=np.asarray(selected_idx, dtype=np.int64),
+            roi_indices=np.asarray(roi_idx, dtype=np.int64),
+            circles_uvr=(
+                np.asarray(self._circles, dtype=np.float64)
+                if self._circles is not None
+                else np.empty((0, 3), dtype=np.float64)
+            ),
+            marker_radius_px=(
+                np.array(float(self.state.marker_radius_px), dtype=np.float64)
+                if self.state.marker_radius_px is not None
+                else np.array(np.nan, dtype=np.float64)
+            ),
+            xray_image_path=np.array(xray_path if xray_path is not None else "", dtype=object),
+            orientation_ok=np.array(bool(dbg.get("orientation_ok", True)), dtype=bool),
+            orientation_ux=np.array(float(dbg.get("orientation_ux", np.nan)), dtype=np.float64),
+            orientation_uy=np.array(float(dbg.get("orientation_uy", np.nan)), dtype=np.float64),
+            orientation_vx=np.array(float(dbg.get("orientation_vx", np.nan)), dtype=np.float64),
+            orientation_vy=np.array(float(dbg.get("orientation_vy", np.nan)), dtype=np.float64),
+            orientation_cross_z=np.array(float(dbg.get("orientation_cross_z", np.nan)), dtype=np.float64),
+            orientation_cond_ux=np.array(bool(dbg.get("orientation_cond_ux", False)), dtype=bool),
+            orientation_cond_vy=np.array(bool(dbg.get("orientation_cond_vy", False)), dtype=bool),
+            orientation_cond_cross=np.array(bool(dbg.get("orientation_cond_cross", False)), dtype=bool),
+            margin_px=np.array(1.1 * float(self._pick_radius_px), dtype=np.float64),
+            pick_radius_px=np.array(float(self._pick_radius_px), dtype=np.float64),
+        )
+
+        print(f"[SAVE] X-ray marker selection saved to: {out_name}")
 
     # ---------------- Helpers ----------------
 

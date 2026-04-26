@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 import time
 
 import cv2
@@ -16,7 +15,6 @@ from overlay.calib.calib_xray_to_pointer import (
     extract_depth,
 )
 from overlay.tracking.transforms import (
-    as_transform,
     invert_transform,
 )
 
@@ -25,12 +23,21 @@ from overlay.tracking.transforms import (
 # Config
 # ============================================================
 
-T_CX_FILE = Path(
-    r"C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Data\debug_pnp_raw_direct_result.npz"
+# Hardcoded from:
+# cam2x_calibration_20260408_151043_iterative_ransac.npz
+T_CX = np.array(
+    [
+        [0.99826878, -0.03444292, -0.04767723,  0.00271865],
+        [-0.02366857, -0.97731641,  0.21045765, -0.10833699],
+        [-0.05384452, -0.20896485, -0.97643968,  1.09274608],
+        [0.0,         0.0,         0.0,         1.0],
+    ],
+    dtype=np.float64,
 )
 
-POSE_METHOD = "ippe"
+POSE_METHOD = "iterative_ransac"
 REFINE_WITH_ITERATIVE = True
+USE_EXTRINSIC_GUESS = False
 
 WINDOW_NAME = "Pointer Tool Depth Debug Capture"
 
@@ -38,22 +45,6 @@ WINDOW_NAME = "Pointer Tool Depth Debug Capture"
 # ============================================================
 # Helpers
 # ============================================================
-
-def _load_first_existing_array(npz_path: Path, keys: list[str]) -> np.ndarray:
-    data = np.load(npz_path)
-    for k in keys:
-        if k in data:
-            return np.asarray(data[k], dtype=np.float64)
-    raise KeyError(f"None of the keys {keys} found in: {npz_path}")
-
-
-def load_T_cx(npz_path: Path) -> np.ndarray:
-    T_cx = _load_first_existing_array(
-        npz_path,
-        keys=["T_cx", "T", "transform", "T_4x4"],
-    )
-    return as_transform(T_cx, "T_cx")
-
 
 def intrinsics_from_rs_video_stream_profile(
     profile: rs.video_stream_profile,
@@ -202,14 +193,18 @@ def plot_debug_records(records: list[dict]) -> None:
 # ============================================================
 
 def main() -> None:
-    print("[INFO] Loading T_cx...")
-    T_cx = load_T_cx(T_CX_FILE)
+    print("[INFO] Using hardcoded T_cx...")
+    T_cx = T_CX.copy()
     T_xc = invert_transform(T_cx)
 
     print("[INFO] T_cx:")
     print(T_cx)
     print("[INFO] T_xc = inv(T_cx):")
     print(T_xc)
+
+    print(f"[INFO] POSE_METHOD = {POSE_METHOD}")
+    print(f"[INFO] REFINE_WITH_ITERATIVE = {REFINE_WITH_ITERATIVE}")
+    print(f"[INFO] USE_EXTRINSIC_GUESS = {USE_EXTRINSIC_GUESS}")
 
     pointer_model = get_default_pointer_tool_model()
 
@@ -260,33 +255,52 @@ def main() -> None:
             reproj_median_px = None
             reproj_max_px = None
             n_markers = None
+            used_guess = False
 
             try:
+                use_guess_now = (
+                    USE_EXTRINSIC_GUESS and
+                    prev_rvec is not None and
+                    prev_tvec is not None
+                )
+
                 result = calibrate_camera_to_pointer(
                     image_bgr=img,
                     camera_intrinsics=K_rgb,
                     dist_coeffs=None,
                     pointer_model=pointer_model,
-                    rvec_init=prev_rvec,
-                    tvec_init=prev_tvec,
-                    use_extrinsic_guess=(prev_rvec is not None and prev_tvec is not None),
+                    rvec_init=prev_rvec if use_guess_now else None,
+                    tvec_init=prev_tvec if use_guess_now else None,
+                    use_extrinsic_guess=use_guess_now,
                     pose_method=POSE_METHOD,
                     refine_with_iterative=REFINE_WITH_ITERATIVE,
                 )
 
-                prev_rvec = result.rvec.copy()
-                prev_tvec = result.tvec.copy()
+                used_guess = bool(use_guess_now)
+
+                if USE_EXTRINSIC_GUESS:
+                    prev_rvec = result.rvec.copy()
+                    prev_tvec = result.tvec.copy()
+                else:
+                    prev_rvec = None
+                    prev_tvec = None
 
                 pose_ok = True
                 tip_uv = np.asarray(result.tip_uv, dtype=np.float64).reshape(2)
                 T_tc = np.asarray(result.T_4x4, dtype=np.float64)
-                tip_xyz_c_mm = np.asarray(result.tip_point_camera_mm, dtype=np.float64).reshape(3)
+                tip_xyz_c_mm = np.asarray(
+                    result.tip_point_camera_mm,
+                    dtype=np.float64,
+                ).reshape(3)
 
                 depth_result = extract_depth(
                     T_xc=T_xc,
                     T_tc=T_tc,
                 )
-                tip_xyz_x_mm = np.asarray(depth_result.tip_xyz_x_mm, dtype=np.float64).reshape(3)
+                tip_xyz_x_mm = np.asarray(
+                    depth_result.tip_xyz_x_mm,
+                    dtype=np.float64,
+                ).reshape(3)
                 d_x_mm = float(depth_result.d_x_mm)
 
                 reproj_mean_px = float(result.reproj_mean_px)
@@ -301,10 +315,17 @@ def main() -> None:
                 pose_ok = False
                 last_status = f"POSE FAIL: {e}"
 
+                if not USE_EXTRINSIC_GUESS:
+                    prev_rvec = None
+                    prev_tvec = None
+
             draw_tip_marker(vis, tip_uv)
 
             lines = [
                 f"status: {last_status}",
+                f"pose_method: {POSE_METHOD}",
+                f"use_guess_cfg: {USE_EXTRINSIC_GUESS}",
+                f"use_guess_now: {used_guess}",
                 f"captured measurements: {len(records)}",
                 "",
                 "Controls: SPACE capture | r reset | q quit+plot",
@@ -321,6 +342,8 @@ def main() -> None:
                     f"tip_xyz_c: [{tip_xyz_c_mm[0]:8.2f}, {tip_xyz_c_mm[1]:8.2f}, {tip_xyz_c_mm[2]:8.2f}]",
                     f"markers used: {n_markers}",
                     f"reproj mean px: {reproj_mean_px:.3f}",
+                    f"reproj med  px: {reproj_median_px:.3f}",
+                    f"reproj max  px: {reproj_max_px:.3f}",
                 ])
             else:
                 if last_dx_mm is not None:
@@ -368,6 +391,9 @@ def main() -> None:
                     "reproj_max_px": float(reproj_max_px),
                     "marker_ids_used": np.asarray(result.marker_ids_used, dtype=np.int64).copy(),
                     "n_markers": int(n_markers),
+                    "pose_method": str(POSE_METHOD),
+                    "use_extrinsic_guess_cfg": bool(USE_EXTRINSIC_GUESS),
+                    "use_extrinsic_guess_now": bool(used_guess),
                 }
                 records.append(record)
 
@@ -378,7 +404,8 @@ def main() -> None:
                     f"d_x = {d_x_mm:.3f} mm, "
                     f"z_c = {tip_xyz_c_mm[2]:.3f} mm, "
                     f"n_markers = {record['n_markers']}, "
-                    f"reproj_mean = {record['reproj_mean_px']:.3f}px"
+                    f"reproj_mean = {record['reproj_mean_px']:.3f}px, "
+                    f"use_guess_now = {record['use_extrinsic_guess_now']}"
                 )
 
     finally:

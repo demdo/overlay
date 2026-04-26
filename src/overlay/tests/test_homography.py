@@ -10,12 +10,15 @@ OpenCV-only test harness (matches the NEW xray_marker_selection API):
 - Select 3 anchor markers (LMB), RMB undo, ESC reset selection
 - After 3 anchors:
     * compute ROI (roi_uv, roi_idx, dbg)  [roi_uv is grid-ordered row-major]
-    * build correspondences (XY in mm, uv in px) in a GUARANTEED consistent ordering
+    * build correspondences using canonical board coordinates
     * estimate homography (grid -> image) and print H + reprojection error
-    * save:
+    * optional save (controlled by global flags):
         - "<image_stem>__H.npz"
-        - "<image_stem>__uv.txt"   (one row per point: "u v")
-        - "<image_stem>__XY.txt"   (one row per point: "X Y")
+        - "<image_stem>__corr.npz"
+        - "<image_stem>__reproj_error.npz"
+        - "<image_stem>__reproj_stats.npz"
+        - "<image_stem>__uv.txt"
+        - "<image_stem>__XY.txt"
 
 NO circles_grid, NO circles_sorted, NO cell-based selection.
 """
@@ -24,7 +27,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List
 
 import cv2
 import numpy as np
@@ -33,13 +36,26 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 from overlay.tools.blob_detection import HoughCircleParams
 from overlay.tools.xray_marker_selection import run_xray_marker_detection, compute_roi_from_grid
 from overlay.tools.homography import (
+    build_board_xyz_canonical,
     estimate_homography_dlt,
     homography_reproj_stats,
     project_homography,
-    build_planar_correspondences,  # NEW: now consumes (roi_uv, dbg)
 )
 
 WIN = "test_homography (LMB detect/select, RMB undo, ESC reset selection, Q quit)"
+
+
+# ============================================================
+# GLOBAL SAVE FLAGS
+# ============================================================
+
+SAVE_ENABLE = True
+
+SAVE_HOMOGRAPHY = False
+SAVE_CORRESPONDENCES = False
+SAVE_ERROR_STATS = False
+SAVE_ERROR_VECTOR = True
+SAVE_DEBUG_TXT = False
 
 
 # ============================================================
@@ -112,21 +128,18 @@ def _render_overlay(
     circle_r = int(round(roi_r))
     cross_r = int(round(0.6 * roi_r))
 
-    # all detected circles (green rings)
     xy = circles[:, :2].astype(np.float64)
     for (x, y) in xy:
         if not (np.isfinite(x) and np.isfinite(y)):
             continue
         cv2.circle(out, (int(round(x)), int(round(y))), circle_r, (0, 255, 0), 2, cv2.LINE_AA)
 
-    # selected anchors (cyan crosses)
     for k in selected_idx:
         x, y, _r = circles[k]
         if not (np.isfinite(x) and np.isfinite(y)):
             continue
         _draw_cross(out, int(round(x)), int(round(y)), cross_r, color=(255, 255, 0), thick=2)
 
-    # ROI points (red crosses) - as returned by compute_roi_from_grid (row-major)
     if roi_uv is not None and len(roi_uv) > 0:
         uv = np.asarray(roi_uv, dtype=np.float64).reshape(-1, 2)
         for (u, v) in uv:
@@ -134,7 +147,6 @@ def _render_overlay(
                 continue
             _draw_cross(out, int(round(u)), int(round(v)), cross_r, color=(0, 0, 255), thick=2)
 
-    # Correspondence uv used for homography (cyan rings)
     if corr_uv is not None and len(corr_uv) > 0:
         uv = np.asarray(corr_uv, dtype=np.float64).reshape(-1, 2)
         for (u, v) in uv:
@@ -147,7 +159,7 @@ def _render_overlay(
 
 
 # ============================================================
-# Selection: nearest circle in circles (N,3)
+# Selection helper
 # ============================================================
 
 def _nearest_circle_index(circles: np.ndarray, u_click: int, v_click: int) -> Optional[int]:
@@ -216,7 +228,7 @@ def main() -> None:
     )
 
     pitch_mm = 2.54
-    gate_tol_pitch = 0.40  # if corner missing: try 0.45; if false points: 0.35
+    gate_tol_pitch = 0.40
 
     circles: Optional[np.ndarray] = None
     pick_radius_px: float = 20.0
@@ -285,7 +297,6 @@ def main() -> None:
 
         margin_px = 1.1 * float(pick_radius_px)
 
-        # --- compute ROI (row-major ordered uv) ---
         roi_uv_, roi_idx_, dbg = compute_roi_from_grid(
             circles=circles,
             anchor_idx=selected_idx,
@@ -302,44 +313,48 @@ def main() -> None:
             f"nu0={dbg['nu0']} nv0={dbg['nv0']} -> nu={dbg['nu']} nv={dbg['nv']}"
         )
 
-        # --- build correspondences (XY row-major + uv row-major) ---
-        XY, uv, meta = build_planar_correspondences(
-            roi_uv=roi_uv,
-            dbg=dbg,
+        # --- build correspondences using canonical board coordinates ---
+        uv = roi_uv.copy()
+
+        XYZ = build_board_xyz_canonical(
+            nu=int(dbg["nu"]),
+            nv=int(dbg["nv"]),
             pitch_mm=pitch_mm,
         )
-        XY = np.asarray(XY, dtype=np.float64).reshape(-1, 2)
-        uv = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
-        
-        # save correspondences
-        corr_path = img_path.with_suffix("").with_name(
-            img_path.with_suffix("").name + "__corr.npz"
-        )
-        
-        np.savez(
-            corr_path,
-            XY=XY.astype(np.float64),
-            uv=uv.astype(np.float64),
-        )
-        
-        print(f"[OK] saved correspondences -> {corr_path}")
+        XY = XYZ[:, :2].astype(np.float64)
 
-        # overlay rings = points actually used for H
-        uv_corr = uv.copy()
+        if uv.shape[0] != XY.shape[0]:
+            raise RuntimeError(
+                f"Mismatch between roi_uv and canonical board grid: "
+                f"{uv.shape[0]} uv points vs {XY.shape[0]} XY points."
+            )
 
         if uv.shape[0] < 4:
             raise RuntimeError(f"Need at least 4 correspondences for homography, got {uv.shape[0]}.")
 
-        # --- save correspondences as txt (for debugging) ---
-        uv_txt = img_path.with_suffix("").with_name(img_path.with_suffix("").name + "__uv.txt")
-        xy_txt = img_path.with_suffix("").with_name(img_path.with_suffix("").name + "__XY.txt")
-        #_save_uv_txt(uv_txt, uv)
-        #_save_xy_txt(xy_txt, XY)
+        if SAVE_ENABLE and SAVE_CORRESPONDENCES:
+            corr_path = img_path.with_suffix("").with_name(
+                img_path.with_suffix("").name + "__corr.npz"
+            )
+            np.savez(
+                corr_path,
+                XY=XY.astype(np.float64),
+                uv=uv.astype(np.float64),
+                XYZ=XYZ.astype(np.float64),
+            )
+            print(f"[OK] saved correspondences -> {corr_path}")
 
-        # --- estimate homography (grid -> image): XY -> uv ---
+        uv_corr = uv.copy()
+
+        if SAVE_ENABLE and SAVE_DEBUG_TXT:
+            uv_txt = img_path.with_suffix("").with_name(img_path.with_suffix("").name + "__uv.txt")
+            xy_txt = img_path.with_suffix("").with_name(img_path.with_suffix("").name + "__XY.txt")
+            _save_uv_txt(uv_txt, uv)
+            _save_xy_txt(xy_txt, XY)
+
+        # current API: estimate_homography_dlt(uv_img, XY_grid)
         H = estimate_homography_dlt(uv, XY)
 
-        # --- compute reprojection error vector ---
         uv_proj = project_homography(H, XY)
         finite = (
             np.isfinite(uv[:, 0]) & np.isfinite(uv[:, 1]) &
@@ -350,12 +365,46 @@ def main() -> None:
         else:
             e = np.empty((0,), dtype=np.float64)
 
-        # --- save homography only ---
-        npz_path = img_path.with_suffix("").with_name(img_path.with_suffix("").name + "__H.npz")
-        np.savez(npz_path, H=H)
-        print(f"[OK] saved homography -> {npz_path}")
+        if SAVE_ENABLE and SAVE_ERROR_VECTOR:
+            err_path = img_path.with_suffix("").with_name(
+                img_path.with_suffix("").name + "__reproj_error.npz"
+            )
+            np.savez(
+                err_path,
+                error_px=e.astype(np.float64),
+                uv=uv.astype(np.float64),
+                uv_proj=uv_proj.astype(np.float64),
+                XY=XY.astype(np.float64),
+                XYZ=XYZ.astype(np.float64),
+            )
+            print(f"[OK] saved reprojection errors -> {err_path}")
+
+        if SAVE_ENABLE and SAVE_HOMOGRAPHY:
+            npz_path = img_path.with_suffix("").with_name(
+                img_path.with_suffix("").name + "__H.npz"
+            )
+            np.savez(npz_path, H=H)
+            print(f"[OK] saved homography -> {npz_path}")
 
         mean_e, med_e, rmse_e = homography_reproj_stats(H, XY, uv)
+
+        if SAVE_ENABLE and SAVE_ERROR_STATS:
+            stats_path = img_path.with_suffix("").with_name(
+                img_path.with_suffix("").name + "__reproj_stats.npz"
+            )
+            np.savez(
+                stats_path,
+                mean_px=float(mean_e),
+                median_px=float(med_e),
+                rmse_px=float(rmse_e),
+                min_px=float(np.min(e)) if e.size else np.nan,
+                max_px=float(np.max(e)) if e.size else np.nan,
+                p95_px=float(np.percentile(e, 95)) if e.size else np.nan,
+                num_points=int(len(e)),
+                nu=int(dbg["nu"]),
+                nv=int(dbg["nv"]),
+            )
+            print(f"[OK] saved reprojection stats -> {stats_path}")
 
         np.set_printoptions(precision=6, suppress=True)
         print("\n================= Homography (DLT) =================")
@@ -422,7 +471,7 @@ def main() -> None:
         if key in (ord("q"), ord("Q")):
             break
 
-        if key == 27:  # ESC
+        if key == 27:
             if detected:
                 selected_idx = []
                 roi_uv = None

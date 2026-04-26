@@ -1,5 +1,3 @@
-# overlay/gui/pages/page_overlay_preview.py
-
 from __future__ import annotations
 
 import cv2
@@ -26,6 +24,13 @@ from overlay.gui.pages.templates.templ_live_image import LiveImagePage
 from overlay.tools.homography import estimate_plane_induced_homography
 from overlay.tools.warp import blend_xray_overlay
 from overlay.gui.widgets.widget_flow_layout import FlowLayout
+
+
+# ============================================================
+# Save config
+# ============================================================
+
+SAVE_OVERLAY_PREVIEW_RESULTS = True
 
 
 # ============================================================
@@ -74,10 +79,15 @@ class OverlayPreviewPage(LiveImagePage):
     --------
     - Live RGB video is shown on this page.
     - SPACE stores a frozen RGB snapshot locally on this page.
-    - Then the user can load an X-ray image.
+    - Then the user can load an anatomical X-ray image.
     - Then the user can compute the overlay.
     - Alpha changes reuse the cached warped X-ray only.
-    - Save Image stores the final overlay in native snapshot resolution.
+    - Save Image stores the main overlay result data as NPZ.
+
+    Important drawing rule
+    ----------------------
+    The pointer tip is always drawn LAST, i.e. in the foreground above the
+    X-ray overlay.
     """
 
     ALPHA_SLIDER_MAX = 100
@@ -117,7 +127,7 @@ class OverlayPreviewPage(LiveImagePage):
             "3) Click 'Load X-ray Image'\n"
             "4) Click 'Overlay' to warp X-ray onto the frozen RGB frame\n"
             "5) Adjust alpha with the slider\n"
-            "6) Click 'Save Image' to store the final overlay"
+            "6) Click 'Next' to continue to the live overlay page"
         )
 
         self._build_controls()
@@ -152,16 +162,16 @@ class OverlayPreviewPage(LiveImagePage):
 
         row_wrap = QWidget()
         row_wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
-        
+
         row = FlowLayout(row_wrap, spacing=12)
         row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(self.btn_load_xray)
         row.addWidget(self.btn_overlay)
         row.addWidget(self.btn_save_image)
-        
+
         self.controls_content.addWidget(row_wrap)
 
-        self.lbl_alpha = QLabel("Alpha: 0.500")
+        self.lbl_alpha = QLabel("Alpha 0.500")
         self.controls_content.addWidget(self.lbl_alpha)
 
         self.slider_alpha = QSlider(Qt.Horizontal)
@@ -180,21 +190,8 @@ class OverlayPreviewPage(LiveImagePage):
             self._last_stats_rows = list(rows)
 
     def stats_rows(self) -> list[tuple[str, str]]:
-        save_res = "-"
-        if self._overlay_bgr is not None:
-            h, w = self._overlay_bgr.shape[:2]
-            save_res = f"{w} x {h}"
-
-        pipe = getattr(self, "pipeline", None)
-
         return [
-            ("Live RGB", "Running" if pipe is not None else "-"),
-            ("Snapshot", "OK" if self._snapshot_taken else "-"),
-            ("Tip", "OK" if self.state.tip_uv_c is not None else "-"),
-            ("X-ray loaded", "Yes" if self._xray_loaded else "No"),
-            ("Overlay", "Done" if self._overlay_done else "No"),
             ("Alpha", f"{self._alpha:.3f}" if self._overlay_done else "-"),
-            ("Save resolution", save_res if self._overlay_done else "-"),
             ("d_x", f"{self.state.d_x:.3f} mm" if self.state.d_x is not None else "-"),
         ]
 
@@ -211,20 +208,23 @@ class OverlayPreviewPage(LiveImagePage):
             and self.state.d_x is not None
         )
 
-    def _build_snapshot_base(self) -> None:
-        self._snapshot_rgb_with_tip_bgr = None
-
-        if self._snapshot_rgb_bgr is None:
-            return
-
-        self._snapshot_rgb_with_tip_bgr = _draw_point(
-            self._snapshot_rgb_bgr,
+    def _draw_tip_on_top(self, img: np.ndarray) -> np.ndarray:
+        return _draw_point(
+            img,
             self.state.tip_uv_c,
             color=(0, 0, 255),
             radius=8,
             cross_size=20,
             thickness=2,
         )
+
+    def _build_snapshot_base(self) -> None:
+        self._snapshot_rgb_with_tip_bgr = None
+
+        if self._snapshot_rgb_bgr is None:
+            return
+
+        self._snapshot_rgb_with_tip_bgr = self._draw_tip_on_top(self._snapshot_rgb_bgr)
 
     def _current_display_image(self) -> np.ndarray | None:
         if self._overlay_done and self._overlay_bgr is not None:
@@ -243,7 +243,7 @@ class OverlayPreviewPage(LiveImagePage):
         self.btn_save_image.setEnabled(self._overlay_done and self._overlay_bgr is not None)
         self.slider_alpha.setEnabled(self._overlay_done)
 
-        self.lbl_alpha.setText(f"Alpha: {self._alpha:.3f}")
+        self.lbl_alpha.setText(f"Alpha {self._alpha:.3f}")
 
     def _compute_H_xc(self) -> np.ndarray:
         T_xc = np.asarray(self.state.T_xc, dtype=np.float64)
@@ -273,6 +273,78 @@ class OverlayPreviewPage(LiveImagePage):
 
         self.state.H_xc = None
 
+    def _save_overlay_results(self) -> Path | None:
+        if not SAVE_OVERLAY_PREVIEW_RESULTS:
+            return None
+
+        if not self._overlay_done or self._overlay_bgr is None:
+            return None
+
+        out_dir = Path.cwd()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = out_dir / f"overlay_preview_{stamp}.npz"
+
+        xray_image_path = (
+            self.state.xray_image_anatomy_path
+            if self.state.xray_image_anatomy_path is not None
+            else ""
+        )
+
+        np.savez(
+            out_path,
+
+            # -------------------------------------------------
+            # Main result images
+            # -------------------------------------------------
+            snapshot_rgb_bgr=self._snapshot_rgb_bgr,
+            snapshot_rgb_with_tip_bgr=self._snapshot_rgb_with_tip_bgr,
+            xray_gray_u8=self._xray_gray_u8,
+            overlay_bgr=self._overlay_bgr,
+
+            # -------------------------------------------------
+            # Main overlay result
+            # -------------------------------------------------
+            H_xc=self.state.H_xc,
+            alpha=np.array(self._alpha, dtype=np.float64),
+            d_x=np.array(
+                self.state.d_x if self.state.d_x is not None else np.nan,
+                dtype=np.float64,
+            ),
+
+            # -------------------------------------------------
+            # Calibration / pose
+            # -------------------------------------------------
+            K_rgb=self.state.K_rgb,
+            K_xray=self.state.K_xray,
+            T_cx=self.state.T_cx,
+            T_xc=self.state.T_xc,
+            T_tc=self.state.T_tc,
+
+            # -------------------------------------------------
+            # Pointer
+            # -------------------------------------------------
+            tip_uv_c=self.state.tip_uv_c,
+            tip_xyz_c=self.state.tip_xyz_c,
+
+            # -------------------------------------------------
+            # Correspondences from previous steps
+            # -------------------------------------------------
+            xray_points_uv=self.state.xray_points_uv,
+            xray_points_xyz_c=self.state.xray_points_xyz_c,
+            checkerboard_corners_uv=self.state.checkerboard_corners_uv,
+            checkerboard_corners_uv_9=self.state.checkerboard_corners_uv_9,
+
+            # -------------------------------------------------
+            # Metadata / bookkeeping
+            # -------------------------------------------------
+            xray_image_path=np.array(xray_image_path, dtype=object),
+            snapshot_taken=np.array(self._snapshot_taken, dtype=bool),
+            xray_loaded=np.array(self._xray_loaded, dtype=bool),
+            overlay_done=np.array(self._overlay_done, dtype=bool),
+        )
+
+        return out_path
+
     # ---------------------------------------------------------
     # Template hooks
     # ---------------------------------------------------------
@@ -297,7 +369,7 @@ class OverlayPreviewPage(LiveImagePage):
             img = self.color_frame_to_bgr(cf)
             if img is None:
                 return self._live_color
-            
+
             self._live_color = img
             return img
 
@@ -403,20 +475,20 @@ class OverlayPreviewPage(LiveImagePage):
                 raise ValueError("Could not read image.")
 
             self._xray_gray_u8 = img
+            self.state.xray_image_anatomy = img.copy()
+            self.state.xray_image_anatomy_path = path
 
-            # reset local overlay state
             self._overlay_cache = None
             self._overlay_bgr = None
             self._overlay_done = False
             self._xray_loaded = True
             self._alpha = 0.5
+
             self.slider_alpha.blockSignals(True)
             self.slider_alpha.setValue(int(round(self._alpha * self.ALPHA_SLIDER_MAX)))
             self.slider_alpha.blockSignals(False)
 
-            # H_xc is not valid until Overlay is pressed
             self.state.H_xc = None
-
             self._mode = "frozen"
 
             self._update_controls()
@@ -438,7 +510,7 @@ class OverlayPreviewPage(LiveImagePage):
             )
             return
 
-        if self._xray_gray_u8 is None or self._snapshot_rgb_with_tip_bgr is None:
+        if self._xray_gray_u8 is None or self._snapshot_rgb_bgr is None:
             QMessageBox.information(
                 self,
                 "Overlay Preview",
@@ -451,11 +523,13 @@ class OverlayPreviewPage(LiveImagePage):
             self.state.H_xc = H_xc
 
             out_bgr, cache = blend_xray_overlay(
-                camera_bgr=self._snapshot_rgb_with_tip_bgr,
+                camera_bgr=self._snapshot_rgb_bgr,
                 xray_gray_u8=self._xray_gray_u8,
                 H_xc=self.state.H_xc,
                 alpha=self._alpha,
             )
+
+            out_bgr = self._draw_tip_on_top(out_bgr)
 
             self._overlay_cache = cache
             self._overlay_bgr = out_bgr
@@ -475,160 +549,54 @@ class OverlayPreviewPage(LiveImagePage):
                 "Overlay failed",
                 str(e),
             )
-    
-    """
+
     def save_image_clicked(self) -> None:
         if not self._overlay_done or self._overlay_bgr is None:
             QMessageBox.information(
                 self,
-                "Save Image",
+                "Save Overlay Results",
                 "Please create the overlay first.",
             )
             return
-    
+
         try:
-            default_path = Path.cwd() / "overlay_preview.png"
-    
-            path, _ = QFileDialog.getSaveFileName(
-                self,
-                "Save Overlay Image",
-                str(default_path),
-                "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg);;Bitmap (*.bmp);;TIFF Image (*.tif *.tiff)"
-            )
-    
-            if not path:
+            out_path = self._save_overlay_results()
+
+            if out_path is None:
+                QMessageBox.information(
+                    self,
+                    "Save Overlay Results",
+                    "Saving is disabled.",
+                )
                 return
-    
-            ok = cv2.imwrite(path, self._overlay_bgr)
-            if not ok:
-                raise IOError("cv2.imwrite returned False.")
-    
+
             QMessageBox.information(
                 self,
-                "Save Image",
-                f"Image saved successfully:\n\n{path}",
+                "Save Overlay Results",
+                f"Overlay results saved successfully:\n\n{out_path}",
             )
-    
+
         except Exception as e:
             QMessageBox.critical(
                 self,
-                "Save Image",
-                f"Failed to save image.\n\n{e}",
+                "Save Overlay Results",
+                f"Failed to save overlay results.\n\n{e}",
             )
-    
-    """
-    def save_image_clicked(self) -> None:
-        if not self._overlay_done or self._overlay_bgr is None:
-            QMessageBox.information(
-                self,
-                "Save Debug Data",
-                "Please create the overlay first.",
-            )
-            return
-    
-        try:
-            out_dir = Path.cwd()
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = out_dir / f"overlay_debug_{stamp}.npz"
-    
-            xray_image_path = (
-                self.state.xray_image_path
-                if self.state.xray_image_path is not None
-                else ""
-            )
-    
-            np.savez(
-                out_path,
-    
-                # -------------------------------------------------
-                # Images / arrays relevant for offline debugging
-                # -------------------------------------------------
-                live_color=self._live_color,
-                snapshot_rgb_bgr=self._snapshot_rgb_bgr,
-                snapshot_rgb_with_tip_bgr=self._snapshot_rgb_with_tip_bgr,
-                xray_gray_u8=self._xray_gray_u8,
-                overlay_bgr=self._overlay_bgr,
-    
-                # -------------------------------------------------
-                # Intrinsics / transforms
-                # -------------------------------------------------
-                K_rgb=self.state.K_rgb,
-                K_xray=self.state.K_xray,
-                T_cx=self.state.T_cx,
-                T_xc=self.state.T_xc,
-                T_tc=self.state.T_tc,
-                H_xc=self.state.H_xc,
-    
-                # -------------------------------------------------
-                # Pointer / depth
-                # -------------------------------------------------
-                tip_uv_c=self.state.tip_uv_c,
-                tip_xyz_c=self.state.tip_xyz_c,
-                d_x=np.array(
-                    self.state.d_x if self.state.d_x is not None else np.nan,
-                    dtype=np.float64,
-                ),
-    
-                # -------------------------------------------------
-                # X-ray / plane fitting data
-                # -------------------------------------------------
-                xray_image=self.state.xray_image,
-                xray_image_path=np.array(xray_image_path, dtype=object),
-                xray_points_uv=self.state.xray_points_uv,
-                xray_points_xyz_c=self.state.xray_points_xyz_c,
-                xray_marker_overlay_bgr=self.state.xray_marker_overlay_bgr,
-    
-                marker_radius_px=np.array(
-                    self.state.marker_radius_px
-                    if self.state.marker_radius_px is not None
-                    else np.nan,
-                    dtype=np.float64,
-                ),
-                pnp_ransac_threshold_px=np.array(
-                    self.state.pnp_ransac_threshold_px
-                    if self.state.pnp_ransac_threshold_px is not None
-                    else np.nan,
-                    dtype=np.float64,
-                ),
-    
-                # -------------------------------------------------
-                # Flags / bookkeeping
-                # -------------------------------------------------
-                xray_points_confirmed=np.array(self.state.xray_points_confirmed, dtype=bool),
-                plane_confirmed=np.array(self.state.plane_confirmed, dtype=bool),
-                snapshot_taken=np.array(self._snapshot_taken, dtype=bool),
-                xray_loaded=np.array(self._xray_loaded, dtype=bool),
-                overlay_done=np.array(self._overlay_done, dtype=bool),
-                alpha=np.array(self._alpha, dtype=np.float64),
-            )
-    
-            QMessageBox.information(
-                self,
-                "Save Debug Data",
-                f"Debug data saved successfully:\n\n{out_path}",
-            )
-    
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Save Debug Data",
-                f"Failed to save debug data.\n\n{e}",
-            )
-    
-    
+
     def _on_alpha_changed(self, value: int) -> None:
         self._alpha = float(value) / float(self.ALPHA_SLIDER_MAX)
 
         if (
             self._overlay_done
             and self._overlay_cache is not None
-            and self._snapshot_rgb_with_tip_bgr is not None
+            and self._snapshot_rgb_bgr is not None
         ):
             try:
-                self._overlay_bgr = self._overlay_cache.blend(
-                    self._snapshot_rgb_with_tip_bgr,
+                out_bgr = self._overlay_cache.blend(
+                    self._snapshot_rgb_bgr,
                     alpha=self._alpha,
                 )
+                self._overlay_bgr = self._draw_tip_on_top(out_bgr)
             except Exception as e:
                 QMessageBox.critical(self, "Alpha update failed", str(e))
                 return
@@ -650,7 +618,7 @@ class OverlayPreviewPage(LiveImagePage):
             self._update_panels()
             self.update_view()
             return
-    
+
         try:
             if getattr(self, "pipeline", None) is None:
                 self.start_realsense(
@@ -659,17 +627,14 @@ class OverlayPreviewPage(LiveImagePage):
                     depth_size=None,
                     align_to=None,
                 )
-    
-            # IMPORTANT:
-            # each time this page is entered, start fresh:
-            # live video only, no old snapshot / no old xray / no old overlay
+
             self._reset_page_state()
-    
+
             self.start_timer(self.FPS)
             self._mode = "preview"
             self.set_viewport_background(active=True)
             self.setFocus()
-    
+
         except Exception as e:
             self.stop_timer()
             self.stop_realsense()
@@ -681,38 +646,30 @@ class OverlayPreviewPage(LiveImagePage):
                 "Camera",
                 f"Could not open RealSense camera.\n\n{e}",
             )
-    
+
         self._update_controls()
         self._update_panels()
         self.update_view()
 
     def on_leave(self) -> None:
         super().on_leave()
-        
+
     def _reset_page_state(self) -> None:
-        # local page-only state
         self._xray_gray_u8 = None
         self._snapshot_rgb_bgr = None
         self._snapshot_rgb_with_tip_bgr = None
-    
+
         self._overlay_cache = None
         self._overlay_bgr = None
-    
+
         self._alpha = 0.5
         self._snapshot_taken = False
         self._xray_loaded = False
         self._overlay_done = False
-    
+
         self.slider_alpha.blockSignals(True)
         self.slider_alpha.setValue(int(round(self._alpha * self.ALPHA_SLIDER_MAX)))
         self.slider_alpha.blockSignals(False)
-    
-        # overlay result in SessionState is no longer valid
+
         self.state.H_xc = None
-    
         self._last_stats_rows = None
-        
-        
-        
-        
-        
