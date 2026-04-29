@@ -11,13 +11,10 @@ RAW-only Debug-Skript:
 - ROI wird direkt in RAW-Koordinaten berechnet
 - points_uv werden direkt in RAW als NPZ gespeichert
 
-Ziel:
-- keine Rotation
-- keine Rücktransformation
-- kein Laden von pose/xyz-NPZ
-- später PnP direkt mit diesen RAW-UV testen
-
 Steuerung:
+  USE_FLIPPING = True   -> current/default behavior: flipped X-ray/source ordering
+  USE_FLIPPING = False  -> unflipped camera-view ordering
+
   Linksklick  = Anchor wählen
   R           = Reset
   Q / ESC     = Beenden
@@ -43,6 +40,8 @@ from overlay.tools.xray_marker_selection import (
 
 # ── Konfiguration ─────────────────────────────────────────────────────────────
 
+USE_FLIPPING = False  # default: True
+
 OUT_UV_PATH_DEFAULT = (
     r"C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Data\uv_debug_raw.npz"
 )
@@ -58,7 +57,7 @@ HOUGH_PARAMS = HoughCircleParams(
     median_ks=(3, 5),
 )
 
-N_LABEL = 11  # erste 11 Punkte beschriften
+N_LABEL = 11
 
 DISPLAY_MAX_W = 1024
 DISPLAY_MAX_H = 1024
@@ -174,6 +173,7 @@ def print_roi_debug(title: str, roi_uv: np.ndarray, dbg: dict) -> None:
     print("\n" + "═" * 72)
     print(title)
     print(f"  Punkte gefunden: {N}  (erwartet: {(nu + 1)}*{(nv + 1)} = {expected})")
+    print(f"  USE_FLIPPING = {USE_FLIPPING}")
     print(f"  nu={nu}  nv={nv}  pitch={dbg['pitch']:.2f}px")
     print(f"  Lu={dbg['Lu']:.1f}px  Lv={dbg['Lv']:.1f}px")
     print(f"  tol_px={dbg['tol_px']:.2f}  gate_tol_pitch={dbg['gate_tol_pitch']}")
@@ -188,11 +188,17 @@ def print_roi_debug(title: str, roi_uv: np.ndarray, dbg: dict) -> None:
 
     print("\nErste Zeile:")
     for k in row0[:11]:
-        print(f"  [{k:3d}] i={gi[k]:2d} j={gj[k]:2d}  uv=({roi_uv[k,0]:8.2f}, {roi_uv[k,1]:8.2f})")
+        print(
+            f"  [{k:3d}] i={gi[k]:2d} j={gj[k]:2d}  "
+            f"uv=({roi_uv[k,0]:8.2f}, {roi_uv[k,1]:8.2f})"
+        )
 
     print("\nErste Spalte:")
     for k in col0[:11]:
-        print(f"  [{k:3d}] i={gi[k]:2d} j={gj[k]:2d}  uv=({roi_uv[k,0]:8.2f}, {roi_uv[k,1]:8.2f})")
+        print(
+            f"  [{k:3d}] i={gi[k]:2d} j={gj[k]:2d}  "
+            f"uv=({roi_uv[k,0]:8.2f}, {roi_uv[k,1]:8.2f})"
+        )
 
     if len(row0) >= 2:
         du = roi_uv[row0[1], 0] - roi_uv[row0[0], 0]
@@ -296,10 +302,19 @@ def draw_state(
             )
 
     h = vis.shape[0]
-    cv2.putText(vis, title, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(
         vis,
-        f"Anchors: {len(anchors)}/3  |  LMB=select  R=reset  Q=quit",
+        title,
+        (10, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        vis,
+        f"USE_FLIPPING={USE_FLIPPING} | Anchors: {len(anchors)}/3  |  LMB=select  R=reset  Q=quit",
         (10, h - 12),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
@@ -390,7 +405,12 @@ def main():
         print("[INFO] Kein Speicherpfad gewählt. Abbruch.")
         return
 
-    print(f"Lade Bild: {xray_path}")
+    print("\n" + "=" * 72)
+    print("DEBUG MARKER SELECTION")
+    print("=" * 72)
+    print(f"USE_FLIPPING = {USE_FLIPPING}")
+
+    print(f"\nLade Bild: {xray_path}")
     img_raw = load_xray(xray_path)
 
     print("Führe Marker-Detection auf RAW image durch...")
@@ -422,7 +442,6 @@ def main():
     roi_uv_raw: np.ndarray | None = None
     dbg: dict | None = None
 
-    # aktuelle Display-Transformation für korrektes Zurückrechnen der Klicks
     display_state = {
         "scale": 1.0,
         "off_x": 0,
@@ -454,7 +473,9 @@ def main():
         if nearest is None:
             return
 
-        d = np.linalg.norm(circles_raw[nearest, :2] - np.array([u_raw, v_raw], dtype=np.float64))
+        d = np.linalg.norm(
+            circles_raw[nearest, :2] - np.array([u_raw, v_raw], dtype=np.float64)
+        )
         if d > pick_r * 3.0:
             return
         if nearest in anchors:
@@ -468,7 +489,7 @@ def main():
 
         if len(anchors) == 3:
             try:
-                roi_uv_raw_, roi_idx, dbg_ = compute_roi_from_grid(
+                roi_uv_final_, roi_idx, dbg_ = compute_roi_from_grid(
                     circles=circles_raw,
                     anchor_idx=anchors,
                     margin_px=1.1 * pick_r,
@@ -476,16 +497,40 @@ def main():
                     min_steps=2,
                 )
 
-                roi_uv_raw = np.asarray(roi_uv_raw_, dtype=np.float64).reshape(-1, 2)
-                dbg = dbg_
+                roi_uv_final = np.asarray(roi_uv_final_, dtype=np.float64).reshape(-1, 2)
+
+                if USE_FLIPPING:
+                    # current behavior: flipped / X-ray-source ordering
+                    roi_uv_raw = roi_uv_final
+                    dbg = dict(dbg_)
+                    points_uv_to_save = roi_uv_raw
+                    save_mode = "WITH_FLIPPING"
+
+                else:
+                    # unflipped / camera-view ordering from marker-selection debug output
+                    roi_uv_raw = np.asarray(dbg_["debug_uv_raw"], dtype=np.float64).reshape(-1, 2)
+
+                    dbg = dict(dbg_)
+                    dbg["grid_i"] = dbg_["grid_i_raw"]
+                    dbg["grid_j"] = dbg_["grid_j_raw"]
+
+                    points_uv_to_save = roi_uv_raw
+                    save_mode = "WITHOUT_FLIPPING"
 
                 np.savez(
                     out_uv_path,
-                    points_uv=roi_uv_raw.astype(np.float64),
+                    points_uv=points_uv_to_save.astype(np.float64),
+                    points_uv_display=roi_uv_raw.astype(np.float64),
+                    use_flipping=np.array(USE_FLIPPING, dtype=bool),
+                    save_mode=np.array(save_mode),
+                    nu=np.array(int(dbg["nu"]), dtype=np.int32),
+                    nv=np.array(int(dbg["nv"]), dtype=np.int32),
                 )
-                print(f"[OK] saved RAW uv -> {out_uv_path}")
 
-                print_roi_debug("ROI DEBUG — RAW", roi_uv_raw, dbg)
+                print(f"[OK] saved RAW uv -> {out_uv_path}")
+                print(f"[OK] save_mode = {save_mode}")
+
+                print_roi_debug(f"ROI DEBUG — {save_mode}", roi_uv_raw, dbg)
 
             except Exception as e:
                 print(f"[ERR] compute_roi_from_grid: {e}")

@@ -22,6 +22,14 @@ from overlay.tools.warp import blend_xray_overlay
 
 
 # ============================================================
+# Config
+# ============================================================
+
+STEPS_PER_EDGE = 10
+GRID_SIZE = STEPS_PER_EDGE + 1
+
+
+# ============================================================
 # Qt helpers
 # ============================================================
 
@@ -156,6 +164,43 @@ def _safe_name(path: Path) -> str:
 
 
 # ============================================================
+# Flipping helper
+# ============================================================
+
+def undo_marker_selection_left_right_flip(
+    uv_final: np.ndarray,
+    *,
+    grid_size: int = GRID_SIZE,
+) -> np.ndarray:
+    """
+    Undo the LEFT-RIGHT correspondence flip from xray_marker_selection.
+
+    Important:
+    This does NOT mirror image coordinates.
+    It mirrors the point ordering within each row.
+
+    In marker selection:
+        j_xray = nu - j_cam
+
+    So the returned xray_points_uv are already ordered with flipped j.
+    To get the "without flipping" correspondences, we reverse each row again.
+    """
+    uv = np.asarray(uv_final, dtype=np.float64)
+
+    expected_n = grid_size * grid_size
+    if uv.shape != (expected_n, 2):
+        raise ValueError(
+            f"Expected uv shape ({expected_n}, 2) for a {grid_size}x{grid_size} grid, "
+            f"got {uv.shape}."
+        )
+
+    uv_grid = uv.reshape(grid_size, grid_size, 2)
+    uv_unflipped = uv_grid[:, ::-1, :].reshape(-1, 2)
+
+    return uv_unflipped
+
+
+# ============================================================
 # Data containers
 # ============================================================
 
@@ -190,7 +235,8 @@ class OverlayData:
             )
         else:
             raise ValueError(
-                "Overlay NPZ must contain either 'snapshot_rgb_with_tip_bgr' or 'snapshot_rgb_bgr'."
+                "Overlay NPZ must contain either 'snapshot_rgb_with_tip_bgr' "
+                "or 'snapshot_rgb_bgr'."
             )
 
         self.xray_gray_u8 = np.asarray(data["xray_gray_u8"])
@@ -249,28 +295,39 @@ def compute_T_cx_from_T_bc_T_bx(T_bc_mm: np.ndarray, T_bx_mm: np.ndarray) -> np.
     """
     T_cx_mm = np.asarray(T_bx_mm, dtype=np.float64) @ invert_transform(T_bc_mm)
     T_cx_m = T_cx_mm.copy()
-    T_cx_m[:3, 3] *= 1e-3  # mm -> m
+    T_cx_m[:3, 3] *= 1e-3
     return T_cx_m
 
 
 def recompute_dx_from_T_xc(T_xc_m: np.ndarray, T_tc_mm: np.ndarray) -> float:
-    """
-    Exact same logic as in the working overlay script:
-        T_cx = inv(T_xc)
-        convert T_cx translation m -> mm
-        T_tx = T_cx_mm @ T_tc_mm
-        d_x = z-component in X-ray frame (mm)
-    """
     T_xc_m = np.asarray(T_xc_m, dtype=np.float64).reshape(4, 4)
     T_tc_mm = np.asarray(T_tc_mm, dtype=np.float64).reshape(4, 4)
 
     T_cx_m = invert_transform(T_xc_m)
     T_cx_mm = T_cx_m.copy()
-    T_cx_mm[:3, 3] *= 1e3  # m -> mm
+    T_cx_mm[:3, 3] *= 1e3
 
     T_tx = T_cx_mm @ T_tc_mm
     tip_xyz_x_mm = T_tx[:3, 3]
     return float(tip_xyz_x_mm[2])
+
+
+def z_axis_angle_deg_from_T_cx(T_cx_m: np.ndarray) -> float:
+    """
+    Angle between camera z-axis and xray z-axis, both expressed in camera frame.
+
+    T_cx maps camera -> xray.
+    Therefore T_xc maps xray -> camera.
+    The xray z-axis expressed in camera coordinates is R_xc[:, 2].
+    The camera z-axis is [0, 0, 1].
+    """
+    T_xc_m = invert_transform(T_cx_m)
+    z_x_in_c = T_xc_m[:3, 2]
+    z_c = np.array([0.0, 0.0, 1.0])
+
+    dot = float(np.dot(z_c, z_x_in_c))
+    dot = float(np.clip(dot, -1.0, 1.0))
+    return float(np.degrees(np.arccos(dot)))
 
 
 # ============================================================
@@ -308,6 +365,135 @@ class OverlayImageWindow(QMainWindow):
 
 
 # ============================================================
+# Hand-eye run helper
+# ============================================================
+
+def run_ippe_handeye_case(
+    *,
+    label: str,
+    uv_xray: np.ndarray,
+    overlay_data: OverlayData,
+    K_xray: np.ndarray,
+    show_overlay: bool,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    print("\n" + "=" * 100)
+    print(label)
+    print("=" * 100)
+
+    res = solve_pose(
+        object_points_xyz=overlay_data.points_xyz_c_m,
+        image_points_uv=uv_xray,
+        K=K_xray,
+        dist_coeffs=None,
+        dist_coeffs_rgb=None,
+        pose_method="ippe_handeye",
+        checkerboard_corners_uv=overlay_data.checkerboard_corners_uv,
+        K_rgb=overlay_data.K_rgb,
+        steps_per_edge=STEPS_PER_EDGE,
+        refine_with_iterative=False,
+        refine_rgb_iterative=False,
+        refine_xray_iterative=False,
+    )
+
+    if res.all_candidates_rgb is None or len(res.all_candidates_rgb) != 2:
+        raise RuntimeError(
+            f"{label}: Expected exactly 2 RGB IPPE candidates, got "
+            f"{0 if res.all_candidates_rgb is None else len(res.all_candidates_rgb)}."
+        )
+
+    if res.all_candidates is None or len(res.all_candidates) != 2:
+        raise RuntimeError(
+            f"{label}: Expected exactly 2 X-ray IPPE candidates, got "
+            f"{0 if res.all_candidates is None else len(res.all_candidates)}."
+        )
+
+    print("\nRGB candidates:")
+    for rgb_idx, rgb_cand in enumerate(res.all_candidates_rgb):
+        T_bc_mm = make_transform(rgb_cand.rvec, rgb_cand.tvec)
+        print("\n" + "-" * 80)
+        print(f"RGB candidate {rgb_idx}")
+        print(f"reproj mean [px]    = {rgb_cand.reproj_mean_px:.6f}")
+        print(f"reproj median [px]  = {rgb_cand.reproj_median_px:.6f}")
+        print(f"reproj max [px]     = {rgb_cand.reproj_max_px:.6f}")
+        print("T_bc [mm] =")
+        print(format_matrix(T_bc_mm))
+
+    print("\nX-ray candidates:")
+    for xray_idx, xray_cand in enumerate(res.all_candidates):
+        T_bx_mm = make_transform(xray_cand.rvec, xray_cand.tvec)
+        print("\n" + "-" * 80)
+        print(f"XRAY candidate {xray_idx}")
+        print(f"reproj mean [px]    = {xray_cand.reproj_mean_px:.6f}")
+        print(f"reproj median [px]  = {xray_cand.reproj_median_px:.6f}")
+        print(f"reproj max [px]     = {xray_cand.reproj_max_px:.6f}")
+        print("T_bx [mm] =")
+        print(format_matrix(T_bx_mm))
+
+    # ------------------------------------------------------------
+    # Final selected result from solve_pose
+    # ------------------------------------------------------------
+    if not hasattr(res, "rvec") or not hasattr(res, "tvec"):
+        raise RuntimeError(
+            f"{label}: solve_pose result has no final rvec/tvec. "
+            "Cannot print final T_cx."
+        )
+
+    T_cx_final = make_transform(res.rvec, res.tvec)
+
+    # Safety: if translation looks like mm, convert to m.
+    # For T_cx we expect roughly meter-scale translation, not hundreds of meters.
+    if np.linalg.norm(T_cx_final[:3, 3]) > 10.0:
+        T_cx_final[:3, 3] *= 1e-3
+
+    T_xc_final = invert_transform(T_cx_final)
+    angle_z = z_axis_angle_deg_from_T_cx(T_cx_final)
+
+    print("\n" + "#" * 100)
+    print(f"FINAL SELECTED RESULT: {label}")
+    print("#" * 100)
+
+    print("\nT_cx final [m] =")
+    print(format_matrix(T_cx_final))
+
+    print("\nT_xc final [m] =")
+    print(format_matrix(T_xc_final))
+
+    print(f"\nangle(z_cam, z_xray expressed in camera) [deg] = {angle_z:.6f}")
+
+    # ------------------------------------------------------------
+    # Optional overlay for final selected pose
+    # ------------------------------------------------------------
+    overlay_bgr = None
+
+    if show_overlay:
+        d_x_mm = recompute_dx_from_T_xc(T_xc_final, overlay_data.T_tc_mm)
+
+        R_xc = T_xc_final[:3, :3]
+        t_xc = T_xc_final[:3, 3]
+
+        H_xc = estimate_plane_induced_homography(
+            K_c=overlay_data.K_rgb,
+            R_xc=R_xc,
+            t_xc=t_xc,
+            K_x=K_xray,
+            d_x=d_x_mm,
+        )
+
+        overlay_bgr, _ = blend_xray_overlay(
+            camera_bgr=overlay_data.camera_bgr,
+            xray_gray_u8=overlay_data.xray_gray_u8,
+            H_xc=H_xc,
+            alpha=overlay_data.alpha_nominal,
+        )
+
+        print(f"\nd_x final [mm] = {d_x_mm:+.6f}")
+        print("\nH_xc final =")
+        print(format_matrix(H_xc))
+
+    return T_cx_final, overlay_bgr
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -327,138 +513,76 @@ def main() -> int:
         K_xray = load_intrinsics_npz(intrinsics_path)
         intrinsic_name = _safe_name(intrinsics_path)
 
-        windows: list[OverlayImageWindow] = []
-
         print("\n" + "=" * 100)
-        print("HAND-EYE ALL SOLUTIONS: 2 RGB CANDIDATES × 2 XRAY CANDIDATES = 4 OVERLAYS")
+        print("IPPE HAND-EYE: WITH FLIPPING VS WITHOUT FLIPPING")
         print("=" * 100)
         print(f"Overlay NPZ:    {overlay_npz_path}")
         print(f"Intrinsics NPZ: {intrinsics_path}")
+
         print("\nK_xray =")
         print(format_matrix(K_xray))
 
-        res = solve_pose(
-            object_points_xyz=overlay_data.points_xyz_c_m,
-            image_points_uv=overlay_data.points_uv_x,
-            K=K_xray,
-            dist_coeffs=None,
-            dist_coeffs_rgb=None,
-            pose_method="ippe_handeye",
-            checkerboard_corners_uv=overlay_data.checkerboard_corners_uv,
-            K_rgb=overlay_data.K_rgb,
-            steps_per_edge=10,
-            refine_with_iterative=False,
-            refine_rgb_iterative=False,
-            refine_xray_iterative=False,
+        uv_with_flipping = overlay_data.points_uv_x
+        uv_without_flipping = undo_marker_selection_left_right_flip(
+            uv_with_flipping,
+            grid_size=GRID_SIZE,
         )
 
-        if res.all_candidates_rgb is None or len(res.all_candidates_rgb) != 2:
-            raise RuntimeError(
-                f"Expected exactly 2 RGB IPPE candidates, got "
-                f"{0 if res.all_candidates_rgb is None else len(res.all_candidates_rgb)}."
+        windows: list[OverlayImageWindow] = []
+
+        T_cx_with_flip, overlay_with_flip = run_ippe_handeye_case(
+            label="WITH FLIPPING (current xray_points_uv)",
+            uv_xray=uv_with_flipping,
+            overlay_data=overlay_data,
+            K_xray=K_xray,
+            show_overlay=True,
+        )
+
+        T_cx_without_flip, overlay_without_flip = run_ippe_handeye_case(
+            label="WITHOUT FLIPPING (row-wise unflipped correspondences)",
+            uv_xray=uv_without_flipping,
+            overlay_data=overlay_data,
+            K_xray=K_xray,
+            show_overlay=True,
+        )
+
+        print("\n" + "=" * 100)
+        print("FINAL COMPARISON")
+        print("=" * 100)
+
+        print("\nT_cx WITH flipping [m] =")
+        print(format_matrix(T_cx_with_flip))
+
+        print("\nT_cx WITHOUT flipping [m] =")
+        print(format_matrix(T_cx_without_flip))
+
+        angle_with = z_axis_angle_deg_from_T_cx(T_cx_with_flip)
+        angle_without = z_axis_angle_deg_from_T_cx(T_cx_without_flip)
+
+        print(f"\nangle(z_cam, z_xray) WITH flipping    [deg] = {angle_with:.6f}")
+        print(f"angle(z_cam, z_xray) WITHOUT flipping [deg] = {angle_without:.6f}")
+
+        if overlay_with_flip is not None:
+            win = OverlayImageWindow(
+                f"{intrinsic_name} | WITH flipping",
+                overlay_with_flip,
             )
+            win.show()
+            windows.append(win)
 
-        if res.all_candidates is None or len(res.all_candidates) != 2:
-            raise RuntimeError(
-                f"Expected exactly 2 X-ray IPPE candidates, got "
-                f"{0 if res.all_candidates is None else len(res.all_candidates)}."
+        if overlay_without_flip is not None:
+            win = OverlayImageWindow(
+                f"{intrinsic_name} | WITHOUT flipping",
+                overlay_without_flip,
             )
-
-        print("\n" + "#" * 100)
-        print("RGB CANDIDATES")
-        print("#" * 100)
-        for rgb_idx, rgb_cand in enumerate(res.all_candidates_rgb):
-            T_bc_mm = make_transform(rgb_cand.rvec, rgb_cand.tvec)
-            print(f"\nRGB candidate {rgb_idx}")
-            print(f"reproj mean [px]    = {rgb_cand.reproj_mean_px:.6f}")
-            print(f"reproj median [px]  = {rgb_cand.reproj_median_px:.6f}")
-            print(f"reproj max [px]     = {rgb_cand.reproj_max_px:.6f}")
-            print("T_bc [mm] =")
-            print(format_matrix(T_bc_mm))
-
-        print("\n" + "#" * 100)
-        print("XRAY CANDIDATES")
-        print("#" * 100)
-        for xray_idx, xray_cand in enumerate(res.all_candidates):
-            T_bx_mm = make_transform(xray_cand.rvec, xray_cand.tvec)
-            print(f"\nXRAY candidate {xray_idx}")
-            print(f"reproj mean [px]    = {xray_cand.reproj_mean_px:.6f}")
-            print(f"reproj median [px]  = {xray_cand.reproj_median_px:.6f}")
-            print(f"reproj max [px]     = {xray_cand.reproj_max_px:.6f}")
-            print("T_bx [mm] =")
-            print(format_matrix(T_bx_mm))
-
-        # =====================================================
-        # FULL COMBINATION: 2 RGB × 2 XRAY = 4 overlays
-        # =====================================================
-        for rgb_idx, rgb_cand in enumerate(res.all_candidates_rgb):
-            T_bc_mm = make_transform(rgb_cand.rvec, rgb_cand.tvec)
-
-            print("\n" + "=" * 100)
-            print(f"RGB CANDIDATE {rgb_idx}")
-            print("=" * 100)
-            print(f"reproj mean [px]    = {rgb_cand.reproj_mean_px:.6f}")
-            print(f"reproj median [px]  = {rgb_cand.reproj_median_px:.6f}")
-            print(f"reproj max [px]     = {rgb_cand.reproj_max_px:.6f}")
-            print("T_bc [mm] =")
-            print(format_matrix(T_bc_mm))
-
-            for xray_idx, xray_cand in enumerate(res.all_candidates):
-                T_bx_mm = make_transform(xray_cand.rvec, xray_cand.tvec)
-                T_cx_m = compute_T_cx_from_T_bc_T_bx(T_bc_mm, T_bx_mm)
-                T_xc_m = invert_transform(T_cx_m)
-
-                d_x_mm = recompute_dx_from_T_xc(T_xc_m, overlay_data.T_tc_mm)
-
-                R_xc = T_xc_m[:3, :3]
-                t_xc = T_xc_m[:3, 3]
-
-                H_xc = estimate_plane_induced_homography(
-                    K_c=overlay_data.K_rgb,
-                    R_xc=R_xc,
-                    t_xc=t_xc,
-                    K_x=K_xray,
-                    d_x=d_x_mm,
-                )
-
-                overlay_bgr, _ = blend_xray_overlay(
-                    camera_bgr=overlay_data.camera_bgr,
-                    xray_gray_u8=overlay_data.xray_gray_u8,
-                    H_xc=H_xc,
-                    alpha=overlay_data.alpha_nominal,
-                )
-
-                print("\n" + "-" * 100)
-                print(f"RGB {rgb_idx} + XRAY {xray_idx}")
-                print("-" * 100)
-                print(f"XRAY reproj mean [px]   = {xray_cand.reproj_mean_px:.6f}")
-                print(f"XRAY reproj median [px] = {xray_cand.reproj_median_px:.6f}")
-                print(f"XRAY reproj max [px]    = {xray_cand.reproj_max_px:.6f}")
-
-                print("\nT_bx [mm] =")
-                print(format_matrix(T_bx_mm))
-
-                print("\nT_cx [m] =")
-                print(format_matrix(T_cx_m))
-
-                print("\nT_xc [m] =")
-                print(format_matrix(T_xc_m))
-
-                print(f"\nd_x [mm] = {d_x_mm:+.6f}")
-
-                print("\nH_xc =")
-                print(format_matrix(H_xc))
-
-                title = f"{intrinsic_name} | RGB {rgb_idx} | XRAY {xray_idx}"
-                win = OverlayImageWindow(title, overlay_bgr)
-                win.show()
-                windows.append(win)
+            win.show()
+            windows.append(win)
 
         app._overlay_windows = windows
         return app.exec()
 
     except Exception as e:
-        QMessageBox.critical(None, "Hand-eye all-solutions overlay", str(e))
+        QMessageBox.critical(None, "IPPE hand-eye flip comparison", str(e))
         return 1
 
 

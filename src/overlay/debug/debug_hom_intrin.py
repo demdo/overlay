@@ -17,10 +17,15 @@ from overlay.calib.calib_xray_intrinsics import estimate_intrinsics_from_homogra
 
 ENFORCE_ZERO_SKEW = True
 IMAGE_SIZE = (1024, 1024)   # (width, height)
+
+LASER_CROSS_UV = (473.0, 424.0)
+
+FORCE_EQUAL_FOCAL_LENGTHS = True
+FIXED_FOCAL_LENGTH_PX = 4650.0
+
 PRINT_H_MATRICES = False
 PRINT_POINT_SAMPLES = False
 
-# Problematic views to exclude automatically if present
 EXCLUDE_VIEWS = set()
 
 
@@ -92,10 +97,7 @@ def load_homography_from_npz(npz_path: Path) -> np.ndarray:
             print(f"[INFO] {npz_path.name}: using fallback key '{key}'")
             return arr
 
-    raise KeyError(
-        f"{npz_path.name}: no homography found. "
-        f"Expected one of {preferred_keys} or any array with shape (3,3)."
-    )
+    raise KeyError(f"{npz_path.name}: no homography found.")
 
 
 def load_corr_from_npz(npz_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -114,14 +116,11 @@ def load_corr_from_npz(npz_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarr
     if uv.ndim != 2 or uv.shape[1] != 2:
         raise ValueError(f"{npz_path.name}: uv must have shape (N,2), got {uv.shape}")
     if len(XY) != len(uv):
-        raise ValueError(
-            f"{npz_path.name}: XY/uv count mismatch: {len(XY)} vs {len(uv)}"
-        )
+        raise ValueError(f"{npz_path.name}: XY/uv count mismatch: {len(XY)} vs {len(uv)}")
 
-    object_points_xyz = np.column_stack([
-        XY,
-        np.zeros((XY.shape[0], 1), dtype=np.float64),
-    ])
+    object_points_xyz = np.column_stack(
+        [XY, np.zeros((XY.shape[0], 1), dtype=np.float64)]
+    )
 
     return XY, uv, object_points_xyz
 
@@ -145,18 +144,10 @@ def find_matching_pairs(H_folder: Path, corr_folder: Path) -> list[tuple[str, Pa
     for corr_path in corr_files:
         corr_map[_stem_from_corr_file(corr_path)] = corr_path
 
-    print("\nH stems:")
-    for h_path in h_files:
-        print(f"  {h_path.name} -> {_stem_from_h_file(h_path)}")
-
-    print("\ncorr stems:")
-    for corr_path in corr_files:
-        print(f"  {corr_path.name} -> {_stem_from_corr_file(corr_path)}")
-
     pairs: list[tuple[str, Path, Path]] = []
     for h_path in h_files:
         stem = _stem_from_h_file(h_path)
-        corr_path = corr_map.get(stem, None)
+        corr_path = corr_map.get(stem)
         if corr_path is None:
             print(f"[SKIP] {h_path.name}: no matching corr file for stem '{stem}'")
             continue
@@ -186,8 +177,7 @@ def apply_homography(H: np.ndarray, XY: np.ndarray) -> np.ndarray:
     ones = np.ones((XY.shape[0], 1), dtype=np.float64)
     Xh = np.hstack([XY, ones])
     xh = (H @ Xh.T).T
-    uv = xh[:, :2] / xh[:, 2:3]
-    return uv
+    return xh[:, :2] / xh[:, 2:3]
 
 
 def compute_homography_reprojection_stats(
@@ -213,6 +203,7 @@ def compute_polygon_area(points_uv: np.ndarray) -> float:
     hull = cv2.convexHull(pts.astype(np.float32)).reshape(-1, 2)
     if hull.shape[0] < 3:
         return 0.0
+
     x = hull[:, 0]
     y = hull[:, 1]
     return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
@@ -235,22 +226,14 @@ def print_matrix(label: str, M: np.ndarray) -> None:
 # View analysis
 # ============================================================
 
-def analyze_single_view(
-    stem: str,
-    H_path: Path,
-    corr_path: Path,
-) -> dict:
+def analyze_single_view(stem: str, H_path: Path, corr_path: Path) -> dict:
     H = load_homography_from_npz(H_path)
     XY, uv, obj_xyz = load_corr_from_npz(corr_path)
 
     Hn = normalize_H(H)
     reproj = compute_homography_reprojection_stats(Hn, XY, uv)
 
-    cond_H = float(np.linalg.cond(Hn))
-    uv_area = compute_polygon_area(uv)
-    xy_area = compute_polygon_area(XY)
-
-    out = {
+    return {
         "stem": stem,
         "H_path": H_path,
         "corr_path": corr_path,
@@ -260,12 +243,11 @@ def analyze_single_view(
         "uv": uv,
         "obj_xyz": obj_xyz,
         "n_points": int(len(XY)),
-        "cond_H": cond_H,
-        "uv_area": uv_area,
-        "xy_area": xy_area,
+        "cond_H": float(np.linalg.cond(Hn)),
+        "uv_area": compute_polygon_area(uv),
+        "xy_area": compute_polygon_area(XY),
         **reproj,
     }
-    return out
 
 
 def print_view_summary(v: dict) -> None:
@@ -298,18 +280,13 @@ def print_view_summary(v: dict) -> None:
 
 def print_intrinsics_summary(label: str, K: np.ndarray, image_size: tuple[int, int]) -> None:
     w, h = image_size
-    fx = float(K[0, 0])
-    fy = float(K[1, 1])
-    cx = float(K[0, 2])
-    cy = float(K[1, 2])
-
     print(f"\n{label}")
     print("-" * len(label))
     print(K)
-    print(f"fx = {fx:.6f}")
-    print(f"fy = {fy:.6f}")
-    print(f"cx = {cx:.6f}")
-    print(f"cy = {cy:.6f}")
+    print(f"fx = {K[0,0]:.6f}")
+    print(f"fy = {K[1,1]:.6f}")
+    print(f"cx = {K[0,2]:.6f}")
+    print(f"cy = {K[1,2]:.6f}")
     print(f"principal point valid = {principal_point_valid(K, image_size)}")
     print(f"image width  = {w}")
     print(f"image height = {h}")
@@ -346,12 +323,12 @@ def run_leave_one_out_analysis(
     print("LEAVE-ONE-OUT ZHANG ANALYSIS")
     print("============================================================")
 
-    rows = []
-
     for i in range(len(views)):
         subset = [v for j, v in enumerate(views) if j != i]
         removed = views[i]["stem"]
         H_list = [v["H"] for v in subset]
+
+        print(f"\nRemoved view: {removed}")
 
         try:
             result = estimate_intrinsics_from_homographies(
@@ -360,42 +337,16 @@ def run_leave_one_out_analysis(
                 global_optimization=False,
             )
             K = result.K
-            ok = principal_point_valid(K, image_size)
-
-            row = {
-                "removed": removed,
-                "success": True,
-                "pp_valid": ok,
-                "fx": float(K[0, 0]),
-                "fy": float(K[1, 1]),
-                "cx": float(K[0, 2]),
-                "cy": float(K[1, 2]),
-            }
+            print("  success  = True")
+            print(f"  pp_valid = {principal_point_valid(K, image_size)}")
+            print(f"  fx = {K[0,0]:.6f}")
+            print(f"  fy = {K[1,1]:.6f}")
+            print(f"  cx = {K[0,2]:.6f}")
+            print(f"  cy = {K[1,2]:.6f}")
         except Exception as e:
-            row = {
-                "removed": removed,
-                "success": False,
-                "pp_valid": False,
-                "fx": np.nan,
-                "fy": np.nan,
-                "cx": np.nan,
-                "cy": np.nan,
-                "error": str(e),
-            }
-
-        rows.append(row)
-
-    for row in rows:
-        print(f"\nRemoved view: {row['removed']}")
-        print(f"  success  = {row['success']}")
-        print(f"  pp_valid = {row['pp_valid']}")
-        if row["success"]:
-            print(f"  fx = {row['fx']:.6f}")
-            print(f"  fy = {row['fy']:.6f}")
-            print(f"  cx = {row['cx']:.6f}")
-            print(f"  cy = {row['cy']:.6f}")
-        else:
-            print(f"  error = {row['error']}")
+            print("  success  = False")
+            print("  pp_valid = False")
+            print(f"  error = {e}")
 
 
 def run_subset_rankings(views: list[dict]) -> None:
@@ -421,7 +372,7 @@ def run_subset_rankings(views: list[dict]) -> None:
 
 
 # ============================================================
-# BA-only intrinsics refinement (no Zhang)
+# BA-only fixed focal length, free PP
 # ============================================================
 
 def _as_opencv_object_points(points: np.ndarray) -> np.ndarray:
@@ -438,93 +389,60 @@ def _as_opencv_image_points(points: np.ndarray) -> np.ndarray:
     return pts.astype(np.float32)
 
 
-def run_ba_only_all_views(
+def run_ba_fixed_f_free_pp(
     views: list[dict],
     image_size: tuple[int, int],
     *,
-    fix_principal_point: bool = True,
-    principal_point_mode: str = "image_center",
-    radial_model: str = "none",
+    fixed_f_px: float = 4650.0,
 ) -> tuple[np.ndarray, np.ndarray, float] | None:
-    """
-    Run direct OpenCV bundle adjustment on all views WITHOUT Zhang initialization.
-
-    Uses a manual intrinsic initialization:
-        fx = fy = 8000
-        cx, cy = image center
-    """
     print("\n============================================================")
-    if fix_principal_point:
-        print("BA-ONLY INTRINSICS (ALL VIEWS, NO ZHANG, PP FIXED)")
-    else:
-        print("BA-ONLY INTRINSICS (ALL VIEWS, NO ZHANG, PP FREE)")
+    print("BA-ONLY DEBUG: FIXED FOCAL LENGTH, FREE PRINCIPAL POINT")
     print("============================================================")
+    print(f"fixed fx = fy = {fixed_f_px:.6f}")
+    print("principal point initialized at image center")
+    print("NO SAVE")
 
-    allowed_models = {"none", "k1", "k1k2"}
-    if radial_model not in allowed_models:
-        raise ValueError(
-            f"radial_model must be one of {sorted(allowed_models)}, got {radial_model!r}"
-        )
+    object_points_cv = [_as_opencv_object_points(v["obj_xyz"]) for v in views]
+    image_points_cv = [_as_opencv_image_points(v["uv"]) for v in views]
 
     w, h = image_size
-
-    object_points_cv: list[np.ndarray] = []
-    image_points_cv: list[np.ndarray] = []
-
-    for v in views:
-        object_points_cv.append(_as_opencv_object_points(v["obj_xyz"]))
-        image_points_cv.append(_as_opencv_image_points(v["uv"]))
-
-    fx_init = 6000.0
-    fy_init = 6000.0
-
-    if principal_point_mode != "image_center":
-        raise ValueError(
-            f"Unsupported principal_point_mode: {principal_point_mode!r}. "
-            f"Use 'image_center'."
-        )
-
     cx_init = w / 2.0
     cy_init = h / 2.0
 
-    K_init = np.array([
-        [fx_init, 0.0, cx_init],
-        [0.0, fy_init, cy_init],
-        [0.0, 0.0, 1.0],
-    ], dtype=np.float64)
+    K_init = np.array(
+        [
+            [fixed_f_px, 0.0, cx_init],
+            [0.0, fixed_f_px, cy_init],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
 
     dist_init = np.zeros((8, 1), dtype=np.float64)
 
+    print("\nInitial K =")
+    print(K_init)
+
     flags = 0
     flags |= cv2.CALIB_USE_INTRINSIC_GUESS
+
+    # Fix focal length, allow principal point to move
+    flags |= cv2.CALIB_FIX_FOCAL_LENGTH
+    flags |= cv2.CALIB_FIX_ASPECT_RATIO
+
+    # No tangential / radial / thin-prism / tilted model
     flags |= cv2.CALIB_ZERO_TANGENT_DIST
-
-    if fix_principal_point:
-        flags |= cv2.CALIB_FIX_PRINCIPAL_POINT
-
+    flags |= cv2.CALIB_FIX_K1
+    flags |= cv2.CALIB_FIX_K2
+    flags |= cv2.CALIB_FIX_K3
+    flags |= cv2.CALIB_FIX_K4
+    flags |= cv2.CALIB_FIX_K5
+    flags |= cv2.CALIB_FIX_K6
     flags |= cv2.CALIB_FIX_S1_S2_S3_S4
     flags |= cv2.CALIB_FIX_TAUX_TAUY
 
-    if radial_model == "none":
-        flags |= cv2.CALIB_FIX_K1
-        flags |= cv2.CALIB_FIX_K2
-        flags |= cv2.CALIB_FIX_K3
-        flags |= cv2.CALIB_FIX_K4
-        flags |= cv2.CALIB_FIX_K5
-        flags |= cv2.CALIB_FIX_K6
-
-    elif radial_model == "k1":
-        flags |= cv2.CALIB_FIX_K2
-        flags |= cv2.CALIB_FIX_K3
-        flags |= cv2.CALIB_FIX_K4
-        flags |= cv2.CALIB_FIX_K5
-        flags |= cv2.CALIB_FIX_K6
-
-    elif radial_model == "k1k2":
-        flags |= cv2.CALIB_FIX_K3
-        flags |= cv2.CALIB_FIX_K4
-        flags |= cv2.CALIB_FIX_K5
-        flags |= cv2.CALIB_FIX_K6
+    # IMPORTANT:
+    # Do NOT set cv2.CALIB_FIX_PRINCIPAL_POINT
 
     criteria = (
         cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT,
@@ -543,22 +461,29 @@ def run_ba_only_all_views(
             criteria=criteria,
         )
     except Exception as e:
-        print("\n[FAIL] BA-only calibration failed")
+        print("\n[FAIL] BA fixed-f free-PP calibration failed")
         print(f"Reason: {e}")
         return None
 
-    print("\nBA-only result")
-    print("--------------")
+    print("\nBA fixed-f free-PP result")
+    print("-------------------------")
     print(K_ba)
     print(f"fx = {K_ba[0,0]:.6f}")
     print(f"fy = {K_ba[1,1]:.6f}")
+    print(f"fx - fy = {K_ba[0,0] - K_ba[1,1]:+.12f}")
     print(f"cx = {K_ba[0,2]:.6f}")
     print(f"cy = {K_ba[1,2]:.6f}")
     print(f"principal point valid = {principal_point_valid(K_ba, image_size)}")
     print(f"RMS reprojection error = {float(rms):.6f}")
+    print(f"dist coeffs = {np.asarray(dist_ba, dtype=np.float64).reshape(-1)}")
 
-    flat_dist = np.asarray(dist_ba, dtype=np.float64).reshape(-1)
-    print(f"dist coeffs = {flat_dist}")
+    print("\nPP displacement from image center:")
+    print(f"dcx = {K_ba[0,2] - cx_init:+.6f} px")
+    print(f"dcy = {K_ba[1,2] - cy_init:+.6f} px")
+
+    print("\nPP displacement from laser cross:")
+    print(f"dcx_laser = {K_ba[0,2] - LASER_CROSS_UV[0]:+.6f} px")
+    print(f"dcy_laser = {K_ba[1,2] - LASER_CROSS_UV[1]:+.6f} px")
 
     return K_ba, dist_ba, float(rms)
 
@@ -574,14 +499,14 @@ def filter_pairs(
     if not exclude_views:
         return pairs
 
-    filtered: list[tuple[str, Path, Path]] = []
-    removed: list[str] = []
+    filtered = []
+    removed = []
 
     for stem, h_path, corr_path in pairs:
         if any(view_name in stem for view_name in exclude_views):
             removed.append(stem)
-            continue
-        filtered.append((stem, h_path, corr_path))
+        else:
+            filtered.append((stem, h_path, corr_path))
 
     print("\n============================================================")
     print("PAIR FILTER")
@@ -616,6 +541,14 @@ def main() -> None:
     print(f"\nH folder:\n  {H_folder}")
     print(f"corr folder:\n  {corr_folder}")
 
+    print("\n============================================================")
+    print("CONFIG")
+    print("============================================================")
+    print(f"IMAGE_SIZE                  = {IMAGE_SIZE}")
+    print(f"LASER_CROSS_UV              = {LASER_CROSS_UV}")
+    print(f"FIXED_FOCAL_LENGTH_PX       = {FIXED_FOCAL_LENGTH_PX}")
+    print(f"ENFORCE_ZERO_SKEW           = {ENFORCE_ZERO_SKEW}")
+
     pairs = find_matching_pairs(H_folder, corr_folder)
     pairs = filter_pairs(pairs, EXCLUDE_VIEWS)
 
@@ -630,9 +563,7 @@ def main() -> None:
 
     min_views = 2 if ENFORCE_ZERO_SKEW else 3
     if len(views) < min_views:
-        raise RuntimeError(
-            f"Only {len(views)} valid views remain. Need at least {min_views}."
-        )
+        raise RuntimeError(f"Only {len(views)} valid views remain. Need at least {min_views}.")
 
     print("\n============================================================")
     print("GLOBAL SUMMARY")
@@ -644,40 +575,27 @@ def main() -> None:
     print(f"Worst per-view H reproj max = {np.max([v['max_px'] for v in views]):.6f}")
 
     run_subset_rankings(views)
-    _ = run_zhang_analysis(views, IMAGE_SIZE, enforce_zero_skew=ENFORCE_ZERO_SKEW)
-    run_leave_one_out_analysis(views, IMAGE_SIZE, enforce_zero_skew=ENFORCE_ZERO_SKEW)
 
-    ba_fixed = run_ba_only_all_views(
+    _ = run_zhang_analysis(
         views,
         IMAGE_SIZE,
-        fix_principal_point=True,
-        principal_point_mode="image_center",
-        radial_model="none",
+        enforce_zero_skew=ENFORCE_ZERO_SKEW,
     )
 
-    if ba_fixed is not None:
-        K_ba_fixed, dist_ba_fixed, rms_ba_fixed = ba_fixed
-
-        out_npz = H_folder / "xray_intrinsics_ba_fixed_pp.npz"
-        np.savez(
-            out_npz,
-            K_xray=np.asarray(K_ba_fixed, dtype=np.float64),
-            dist_coeffs=np.asarray(dist_ba_fixed, dtype=np.float64),
-            rms_reproj_error=np.array(rms_ba_fixed, dtype=np.float64),
-            image_size=np.array(IMAGE_SIZE, dtype=np.int32),
-            excluded_views=np.array(sorted(EXCLUDE_VIEWS), dtype=object),
-            used_view_names=np.array([v["stem"] for v in views], dtype=object),
-            method=np.array("ba_only_fixed_pp"),
-            principal_point_mode=np.array("image_center"),
-        )
-        print(f"\nSaved BA fixed-PP intrinsics to:\n  {out_npz}")
-
-    _ = run_ba_only_all_views(
+    run_leave_one_out_analysis(
         views,
         IMAGE_SIZE,
-        fix_principal_point=False,
-        principal_point_mode="image_center",
-        radial_model="none",
+        enforce_zero_skew=ENFORCE_ZERO_SKEW,
+    )
+
+    # ============================================================
+    # DEBUG ONLY: fixed f, free PP, no save
+    # ============================================================
+
+    _ = run_ba_fixed_f_free_pp(
+        views,
+        IMAGE_SIZE,
+        fixed_f_px=FIXED_FOCAL_LENGTH_PX,
     )
 
 

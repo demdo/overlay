@@ -8,7 +8,11 @@ Test:
 3) saved pose + FLIP_LR X-ray image + same H + explicit flipped RAW mask
 4) direct IPPE candidate 0 + FLIP_LR X-ray image + same H_direct + explicit flipped RAW mask
 5) direct IPPE candidate 1 + FLIP_LR X-ray image + same H_direct + explicit flipped RAW mask
-6) IPPE-Handeye selected + padded FLIP_LR around laser-cross u0 + explicit padded/flipped mask
+6) IPPE-Handeye selected + BASE K_xray + padded FLIP_LR around laser-cross u0
+7) NEW K_xray + IPPE-Handeye selected + padded FLIP_LR around PP / laser-cross u0
+8) NEW K_xray + IPPE-Handeye selected + normal FLIP_LR around image center + same H
+9) FX=FY laser-cross K_xray + IPPE-Handeye selected + padded FLIP_LR around PP / laser-cross u0
+10) IMAGE-CENTER FX=FY K_xray + IPPE-Handeye selected + normal FLIP_LR + same H
 """
 
 from __future__ import annotations
@@ -51,6 +55,17 @@ def pick_overlay_npz_file() -> Path | None:
     path, _ = QFileDialog.getOpenFileName(
         None,
         "Select overlay preview NPZ",
+        "",
+        "NPZ files (*.npz);;All files (*.*)",
+    )
+    return Path(path) if path else None
+
+
+def pick_intrinsics_npz_file(title: str) -> Path | None:
+    _ensure_qt_app()
+    path, _ = QFileDialog.getOpenFileName(
+        None,
+        title,
         "",
         "NPZ files (*.npz);;All files (*.*)",
     )
@@ -165,25 +180,24 @@ def _safe_name(path: Path) -> str:
     return path.stem.replace(" ", "_")
 
 
+def load_K_xray_from_intrinsics_npz(npz_path: Path) -> np.ndarray:
+    data = np.load(str(npz_path), allow_pickle=True)
+
+    for key in ["K_xray", "K", "camera_matrix"]:
+        if key in data:
+            return _as_mat33(data[key], key)
+
+    raise KeyError(
+        f"No K found in {npz_path.name}. Expected one of: K_xray, K, camera_matrix"
+    )
+
+
 def pad_and_flip_lr_about_u0(
     img_u8: np.ndarray,
     *,
     u0: float,
     border_value: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
-    """
-    Pad image horizontally so that u0 becomes the new image center, then flip LR.
-
-    Returns
-    -------
-    flipped : np.ndarray
-        Padded and horizontally flipped image.
-    T_pad : np.ndarray
-        Homography mapping original image coordinates to padded coordinates:
-            u_pad = u + pad_left
-    pad_left, pad_right : int
-        Padding amounts.
-    """
     img_u8 = np.asarray(img_u8)
     if img_u8.ndim != 2:
         raise ValueError(f"Expected 2D image/mask, got {img_u8.shape}")
@@ -309,6 +323,7 @@ def compute_H_xc_from_T_xc(
     data: OverlayData,
     T_xc_m: np.ndarray,
     d_x_mm: float | None = None,
+    K_xray: np.ndarray,
 ) -> tuple[np.ndarray, float]:
     if d_x_mm is None:
         d_x_mm = recompute_dx_from_T_xc(T_xc_m, data.T_tc)
@@ -317,7 +332,7 @@ def compute_H_xc_from_T_xc(
         K_c=data.K_rgb,
         R_xc=T_xc_m[:3, :3],
         t_xc=T_xc_m[:3, 3],
-        K_x=data.K_xray,
+        K_x=K_xray,
         d_x=d_x_mm,
     )
 
@@ -462,8 +477,16 @@ def main() -> int:
     if overlay_npz_path is None:
         return 0
 
+    intrinsics_npz_path_base = pick_intrinsics_npz_file(
+        "Select BASE X-ray intrinsics NPZ for blocks 1-6"
+    )
+    if intrinsics_npz_path_base is None:
+        return 0
+
     try:
         data = OverlayData(overlay_npz_path)
+        K_xray_base = load_K_xray_from_intrinsics_npz(intrinsics_npz_path_base)
+
         base_name = _safe_name(overlay_npz_path)
         windows: list[OverlayImageWindow] = []
 
@@ -471,9 +494,13 @@ def main() -> int:
         print("DEBUG XRAY IMAGE FLIPPING")
         print("=" * 120)
         print(f"Overlay NPZ: {overlay_npz_path}")
+        print(f"BASE intrinsics NPZ for blocks 1-6: {intrinsics_npz_path_base}")
 
-        print("\nK_xray =")
+        print("\nK_xray stored in overlay NPZ =")
         print(format_matrix(data.K_xray))
+
+        print("\nK_xray BASE used for blocks 1-6 =")
+        print(format_matrix(K_xray_base))
 
         print("\nSaved T_cx =")
         print(format_matrix(data.T_cx))
@@ -498,15 +525,16 @@ def main() -> int:
             data=data,
             T_xc_m=data.T_xc,
             d_x_mm=d_x_saved,
+            K_xray=K_xray_base,
         )
 
-        print("\nH_saved =")
+        print("\nH_saved recomputed with BASE K_xray =")
         print(format_matrix(H_saved))
 
         if data.H_xc_saved is not None:
-            print("\nH_xc saved in NPZ =")
+            print("\nH_xc saved in overlay NPZ =")
             print(format_matrix(data.H_xc_saved))
-            print("\nH_saved recomputed - H_xc saved =")
+            print("\nH_saved(BASE K) - H_xc saved in overlay NPZ =")
             print(format_matrix(H_saved - data.H_xc_saved))
 
         # ========================================================
@@ -519,13 +547,13 @@ def main() -> int:
         )
 
         print("\n" + "-" * 120)
-        print("1) SAVED POSE | X-ray RAW | H_saved | normal mask detection")
+        print("1) SAVED POSE | BASE K_xray | X-ray RAW | H_saved | normal mask detection")
         print("-" * 120)
         print(f"d_x [mm] = {d_x_saved:+.6f}")
 
         show_overlay(
             windows=windows,
-            title=f"{base_name} | 1 Saved pose | RAW | normal mask",
+            title=f"{base_name} | 1 BASE K | Saved pose | RAW | normal mask",
             overlay_bgr=overlay_saved_raw,
         )
 
@@ -539,13 +567,13 @@ def main() -> int:
         )
 
         print("\n" + "-" * 120)
-        print("2) SAVED POSE | X-ray FLIP_LR | same H_saved | normal mask detection")
+        print("2) SAVED POSE | BASE K_xray | X-ray FLIP_LR | same H_saved | normal mask")
         print("-" * 120)
         print(f"d_x [mm] = {d_x_saved:+.6f}")
 
         show_overlay(
             windows=windows,
-            title=f"{base_name} | 2 Saved pose | FLIP_LR | same H | normal mask",
+            title=f"{base_name} | 2 BASE K | Saved pose | FLIP_LR | same H | normal mask",
             overlay_bgr=overlay_saved_flip_same_H,
         )
 
@@ -561,13 +589,13 @@ def main() -> int:
         )
 
         print("\n" + "-" * 120)
-        print("3) SAVED POSE | FLIP_LR | same H_saved | explicit mask = flip(mask_raw)")
+        print("3) SAVED POSE | BASE K_xray | FLIP_LR | same H_saved | explicit flipped mask")
         print("-" * 120)
         print(f"d_x [mm] = {d_x_saved:+.6f}")
 
         show_overlay(
             windows=windows,
-            title=f"{base_name} | 3 Saved pose | FLIP_LR | same H | explicit flipped mask",
+            title=f"{base_name} | 3 BASE K | Saved pose | FLIP_LR | same H | explicit flipped mask",
             overlay_bgr=overlay_saved_flip_explicit_mask,
         )
 
@@ -575,13 +603,13 @@ def main() -> int:
         # 4/5) Direct IPPE candidates: FLIP_LR image, same H_direct
         # ========================================================
         print("\n" + "=" * 120)
-        print("DIRECT IPPE CANDIDATES | X-ray image FLIP_LR | same H_direct")
+        print("DIRECT IPPE CANDIDATES | BASE K_xray | X-ray image FLIP_LR | same H_direct")
         print("=" * 120)
 
         res_direct = solve_pose(
             object_points_xyz=data.points_xyz_c_m,
             image_points_uv=data.points_uv_x,
-            K=data.K_xray,
+            K=K_xray_base,
             dist_coeffs=None,
             pose_method="ippe",
             refine_with_iterative=False,
@@ -602,6 +630,7 @@ def main() -> int:
                 data=data,
                 T_xc_m=T_xc_direct_m,
                 d_x_mm=None,
+                K_xray=K_xray_base,
             )
 
             overlay_direct_flip = make_overlay_with_explicit_mask(
@@ -613,7 +642,7 @@ def main() -> int:
             )
 
             print("\n" + "-" * 120)
-            print(f"DIRECT IPPE candidate {cand_idx} | FLIP_LR | same H_direct | explicit flipped mask")
+            print(f"DIRECT IPPE candidate {cand_idx} | BASE K | FLIP_LR | same H_direct")
             print("-" * 120)
             print(f"reproj mean [px]    = {cand.reproj_mean_px:.6f}")
             print(f"reproj median [px]  = {cand.reproj_median_px:.6f}")
@@ -632,7 +661,7 @@ def main() -> int:
 
             show_overlay(
                 windows=windows,
-                title=f"{base_name} | Direct IPPE {cand_idx} | FLIP_LR | same H | explicit flipped mask",
+                title=f"{base_name} | 4/5 BASE K | Direct IPPE {cand_idx} | FLIP_LR",
                 overlay_bgr=overlay_direct_flip,
             )
 
@@ -640,7 +669,7 @@ def main() -> int:
         # 6) IPPE-Handeye selected: padded FLIP_LR around laser-cross u0
         # ========================================================
         print("\n" + "=" * 120)
-        print("6) IPPE HANDEYE SELECTED | padded FLIP_LR around laser-cross u0")
+        print("6) IPPE HANDEYE SELECTED | BASE K_XRAY | padded FLIP_LR around laser-cross u0")
         print("=" * 120)
 
         xray_flip_laser, T_pad_laser, pad_left, pad_right = pad_and_flip_lr_about_u0(
@@ -649,7 +678,7 @@ def main() -> int:
             border_value=0,
         )
 
-        mask_flip_laser, T_pad_mask, pad_left_m, pad_right_m = pad_and_flip_lr_about_u0(
+        mask_flip_laser, _, pad_left_m, pad_right_m = pad_and_flip_lr_about_u0(
             xray_mask_raw,
             u0=LASER_CROSS_U,
             border_value=0,
@@ -661,7 +690,7 @@ def main() -> int:
         res_handeye = solve_pose(
             object_points_xyz=data.points_xyz_c_m,
             image_points_uv=data.points_uv_x,
-            K=data.K_xray,
+            K=K_xray_base,
             dist_coeffs=None,
             dist_coeffs_rgb=None,
             pose_method="ippe_handeye",
@@ -698,11 +727,9 @@ def main() -> int:
             data=data,
             T_xc_m=T_xc_handeye_m,
             d_x_mm=None,
+            K_xray=K_xray_base,
         )
 
-        # Padding changes input pixel coordinates:
-        # u_pad = u + pad_left, so original u = inv(T_pad_laser) * u_pad.
-        # Do NOT compensate the flip here.
         H_handeye_padded = H_handeye @ np.linalg.inv(T_pad_laser)
 
         overlay_handeye_laser_flip = make_overlay_with_explicit_mask(
@@ -746,10 +773,580 @@ def main() -> int:
         show_overlay(
             windows=windows,
             title=(
-                f"{base_name} | 6 Handeye selected | "
+                f"{base_name} | 6 BASE K_xray | Handeye selected | "
                 f"padded FLIP_LR around laser u={LASER_CROSS_U:.0f}"
             ),
             overlay_bgr=overlay_handeye_laser_flip,
+        )
+
+        # ========================================================
+        # 7) Load additional NEW intrinsics
+        # ========================================================
+        print("\n" + "=" * 120)
+        print("7) LOAD NEW K_XRAY | recompute handeye + H | LASER/PP FLIP")
+        print("=" * 120)
+
+        intrinsics_npz_path_new = pick_intrinsics_npz_file(
+            "Select NEW X-ray intrinsics NPZ for block 7 LASER/PP FLIP"
+        )
+        if intrinsics_npz_path_new is None:
+            print("\n[INFO] No additional intrinsics selected. Skipping blocks 7, 8, 9 and 10.")
+            app._overlay_windows = windows
+            return app.exec()
+
+        K_xray_new = load_K_xray_from_intrinsics_npz(intrinsics_npz_path_new)
+
+        print(f"\nNEW intrinsics NPZ:\n  {intrinsics_npz_path_new}")
+
+        print("\nK_xray BASE used for blocks 1-6 =")
+        print(format_matrix(K_xray_base))
+
+        print("\nK_xray NEW used for block 7 =")
+        print(format_matrix(K_xray_new))
+
+        print("\nK_xray NEW - K_xray BASE =")
+        print(format_matrix(K_xray_new - K_xray_base))
+
+        laser_u_new = float(K_xray_new[0, 2])
+        print(f"\nUsing u0 from NEW K_xray principal point: {laser_u_new:.6f}")
+
+        xray_flip_laser_newK, T_pad_laser_newK, pad_left_newK, pad_right_newK = (
+            pad_and_flip_lr_about_u0(
+                xray_raw,
+                u0=laser_u_new,
+                border_value=0,
+            )
+        )
+
+        mask_flip_laser_newK, _, pad_left_m_newK, pad_right_m_newK = (
+            pad_and_flip_lr_about_u0(
+                xray_mask_raw,
+                u0=laser_u_new,
+                border_value=0,
+            )
+        )
+
+        if pad_left_newK != pad_left_m_newK or pad_right_newK != pad_right_m_newK:
+            raise RuntimeError("Image and mask padding do not match for new K.")
+
+        res_handeye_newK = solve_pose(
+            object_points_xyz=data.points_xyz_c_m,
+            image_points_uv=data.points_uv_x,
+            K=K_xray_new,
+            dist_coeffs=None,
+            dist_coeffs_rgb=None,
+            pose_method="ippe_handeye",
+            checkerboard_corners_uv=data.checkerboard_corners_uv,
+            K_rgb=data.K_rgb,
+            steps_per_edge=10,
+            refine_with_iterative=False,
+            refine_rgb_iterative=False,
+            refine_xray_iterative=False,
+        )
+
+        if (
+            res_handeye_newK.all_candidates_rgb is None
+            or len(res_handeye_newK.all_candidates_rgb) != 2
+        ):
+            raise RuntimeError("Expected exactly 2 RGB IPPE candidates for new-K handeye.")
+
+        if (
+            res_handeye_newK.all_candidates is None
+            or len(res_handeye_newK.all_candidates) != 2
+        ):
+            raise RuntimeError("Expected exactly 2 X-ray IPPE candidates for new-K handeye.")
+
+        if res_handeye_newK.candidate_index_rgb is None:
+            raise RuntimeError("No selected RGB candidate index returned for new-K handeye.")
+
+        if res_handeye_newK.candidate_index_xray is None:
+            raise RuntimeError("No selected X-ray candidate index returned for new-K handeye.")
+
+        rgb_idx_newK = int(res_handeye_newK.candidate_index_rgb)
+        xray_idx_newK = int(res_handeye_newK.candidate_index_xray)
+
+        rgb_cand_newK = res_handeye_newK.all_candidates_rgb[rgb_idx_newK]
+        xray_cand_newK = res_handeye_newK.all_candidates[xray_idx_newK]
+
+        T_bc_newK_mm = make_transform(rgb_cand_newK.rvec, rgb_cand_newK.tvec)
+        T_bx_newK_mm = make_transform(xray_cand_newK.rvec, xray_cand_newK.tvec)
+
+        T_cx_newK_m = compute_T_cx_from_T_bc_T_bx(T_bc_newK_mm, T_bx_newK_mm)
+        T_xc_newK_m = invert_transform(T_cx_newK_m)
+
+        H_newK, d_x_newK = compute_H_xc_from_T_xc(
+            data=data,
+            T_xc_m=T_xc_newK_m,
+            d_x_mm=None,
+            K_xray=K_xray_new,
+        )
+
+        H_newK_padded = H_newK @ np.linalg.inv(T_pad_laser_newK)
+
+        overlay_newK_laser_flip = make_overlay_with_explicit_mask(
+            camera_bgr=data.camera_bgr,
+            xray_gray_u8=xray_flip_laser_newK,
+            xray_fov_mask=mask_flip_laser_newK,
+            H_xc=H_newK_padded,
+            alpha=data.alpha,
+        )
+
+        print(f"selected RGB candidate   = {rgb_idx_newK}")
+        print(f"selected X-ray candidate = {xray_idx_newK}")
+        print(f"laser / PP u0            = {laser_u_new:.6f}")
+        print(f"pad_left                 = {pad_left_newK}")
+        print(f"pad_right                = {pad_right_newK}")
+        print(f"padded image shape       = {xray_flip_laser_newK.shape}")
+
+        print("\nT_bc_newK [mm] =")
+        print(format_matrix(T_bc_newK_mm))
+
+        print("\nT_bx_newK [mm] =")
+        print(format_matrix(T_bx_newK_mm))
+
+        print("\nT_cx_newK [m] =")
+        print(format_matrix(T_cx_newK_m))
+
+        print("\nT_xc_newK [m] =")
+        print(format_matrix(T_xc_newK_m))
+
+        print(f"\nd_x_newK [mm] = {d_x_newK:+.6f}")
+
+        print("\nT_pad_laser_newK =")
+        print(format_matrix(T_pad_laser_newK))
+
+        print("\nH_newK =")
+        print(format_matrix(H_newK))
+
+        print("\nH_newK_padded = H_newK @ inv(T_pad_laser_newK)")
+        print(format_matrix(H_newK_padded))
+
+        show_overlay(
+            windows=windows,
+            title=(
+                f"{base_name} | 7 NEW K_xray | Handeye selected | "
+                f"padded FLIP_LR around PP u={laser_u_new:.0f}"
+            ),
+            overlay_bgr=overlay_newK_laser_flip,
+        )
+
+        # ========================================================
+        # 8) Load additional intrinsics
+        # ========================================================
+        print("\n" + "=" * 120)
+        print("8) LOAD NEW K_XRAY | recompute handeye + H | CENTER FLIP | SAME H")
+        print("=" * 120)
+
+        intrinsics_npz_path_center = pick_intrinsics_npz_file(
+            "Select X-ray intrinsics NPZ for block 8 CENTER FLIP"
+        )
+        if intrinsics_npz_path_center is None:
+            print("\n[INFO] No center-flip intrinsics selected. Skipping blocks 8, 9 and 10.")
+            app._overlay_windows = windows
+            return app.exec()
+
+        K_xray_center = load_K_xray_from_intrinsics_npz(intrinsics_npz_path_center)
+
+        print(f"\nCENTER-FLIP intrinsics NPZ:\n  {intrinsics_npz_path_center}")
+
+        print("\nK_xray CENTER-FLIP =")
+        print(format_matrix(K_xray_center))
+
+        print("\nK_xray CENTER-FLIP - K_xray BASE =")
+        print(format_matrix(K_xray_center - K_xray_base))
+
+        xray_flip_center = cv2.flip(xray_raw, 1)
+        mask_flip_center = cv2.flip(xray_mask_raw, 1)
+
+        res_handeye_center = solve_pose(
+            object_points_xyz=data.points_xyz_c_m,
+            image_points_uv=data.points_uv_x,
+            K=K_xray_center,
+            dist_coeffs=None,
+            dist_coeffs_rgb=None,
+            pose_method="ippe_handeye",
+            checkerboard_corners_uv=data.checkerboard_corners_uv,
+            K_rgb=data.K_rgb,
+            steps_per_edge=10,
+            refine_with_iterative=False,
+            refine_rgb_iterative=False,
+            refine_xray_iterative=False,
+        )
+
+        if (
+            res_handeye_center.all_candidates_rgb is None
+            or len(res_handeye_center.all_candidates_rgb) != 2
+        ):
+            raise RuntimeError("Expected exactly 2 RGB IPPE candidates for center-flip handeye.")
+
+        if (
+            res_handeye_center.all_candidates is None
+            or len(res_handeye_center.all_candidates) != 2
+        ):
+            raise RuntimeError("Expected exactly 2 X-ray IPPE candidates for center-flip handeye.")
+
+        if res_handeye_center.candidate_index_rgb is None:
+            raise RuntimeError("No selected RGB candidate index returned for center-flip handeye.")
+
+        if res_handeye_center.candidate_index_xray is None:
+            raise RuntimeError("No selected X-ray candidate index returned for center-flip handeye.")
+
+        rgb_idx_center = int(res_handeye_center.candidate_index_rgb)
+        xray_idx_center = int(res_handeye_center.candidate_index_xray)
+
+        rgb_cand_center = res_handeye_center.all_candidates_rgb[rgb_idx_center]
+        xray_cand_center = res_handeye_center.all_candidates[xray_idx_center]
+
+        T_bc_center_mm = make_transform(rgb_cand_center.rvec, rgb_cand_center.tvec)
+        T_bx_center_mm = make_transform(xray_cand_center.rvec, xray_cand_center.tvec)
+
+        T_cx_center_m = compute_T_cx_from_T_bc_T_bx(T_bc_center_mm, T_bx_center_mm)
+        T_xc_center_m = invert_transform(T_cx_center_m)
+
+        H_center, d_x_center = compute_H_xc_from_T_xc(
+            data=data,
+            T_xc_m=T_xc_center_m,
+            d_x_mm=None,
+            K_xray=K_xray_center,
+        )
+
+        overlay_center_flip = make_overlay_with_explicit_mask(
+            camera_bgr=data.camera_bgr,
+            xray_gray_u8=xray_flip_center,
+            xray_fov_mask=mask_flip_center,
+            H_xc=H_center,
+            alpha=data.alpha,
+        )
+
+        print(f"selected RGB candidate   = {rgb_idx_center}")
+        print(f"selected X-ray candidate = {xray_idx_center}")
+        print("center flip              = cv2.flip(image, 1)")
+        print("H usage                  = SAME H_center, no additional flip transform")
+
+        print("\nT_bc_center [mm] =")
+        print(format_matrix(T_bc_center_mm))
+
+        print("\nT_bx_center [mm] =")
+        print(format_matrix(T_bx_center_mm))
+
+        print("\nT_cx_center [m] =")
+        print(format_matrix(T_cx_center_m))
+
+        print("\nT_xc_center [m] =")
+        print(format_matrix(T_xc_center_m))
+
+        print(f"\nd_x_center [mm] = {d_x_center:+.6f}")
+
+        print("\nH_center =")
+        print(format_matrix(H_center))
+
+        show_overlay(
+            windows=windows,
+            title=(
+                f"{base_name} | 8 CENTER FLIP | Handeye selected | "
+                f"normal FLIP_LR | same H"
+            ),
+            overlay_bgr=overlay_center_flip,
+        )
+
+        # ========================================================
+        # 9) Load fx=fy laser-cross intrinsics
+        # ========================================================
+        print("\n" + "=" * 120)
+        print("9) LOAD FX=FY + LASER-CROSS K_XRAY | recompute handeye + H | LASER/PP FLIP")
+        print("=" * 120)
+
+        intrinsics_npz_path_equal_laser = pick_intrinsics_npz_file(
+            "Select fx=fy + laser-cross X-ray intrinsics NPZ for block 9"
+        )
+        if intrinsics_npz_path_equal_laser is None:
+            print("\n[INFO] No fx=fy laser-cross intrinsics selected. Skipping blocks 9 and 10.")
+            app._overlay_windows = windows
+            return app.exec()
+
+        K_xray_equal_laser = load_K_xray_from_intrinsics_npz(
+            intrinsics_npz_path_equal_laser
+        )
+
+        print(f"\nFX=FY LASER-CROSS intrinsics NPZ:\n  {intrinsics_npz_path_equal_laser}")
+
+        print("\nK_xray FX=FY LASER-CROSS =")
+        print(format_matrix(K_xray_equal_laser))
+
+        print("\nK_xray FX=FY LASER-CROSS - K_xray BASE =")
+        print(format_matrix(K_xray_equal_laser - K_xray_base))
+
+        laser_u_equal_laser = float(K_xray_equal_laser[0, 2])
+        print(f"\nUsing u0 from FX=FY LASER-CROSS K_xray principal point: {laser_u_equal_laser:.6f}")
+
+        xray_flip_equal_laser, T_pad_equal_laser, pad_left_equal_laser, pad_right_equal_laser = (
+            pad_and_flip_lr_about_u0(
+                xray_raw,
+                u0=laser_u_equal_laser,
+                border_value=0,
+            )
+        )
+
+        mask_flip_equal_laser, _, pad_left_m_equal_laser, pad_right_m_equal_laser = (
+            pad_and_flip_lr_about_u0(
+                xray_mask_raw,
+                u0=laser_u_equal_laser,
+                border_value=0,
+            )
+        )
+
+        if (
+            pad_left_equal_laser != pad_left_m_equal_laser
+            or pad_right_equal_laser != pad_right_m_equal_laser
+        ):
+            raise RuntimeError("Image and mask padding do not match for block 9.")
+
+        res_handeye_equal_laser = solve_pose(
+            object_points_xyz=data.points_xyz_c_m,
+            image_points_uv=data.points_uv_x,
+            K=K_xray_equal_laser,
+            dist_coeffs=None,
+            dist_coeffs_rgb=None,
+            pose_method="ippe_handeye",
+            checkerboard_corners_uv=data.checkerboard_corners_uv,
+            K_rgb=data.K_rgb,
+            steps_per_edge=10,
+            refine_with_iterative=False,
+            refine_rgb_iterative=False,
+            refine_xray_iterative=False,
+        )
+
+        if (
+            res_handeye_equal_laser.all_candidates_rgb is None
+            or len(res_handeye_equal_laser.all_candidates_rgb) != 2
+        ):
+            raise RuntimeError("Expected exactly 2 RGB IPPE candidates for block 9.")
+
+        if (
+            res_handeye_equal_laser.all_candidates is None
+            or len(res_handeye_equal_laser.all_candidates) != 2
+        ):
+            raise RuntimeError("Expected exactly 2 X-ray IPPE candidates for block 9.")
+
+        if res_handeye_equal_laser.candidate_index_rgb is None:
+            raise RuntimeError("No selected RGB candidate index returned for block 9.")
+
+        if res_handeye_equal_laser.candidate_index_xray is None:
+            raise RuntimeError("No selected X-ray candidate index returned for block 9.")
+
+        rgb_idx_equal_laser = int(res_handeye_equal_laser.candidate_index_rgb)
+        xray_idx_equal_laser = int(res_handeye_equal_laser.candidate_index_xray)
+
+        rgb_cand_equal_laser = res_handeye_equal_laser.all_candidates_rgb[rgb_idx_equal_laser]
+        xray_cand_equal_laser = res_handeye_equal_laser.all_candidates[xray_idx_equal_laser]
+
+        T_bc_equal_laser_mm = make_transform(
+            rgb_cand_equal_laser.rvec,
+            rgb_cand_equal_laser.tvec,
+        )
+        T_bx_equal_laser_mm = make_transform(
+            xray_cand_equal_laser.rvec,
+            xray_cand_equal_laser.tvec,
+        )
+
+        T_cx_equal_laser_m = compute_T_cx_from_T_bc_T_bx(
+            T_bc_equal_laser_mm,
+            T_bx_equal_laser_mm,
+        )
+        T_xc_equal_laser_m = invert_transform(T_cx_equal_laser_m)
+
+        H_equal_laser, d_x_equal_laser = compute_H_xc_from_T_xc(
+            data=data,
+            T_xc_m=T_xc_equal_laser_m,
+            d_x_mm=None,
+            K_xray=K_xray_equal_laser,
+        )
+
+        H_equal_laser_padded = H_equal_laser @ np.linalg.inv(T_pad_equal_laser)
+
+        overlay_equal_laser_flip = make_overlay_with_explicit_mask(
+            camera_bgr=data.camera_bgr,
+            xray_gray_u8=xray_flip_equal_laser,
+            xray_fov_mask=mask_flip_equal_laser,
+            H_xc=H_equal_laser_padded,
+            alpha=data.alpha,
+        )
+
+        print(f"selected RGB candidate   = {rgb_idx_equal_laser}")
+        print(f"selected X-ray candidate = {xray_idx_equal_laser}")
+        print(f"laser / PP u0            = {laser_u_equal_laser:.6f}")
+        print(f"pad_left                 = {pad_left_equal_laser}")
+        print(f"pad_right                = {pad_right_equal_laser}")
+        print(f"padded image shape       = {xray_flip_equal_laser.shape}")
+
+        print("\nT_bc_equal_laser [mm] =")
+        print(format_matrix(T_bc_equal_laser_mm))
+
+        print("\nT_bx_equal_laser [mm] =")
+        print(format_matrix(T_bx_equal_laser_mm))
+
+        print("\nT_cx_equal_laser [m] =")
+        print(format_matrix(T_cx_equal_laser_m))
+
+        print("\nT_xc_equal_laser [m] =")
+        print(format_matrix(T_xc_equal_laser_m))
+
+        print(f"\nd_x_equal_laser [mm] = {d_x_equal_laser:+.6f}")
+
+        print("\nT_pad_equal_laser =")
+        print(format_matrix(T_pad_equal_laser))
+
+        print("\nH_equal_laser =")
+        print(format_matrix(H_equal_laser))
+
+        print("\nH_equal_laser_padded = H_equal_laser @ inv(T_pad_equal_laser)")
+        print(format_matrix(H_equal_laser_padded))
+
+        show_overlay(
+            windows=windows,
+            title=(
+                f"{base_name} | 9 FX=FY LASER-CROSS K | Handeye selected | "
+                f"padded FLIP_LR around PP u={laser_u_equal_laser:.0f}"
+            ),
+            overlay_bgr=overlay_equal_laser_flip,
+        )
+
+        # ========================================================
+        # 10) Load image-center fx=fy intrinsics
+        #     Recompute IPPE-Handeye, T_cx, T_xc, d_x and H
+        #     Normal center flip, but SAME H
+        # ========================================================
+        print("\n" + "=" * 120)
+        print("10) LOAD IMAGE-CENTER FX=FY K_XRAY | recompute handeye + H | NORMAL FLIP | SAME H")
+        print("=" * 120)
+
+        intrinsics_npz_path_image_center = pick_intrinsics_npz_file(
+            "Select image-center fx=fy X-ray intrinsics NPZ for block 10"
+        )
+        if intrinsics_npz_path_image_center is None:
+            print("\n[INFO] No image-center fx=fy intrinsics selected. Skipping block 10.")
+            app._overlay_windows = windows
+            return app.exec()
+
+        K_xray_image_center = load_K_xray_from_intrinsics_npz(
+            intrinsics_npz_path_image_center
+        )
+
+        print(f"\nIMAGE-CENTER FX=FY intrinsics NPZ:\n  {intrinsics_npz_path_image_center}")
+
+        print("\nK_xray IMAGE-CENTER FX=FY =")
+        print(format_matrix(K_xray_image_center))
+
+        print("\nK_xray IMAGE-CENTER FX=FY - K_xray BASE =")
+        print(format_matrix(K_xray_image_center - K_xray_base))
+
+        # Normal image flip around image center.
+        # IMPORTANT: H is NOT modified.
+        xray_flip_image_center = cv2.flip(xray_raw, 1)
+        mask_flip_image_center = cv2.flip(xray_mask_raw, 1)
+
+        res_handeye_image_center = solve_pose(
+            object_points_xyz=data.points_xyz_c_m,
+            image_points_uv=data.points_uv_x,
+            K=K_xray_image_center,
+            dist_coeffs=None,
+            dist_coeffs_rgb=None,
+            pose_method="ippe_handeye",
+            checkerboard_corners_uv=data.checkerboard_corners_uv,
+            K_rgb=data.K_rgb,
+            steps_per_edge=10,
+            refine_with_iterative=False,
+            refine_rgb_iterative=False,
+            refine_xray_iterative=False,
+        )
+
+        if (
+            res_handeye_image_center.all_candidates_rgb is None
+            or len(res_handeye_image_center.all_candidates_rgb) != 2
+        ):
+            raise RuntimeError("Expected exactly 2 RGB IPPE candidates for block 10.")
+
+        if (
+            res_handeye_image_center.all_candidates is None
+            or len(res_handeye_image_center.all_candidates) != 2
+        ):
+            raise RuntimeError("Expected exactly 2 X-ray IPPE candidates for block 10.")
+
+        if res_handeye_image_center.candidate_index_rgb is None:
+            raise RuntimeError("No selected RGB candidate index returned for block 10.")
+
+        if res_handeye_image_center.candidate_index_xray is None:
+            raise RuntimeError("No selected X-ray candidate index returned for block 10.")
+
+        rgb_idx_image_center = int(res_handeye_image_center.candidate_index_rgb)
+        xray_idx_image_center = int(res_handeye_image_center.candidate_index_xray)
+
+        rgb_cand_image_center = res_handeye_image_center.all_candidates_rgb[
+            rgb_idx_image_center
+        ]
+        xray_cand_image_center = res_handeye_image_center.all_candidates[
+            xray_idx_image_center
+        ]
+
+        T_bc_image_center_mm = make_transform(
+            rgb_cand_image_center.rvec,
+            rgb_cand_image_center.tvec,
+        )
+        T_bx_image_center_mm = make_transform(
+            xray_cand_image_center.rvec,
+            xray_cand_image_center.tvec,
+        )
+
+        T_cx_image_center_m = compute_T_cx_from_T_bc_T_bx(
+            T_bc_image_center_mm,
+            T_bx_image_center_mm,
+        )
+        T_xc_image_center_m = invert_transform(T_cx_image_center_m)
+
+        H_image_center, d_x_image_center = compute_H_xc_from_T_xc(
+            data=data,
+            T_xc_m=T_xc_image_center_m,
+            d_x_mm=None,
+            K_xray=K_xray_image_center,
+        )
+
+        overlay_image_center_normal_flip = make_overlay_with_explicit_mask(
+            camera_bgr=data.camera_bgr,
+            xray_gray_u8=xray_flip_image_center,
+            xray_fov_mask=mask_flip_image_center,
+            H_xc=H_image_center,  # IMPORTANT: same H, no flip/padding correction
+            alpha=data.alpha,
+        )
+
+        print(f"selected RGB candidate   = {rgb_idx_image_center}")
+        print(f"selected X-ray candidate = {xray_idx_image_center}")
+        print("flip mode                = cv2.flip(image, 1)")
+        print("H usage                  = SAME H_image_center, no modification")
+
+        print("\nT_bc_image_center [mm] =")
+        print(format_matrix(T_bc_image_center_mm))
+
+        print("\nT_bx_image_center [mm] =")
+        print(format_matrix(T_bx_image_center_mm))
+
+        print("\nT_cx_image_center [m] =")
+        print(format_matrix(T_cx_image_center_m))
+
+        print("\nT_xc_image_center [m] =")
+        print(format_matrix(T_xc_image_center_m))
+
+        print(f"\nd_x_image_center [mm] = {d_x_image_center:+.6f}")
+
+        print("\nH_image_center =")
+        print(format_matrix(H_image_center))
+
+        show_overlay(
+            windows=windows,
+            title=(
+                f"{base_name} | 10 IMAGE-CENTER FX=FY K | Handeye selected | "
+                f"normal FLIP_LR | same H"
+            ),
+            overlay_bgr=overlay_image_center_normal_flip,
         )
 
         app._overlay_windows = windows
