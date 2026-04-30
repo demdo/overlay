@@ -27,16 +27,15 @@ ROI:
     These anchor roles are defined in CAMERA VIEW semantics, i.e. from the
     camera / top-view perspective of the board.
 
-    This produces a provisional ROI ordering in CAMERA VIEW, stored as uv_raw.
+    This function produces a canonical RAW ROI ordering in CAMERA VIEW /
+    global board order only.
 
-    For the current setup, the X-ray image observes the board effectively from
-    the opposite side (source side / from below). Therefore, the final uv_xray
-    ordering is obtained by LEFT-RIGHT mirroring of uv_raw only.
+    It does NOT perform any X-ray semantic reordering. After the canonical RAW
+    order has been determined, the measured UVs are transformed into the X-ray
+    working pixel space:
 
-    Therefore:
-        - anchor selection is interpreted as [TL, TR, BL] in CAMERA VIEW
-        - uv_raw   = provisional ROI ordering in CAMERA VIEW
-        - uv_final = LEFT-RIGHT mirrored version of uv_raw for X-ray usage
+        u_work = W - 1 - u_raw
+        v_work = v_raw
 
     The affine ROI model is
 
@@ -57,6 +56,7 @@ Notes
 -----
 - No circles_sorted, no circles_grid.
 - No affine regularization is applied to the returned ROI points.
+- No j_xray = nu - j_cam semantic reordering is performed here.
 - estimate_pitch_nn is imported from overlay.tools.blob_detection.
 """
 
@@ -111,6 +111,7 @@ def _apply_clahe(
     """Optionally apply CLAHE to a uint8 grayscale image."""
     if not use_clahe:
         return img_gray_u8
+
     clahe = cv2.createCLAHE(
         clipLimit=float(clip_limit),
         tileGridSize=tuple(tile_grid_size),
@@ -169,7 +170,12 @@ def _detector_mask(
     def _touches_border(c: np.ndarray) -> bool:
         xs = c[:, 0, 0]
         ys = c[:, 0, 1]
-        return (xs.min() <= 1) or (ys.min() <= 1) or (xs.max() >= w - 2) or (ys.max() >= h - 2)
+        return (
+            (xs.min() <= 1)
+            or (ys.min() <= 1)
+            or (xs.max() >= w - 2)
+            or (ys.max() >= h - 2)
+        )
 
     nb = [c for c in cnts if not _touches_border(c)]
     candidates = nb if nb else cnts
@@ -198,7 +204,7 @@ def _solve_alpha_beta(
     v: np.ndarray,
 ) -> np.ndarray:
     """
-    Solve (alpha,beta) in: P = p0 + alpha*u + beta*v  for each P (Nx2).
+    Solve (alpha,beta) in: P = p0 + alpha*u + beta*v for each P (Nx2).
 
     Returns
     -------
@@ -207,6 +213,7 @@ def _solve_alpha_beta(
     """
     u = np.asarray(u, float)
     v = np.asarray(v, float)
+
     A = np.stack([u, v], axis=1)  # 2x2 (columns)
     det = float(A[0, 0] * A[1, 1] - A[0, 1] * A[1, 0])
     if abs(det) < 1e-9:
@@ -274,16 +281,6 @@ def _check_anchor_orientation(
     with
 
         cross_z = u_x * v_y - u_y * v_x
-
-    Returns
-    -------
-    ok : bool
-        True if the anchor configuration is plausible for the expected
-        CAMERA VIEW semantics.
-    warning_msg : str | None
-        Warning text if the orientation is unexpected or degenerate.
-    dbg : dict
-        Diagnostic values for the orientation test.
     """
     u = p_tr - p_tl
     v = p_bl - p_tl
@@ -338,6 +335,28 @@ def _check_anchor_orientation(
     )
 
 
+
+def transform_xray_uv_raw_to_working(
+    uv_raw: np.ndarray,
+    *,
+    image_width: int,
+) -> np.ndarray:
+    """
+    RAW X-ray UV -> X-ray working-space UV.
+
+    Horizontal pixel-space flip:
+        u_work = W - 1 - u_raw
+        v_work = v_raw
+    """
+    uv_raw = np.asarray(uv_raw, dtype=np.float64).reshape(-1, 2)
+    image_width = int(image_width)
+    if image_width <= 0:
+        raise ValueError("image_width must be positive.")
+
+    uv_work = uv_raw.copy()
+    uv_work[:, 0] = float(image_width - 1) - uv_work[:, 0]
+    return uv_work
+
 # ============================================================
 # Public API
 # ============================================================
@@ -364,7 +383,12 @@ def run_xray_marker_detection(
     if img_gray.ndim != 2:
         raise ValueError("img_gray must be grayscale (H,W).")
 
-    img_u8 = img_gray if img_gray.dtype == np.uint8 else np.clip(img_gray, 0, 255).astype(np.uint8)
+    img_u8 = (
+        img_gray
+        if img_gray.dtype == np.uint8
+        else np.clip(img_gray, 0, 255).astype(np.uint8)
+    )
+
     img_proc = _apply_clahe(
         img_u8,
         use_clahe=use_clahe,
@@ -416,6 +440,7 @@ def compute_roi_from_grid(
     anchor_idx: Sequence[int],
     *,
     margin_px: float,
+    image_width: int,
     gate_tol_pitch: float = 0.40,
     min_steps: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
@@ -429,22 +454,25 @@ def compute_roi_from_grid(
     The function uses an affine parameterization induced by these anchors to:
         - define the ROI support region
         - gate detections by lattice proximity
-        - assign a consistent ordering
+        - assign a canonical CAMERA VIEW / global board ordering.
 
     Important
     ---------
     No affine regularization is applied.
     No ideal grid is fitted back onto the detections.
-    All returned ROI points are measured blob centers.
+    No X-ray semantic reordering is applied.
+    All returned ROI points are measured blob centers transformed into the
+    X-ray working pixel space.
 
     Returns
     -------
     uv_final : np.ndarray
-        Final ROI points in X-ray ordering, shape (N,2). These are measured points
-        only, not regularized points.
+        Canonically ordered ROI points in XRAY_WORKING_FLIPPED_UV, shape (N,2).
+        These are measured points only, not regularized points.
 
     roi_idx : np.ndarray
-        Indices of the selected ROI detections in the original circles array.
+        Indices of the selected ROI detections in the original circles array,
+        in the same canonical order as uv_final.
 
     dbg : dict
         Debug information for ROI extraction, ordering, and orientation checks.
@@ -454,6 +482,10 @@ def compute_roi_from_grid(
         raise ValueError("circles must contain at least 3 entries.")
     if anchor_idx is None or len(anchor_idx) != 3:
         raise ValueError("anchor_idx must contain exactly 3 indices.")
+
+    image_width = int(image_width)
+    if image_width <= 0:
+        raise ValueError("image_width must be positive.")
 
     idx = np.asarray(anchor_idx, dtype=int)
     if np.any(idx < 0) or np.any(idx >= c.shape[0]):
@@ -505,8 +537,10 @@ def compute_roi_from_grid(
     mv = float((margin_px + tol_px) / (Lv + 1e-12))
 
     in_box = (
-        (alpha >= -mu) & (alpha <= 1.0 + mu) &
-        (beta >= -mv) & (beta <= 1.0 + mv)
+        (alpha >= -mu)
+        & (alpha <= 1.0 + mu)
+        & (beta >= -mv)
+        & (beta <= 1.0 + mv)
     )
 
     nu0 = int(np.clip(np.rint(Lu / pitch), int(min_steps), 10_000))
@@ -545,34 +579,32 @@ def compute_roi_from_grid(
     nu = int(best[0])
     nv = int(best[1])
 
+    # Canonical board/camera-view lattice indices:
+    #   i_cam: row index   (TL -> BL)
+    #   j_cam: column index(TL -> TR)
     j_cam = np.rint(alpha_roi * nu).astype(np.int32)
     i_cam = np.rint(beta_roi * nv).astype(np.int32)
 
     j_cam = np.clip(j_cam, 0, nu)
     i_cam = np.clip(i_cam, 0, nv)
 
+    # IMPORTANT:
+    # Do NOT compute j_xray = nu - j_cam here anymore.
+    # The actual X-ray working-space coordinate transform is performed later
+    # by the GUI page using u_work = W - 1 - u_raw.
     order_raw = np.lexsort((j_cam, i_cam))
-    roi_idx_local_raw = roi_idx_local_all[order_raw]
-    uv_raw = xy[roi_idx_local_raw].astype(np.float64)
+    roi_idx_local = roi_idx_local_all[order_raw]
 
-    j_xray = nu - j_cam
-    i_xray = i_cam
+    grid_i_raw = i_cam[order_raw].astype(np.int32)
+    grid_j_raw = j_cam[order_raw].astype(np.int32)
 
-    order_final = np.lexsort((j_xray, i_xray))
-    roi_idx_local = roi_idx_local_all[order_final]
-
-    grid_i_final = i_xray[order_final].astype(np.int32)
-    grid_j_final = j_xray[order_final].astype(np.int32)
-
-    roi_uv_raw_final = xy[roi_idx_local].astype(np.float64)
-    uv_final = roi_uv_raw_final.copy()
+    uv_raw = xy[roi_idx_local].astype(np.float64)
+    uv_final = transform_xray_uv_raw_to_working(uv_raw, image_width=image_width)
 
     if map_back is None:
-        roi_idx = roi_idx_local
-        roi_idx_raw = roi_idx_local_raw
+        roi_idx = roi_idx_local.astype(np.int64)
     else:
         roi_idx = map_back[roi_idx_local].astype(np.int64)
-        roi_idx_raw = map_back[roi_idx_local_raw].astype(np.int64)
 
     debug_npz_path = "xray_marker_selection_debug_uv.npz"
     debug_npz_saved = False
@@ -582,16 +614,24 @@ def compute_roi_from_grid(
         np.savez(
             debug_npz_path,
             uv_raw=uv_raw,
-            uv_raw_final=roi_uv_raw_final,
             uv_final=uv_final,
-            roi_idx_raw=roi_idx_raw,
+            points_uv_raw=uv_raw,
+            points_uv_working=uv_final,
+            roi_idx_raw=roi_idx,
             roi_idx_final=roi_idx,
             anchor_idx=np.asarray(anchor_idx, dtype=int),
             anchor_idx_effective=np.asarray(idx_eff, dtype=int),
-            grid_i_raw=i_cam[order_raw],
-            grid_j_raw=j_cam[order_raw],
-            grid_i_final=grid_i_final,
-            grid_j_final=grid_j_final,
+            grid_i_raw=grid_i_raw,
+            grid_j_raw=grid_j_raw,
+            grid_i_final=grid_i_raw,
+            grid_j_final=grid_j_raw,
+            semantic_reordering=np.array(False, dtype=bool),
+            no_j_xray_reordering=np.array(True, dtype=bool),
+            image_width=np.array(image_width, dtype=np.int32),
+            uv_space=np.array("XRAY_WORKING_FLIPPED_UV", dtype="<U64"),
+            raw_uv_space=np.array("XRAY_RAW_CANONICAL_BOARD_ORDER", dtype="<U64"),
+            uv_transform=np.array("horizontal_flip", dtype="<U32"),
+            uv_transform_formula=np.array("u_work = W - 1 - u_raw, v_work = v_raw", dtype="<U64"),
         )
         debug_npz_saved = True
     except Exception as e:
@@ -615,13 +655,15 @@ def compute_roi_from_grid(
         anchor_idx_effective=np.asarray(idx_eff, dtype=int).tolist(),
         anchor_role=["TL", "TR", "BL"],
 
-        grid_i_raw=i_cam[order_raw].tolist(),
-        grid_j_raw=j_cam[order_raw].tolist(),
-        grid_i_final=grid_i_final.tolist(),
-        grid_j_final=grid_j_final.tolist(),
+        grid_i_raw=grid_i_raw.tolist(),
+        grid_j_raw=grid_j_raw.tolist(),
 
-        grid_i=grid_i_final.tolist(),
-        grid_j=grid_j_final.tolist(),
+        # Backward-compatible aliases.
+        # These are now identical to the RAW/canonical indices.
+        grid_i_final=grid_i_raw.tolist(),
+        grid_j_final=grid_j_raw.tolist(),
+        grid_i=grid_i_raw.tolist(),
+        grid_j=grid_j_raw.tolist(),
 
         orientation_ok=bool(orientation_ok),
         orientation_warning=orientation_warning,
@@ -635,8 +677,18 @@ def compute_roi_from_grid(
         orientation_cond_cross=bool(orientation_dbg["cond_cross"]),
 
         debug_uv_raw=uv_raw.tolist(),
-        debug_uv_raw_final=roi_uv_raw_final.tolist(),
+        debug_uv_raw_final=uv_raw.tolist(),
         debug_uv_final=uv_final.tolist(),
+        points_uv_raw=uv_raw.tolist(),
+        points_uv_working=uv_final.tolist(),
+
+        semantic_reordering=False,
+        no_j_xray_reordering=True,
+        uv_space="XRAY_WORKING_FLIPPED_UV",
+        raw_uv_space="XRAY_RAW_CANONICAL_BOARD_ORDER",
+        uv_transform="horizontal_flip",
+        uv_transform_formula="u_work = W - 1 - u_raw, v_work = v_raw",
+        image_width=int(image_width),
 
         debug_npz_path=debug_npz_path,
         debug_npz_saved=bool(debug_npz_saved),

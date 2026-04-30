@@ -19,6 +19,7 @@ pybind11_add_module(hydramarker_cpp
     bindings.cpp
     marker_field.cpp
     checkerboard_detector.cpp
+    dot_detector.cpp
 )
 
 target_link_libraries(hydramarker_cpp
@@ -35,6 +36,7 @@ add_executable(example
     generator_HydraMarker.cpp
     marker_field.cpp
     checkerboard_detector.cpp
+    dot_detector.cpp
 )
 
 target_link_libraries(example

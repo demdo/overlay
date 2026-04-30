@@ -20,8 +20,7 @@ IMAGE_SIZE = (1024, 1024)   # (width, height)
 
 LASER_CROSS_UV = (473.0, 424.0)
 
-FORCE_EQUAL_FOCAL_LENGTHS = True
-FIXED_FOCAL_LENGTH_PX = 4650.0
+INITIAL_FOCAL_LENGTH_PX = 4650.0
 
 PRINT_H_MATRICES = False
 PRINT_POINT_SAMPLES = False
@@ -53,6 +52,22 @@ def _select_folder(title: str) -> Path:
     return Path(folder)
 
 
+def _save_intrinsics_dialog(default_name: str) -> Path | None:
+    _get_app()
+    path, _ = QFileDialog.getSaveFileName(
+        None,
+        "Save X-ray intrinsics NPZ",
+        default_name,
+        "NPZ files (*.npz);;All files (*.*)",
+    )
+    if not path:
+        return None
+    p = Path(path)
+    if p.suffix.lower() != ".npz":
+        p = p.with_suffix(".npz")
+    return p
+
+
 # ============================================================
 # Load helpers
 # ============================================================
@@ -66,6 +81,8 @@ def _extract_view_number_from_name(name: str) -> int:
 
 def _stem_from_h_file(path: Path) -> str:
     name = path.name
+    if name.endswith("__H_XRAY_UV_TRANSFORM.npz"):
+        return name[:-len("__H_XRAY_UV_TRANSFORM.npz")]
     if name.endswith("_H.npz"):
         return name[:-len("_H.npz")]
     return path.stem
@@ -73,6 +90,8 @@ def _stem_from_h_file(path: Path) -> str:
 
 def _stem_from_corr_file(path: Path) -> str:
     name = path.name
+    if name.endswith("__corr_XRAY_UV_TRANSFORM.npz"):
+        return name[:-len("__corr_XRAY_UV_TRANSFORM.npz")]
     if name.endswith("_corr.npz"):
         return name[:-len("_corr.npz")]
     return path.stem
@@ -80,15 +99,11 @@ def _stem_from_corr_file(path: Path) -> str:
 
 def load_homography_from_npz(npz_path: Path) -> np.ndarray:
     data = np.load(npz_path)
-    preferred_keys = ["H", "homography", "H_x"]
-
-    for key in preferred_keys:
+    for key in ["H", "homography", "H_x"]:
         if key in data:
             H = np.asarray(data[key], dtype=np.float64)
             if H.shape != (3, 3):
-                raise ValueError(
-                    f"{npz_path.name}: key '{key}' has shape {H.shape}, expected (3,3)"
-                )
+                raise ValueError(f"{npz_path.name}: key '{key}' has shape {H.shape}")
             return H
 
     for key in data.files:
@@ -116,7 +131,7 @@ def load_corr_from_npz(npz_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarr
     if uv.ndim != 2 or uv.shape[1] != 2:
         raise ValueError(f"{npz_path.name}: uv must have shape (N,2), got {uv.shape}")
     if len(XY) != len(uv):
-        raise ValueError(f"{npz_path.name}: XY/uv count mismatch: {len(XY)} vs {len(uv)}")
+        raise ValueError(f"{npz_path.name}: XY/uv mismatch: {len(XY)} vs {len(uv)}")
 
     object_points_xyz = np.column_stack(
         [XY, np.zeros((XY.shape[0], 1), dtype=np.float64)]
@@ -127,24 +142,22 @@ def load_corr_from_npz(npz_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarr
 
 def find_matching_pairs(H_folder: Path, corr_folder: Path) -> list[tuple[str, Path, Path]]:
     h_files = sorted(
-        H_folder.glob("*_H.npz"),
+        list(H_folder.glob("*_H.npz")) + list(H_folder.glob("*__H_XRAY_UV_TRANSFORM.npz")),
         key=lambda p: _extract_view_number_from_name(p.name),
     )
     if not h_files:
-        raise FileNotFoundError(f"No '*_H.npz' files found in H folder: {H_folder}")
+        raise FileNotFoundError(f"No H files found in H folder: {H_folder}")
 
     corr_files = sorted(
-        corr_folder.glob("*_corr.npz"),
+        list(corr_folder.glob("*_corr.npz")) + list(corr_folder.glob("*__corr_XRAY_UV_TRANSFORM.npz")),
         key=lambda p: _extract_view_number_from_name(p.name),
     )
     if not corr_files:
-        raise FileNotFoundError(f"No '*_corr.npz' files found in corr folder: {corr_folder}")
+        raise FileNotFoundError(f"No corr files found in corr folder: {corr_folder}")
 
-    corr_map: dict[str, Path] = {}
-    for corr_path in corr_files:
-        corr_map[_stem_from_corr_file(corr_path)] = corr_path
+    corr_map = {_stem_from_corr_file(p): p for p in corr_files}
 
-    pairs: list[tuple[str, Path, Path]] = []
+    pairs = []
     for h_path in h_files:
         stem = _stem_from_h_file(h_path)
         corr_path = corr_map.get(stem)
@@ -165,8 +178,6 @@ def find_matching_pairs(H_folder: Path, corr_folder: Path) -> list[tuple[str, Pa
 
 def normalize_H(H: np.ndarray) -> np.ndarray:
     H = np.asarray(H, dtype=np.float64)
-    if H.shape != (3, 3):
-        raise ValueError(f"H must be (3,3), got {H.shape}")
     if abs(H[2, 2]) > 1e-12:
         return H / H[2, 2]
     return H / (np.linalg.norm(H) + 1e-12)
@@ -174,8 +185,7 @@ def normalize_H(H: np.ndarray) -> np.ndarray:
 
 def apply_homography(H: np.ndarray, XY: np.ndarray) -> np.ndarray:
     XY = np.asarray(XY, dtype=np.float64).reshape(-1, 2)
-    ones = np.ones((XY.shape[0], 1), dtype=np.float64)
-    Xh = np.hstack([XY, ones])
+    Xh = np.hstack([XY, np.ones((XY.shape[0], 1), dtype=np.float64)])
     xh = (H @ Xh.T).T
     return xh[:, :2] / xh[:, 2:3]
 
@@ -187,7 +197,6 @@ def compute_homography_reprojection_stats(
 ) -> dict:
     uv_pred = apply_homography(H, XY)
     err = np.linalg.norm(uv_meas - uv_pred, axis=1)
-
     return {
         "uv_pred": uv_pred,
         "errors_px": err,
@@ -203,7 +212,6 @@ def compute_polygon_area(points_uv: np.ndarray) -> float:
     hull = cv2.convexHull(pts.astype(np.float32)).reshape(-1, 2)
     if hull.shape[0] < 3:
         return 0.0
-
     x = hull[:, 0]
     y = hull[:, 1]
     return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
@@ -214,12 +222,6 @@ def principal_point_valid(K: np.ndarray, image_size: tuple[int, int]) -> bool:
     cx = float(K[0, 2])
     cy = float(K[1, 2])
     return (0.0 <= cx < float(w)) and (0.0 <= cy < float(h))
-
-
-def print_matrix(label: str, M: np.ndarray) -> None:
-    print(f"{label}")
-    for row in np.asarray(M, dtype=np.float64):
-        print("  " + " ".join(f"{v:+.6f}" for v in row))
 
 
 # ============================================================
@@ -261,25 +263,12 @@ def print_view_summary(v: dict) -> None:
     print(f"H reproj p95 px   = {v['p95_px']:.6f}")
     print(f"H reproj max px   = {v['max_px']:.6f}")
 
-    if PRINT_H_MATRICES:
-        print_matrix("H (raw)", v["H"])
-        print_matrix("H (normalized)", v["Hn"])
-
-    if PRINT_POINT_SAMPLES:
-        print("First 5 XY:")
-        print(v["XY"][:5])
-        print("First 5 uv:")
-        print(v["uv"][:5])
-        print("First 5 uv_pred:")
-        print(v["uv_pred"][:5])
-
 
 # ============================================================
 # Zhang analysis
 # ============================================================
 
 def print_intrinsics_summary(label: str, K: np.ndarray, image_size: tuple[int, int]) -> None:
-    w, h = image_size
     print(f"\n{label}")
     print("-" * len(label))
     print(K)
@@ -288,8 +277,6 @@ def print_intrinsics_summary(label: str, K: np.ndarray, image_size: tuple[int, i
     print(f"cx = {K[0,2]:.6f}")
     print(f"cy = {K[1,2]:.6f}")
     print(f"principal point valid = {principal_point_valid(K, image_size)}")
-    print(f"image width  = {w}")
-    print(f"image height = {h}")
 
 
 def run_zhang_analysis(
@@ -312,41 +299,6 @@ def run_zhang_analysis(
         print("\n[FAIL] Zhang (all views)")
         print(f"Reason: {e}")
         return None
-
-
-def run_leave_one_out_analysis(
-    views: list[dict],
-    image_size: tuple[int, int],
-    enforce_zero_skew: bool = True,
-) -> None:
-    print("\n============================================================")
-    print("LEAVE-ONE-OUT ZHANG ANALYSIS")
-    print("============================================================")
-
-    for i in range(len(views)):
-        subset = [v for j, v in enumerate(views) if j != i]
-        removed = views[i]["stem"]
-        H_list = [v["H"] for v in subset]
-
-        print(f"\nRemoved view: {removed}")
-
-        try:
-            result = estimate_intrinsics_from_homographies(
-                H_list,
-                enforce_zero_skew=enforce_zero_skew,
-                global_optimization=False,
-            )
-            K = result.K
-            print("  success  = True")
-            print(f"  pp_valid = {principal_point_valid(K, image_size)}")
-            print(f"  fx = {K[0,0]:.6f}")
-            print(f"  fy = {K[1,1]:.6f}")
-            print(f"  cx = {K[0,2]:.6f}")
-            print(f"  cy = {K[1,2]:.6f}")
-        except Exception as e:
-            print("  success  = False")
-            print("  pp_valid = False")
-            print(f"  error = {e}")
 
 
 def run_subset_rankings(views: list[dict]) -> None:
@@ -372,7 +324,7 @@ def run_subset_rankings(views: list[dict]) -> None:
 
 
 # ============================================================
-# BA-only fixed focal length, free PP
+# BA-only center PP, optimize equal focal length
 # ============================================================
 
 def _as_opencv_object_points(points: np.ndarray) -> np.ndarray:
@@ -389,18 +341,63 @@ def _as_opencv_image_points(points: np.ndarray) -> np.ndarray:
     return pts.astype(np.float32)
 
 
-def run_ba_fixed_f_free_pp(
+def save_intrinsics_npz(
+    out_path: Path,
+    *,
+    K: np.ndarray,
+    dist: np.ndarray,
+    rms: float,
+    image_size: tuple[int, int],
+    initial_f_px: float,
+) -> None:
+    K = np.asarray(K, dtype=np.float64)
+    dist = np.asarray(dist, dtype=np.float64)
+
+    np.savez(
+        out_path,
+        # same compatibility keys as before
+        K=K,
+        K_x=K,
+        K_xray=K,
+
+        dist=dist,
+        dist_x=dist,
+        dist_xray=dist,
+
+        # useful metadata
+        rms=np.array(float(rms), dtype=np.float64),
+        image_size=np.asarray(image_size, dtype=np.int32),
+        width=np.array(image_size[0], dtype=np.int32),
+        height=np.array(image_size[1], dtype=np.int32),
+
+        method=np.array("BA_CENTER_PP_EQUAL_F", dtype="<U64"),
+        uv_space=np.array("XRAY_WORKING_FLIPPED_UV", dtype="<U64"),
+        uv_transform=np.array("horizontal_flip", dtype="<U32"),
+
+        initial_f_px=np.array(float(initial_f_px), dtype=np.float64),
+        fixed_principal_point=np.array(True, dtype=bool),
+        cx_fixed=np.array(float(image_size[0]) / 2.0, dtype=np.float64),
+        cy_fixed=np.array(float(image_size[1]) / 2.0, dtype=np.float64),
+        equal_focal_lengths=np.array(True, dtype=bool),
+        distortion_fixed_zero=np.array(True, dtype=bool),
+    )
+
+    print(f"\n[OK] saved intrinsics -> {out_path}")
+
+
+def run_ba_center_pp_equal_f(
     views: list[dict],
     image_size: tuple[int, int],
     *,
-    fixed_f_px: float = 4650.0,
+    initial_f_px: float = 4650.0,
 ) -> tuple[np.ndarray, np.ndarray, float] | None:
     print("\n============================================================")
-    print("BA-ONLY DEBUG: FIXED FOCAL LENGTH, FREE PRINCIPAL POINT")
+    print("BA-ONLY: FIXED CENTER PP, OPTIMIZE EQUAL FOCAL LENGTH")
     print("============================================================")
-    print(f"fixed fx = fy = {fixed_f_px:.6f}")
-    print("principal point initialized at image center")
-    print("NO SAVE")
+    print(f"initial fx = fy = {initial_f_px:.6f}")
+    print("principal point fixed at image center")
+    print("fx = fy enforced via CALIB_FIX_ASPECT_RATIO")
+    print("distortion fixed to zero")
 
     object_points_cv = [_as_opencv_object_points(v["obj_xyz"]) for v in views]
     image_points_cv = [_as_opencv_image_points(v["uv"]) for v in views]
@@ -411,8 +408,8 @@ def run_ba_fixed_f_free_pp(
 
     K_init = np.array(
         [
-            [fixed_f_px, 0.0, cx_init],
-            [0.0, fixed_f_px, cy_init],
+            [initial_f_px, 0.0, cx_init],
+            [0.0, initial_f_px, cy_init],
             [0.0, 0.0, 1.0],
         ],
         dtype=np.float64,
@@ -425,12 +422,9 @@ def run_ba_fixed_f_free_pp(
 
     flags = 0
     flags |= cv2.CALIB_USE_INTRINSIC_GUESS
-
-    # Fix focal length, allow principal point to move
-    flags |= cv2.CALIB_FIX_FOCAL_LENGTH
+    flags |= cv2.CALIB_FIX_PRINCIPAL_POINT
     flags |= cv2.CALIB_FIX_ASPECT_RATIO
 
-    # No tangential / radial / thin-prism / tilted model
     flags |= cv2.CALIB_ZERO_TANGENT_DIST
     flags |= cv2.CALIB_FIX_K1
     flags |= cv2.CALIB_FIX_K2
@@ -441,9 +435,6 @@ def run_ba_fixed_f_free_pp(
     flags |= cv2.CALIB_FIX_S1_S2_S3_S4
     flags |= cv2.CALIB_FIX_TAUX_TAUY
 
-    # IMPORTANT:
-    # Do NOT set cv2.CALIB_FIX_PRINCIPAL_POINT
-
     criteria = (
         cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT,
         500,
@@ -451,7 +442,7 @@ def run_ba_fixed_f_free_pp(
     )
 
     try:
-        rms, K_ba, dist_ba, _, _ = cv2.calibrateCamera(
+        rms, K_ba, dist_ba, rvecs, tvecs = cv2.calibrateCamera(
             objectPoints=object_points_cv,
             imagePoints=image_points_cv,
             imageSize=image_size,
@@ -461,12 +452,12 @@ def run_ba_fixed_f_free_pp(
             criteria=criteria,
         )
     except Exception as e:
-        print("\n[FAIL] BA fixed-f free-PP calibration failed")
+        print("\n[FAIL] BA center-PP equal-f calibration failed")
         print(f"Reason: {e}")
         return None
 
-    print("\nBA fixed-f free-PP result")
-    print("-------------------------")
+    print("\nBA center-PP equal-f result")
+    print("---------------------------")
     print(K_ba)
     print(f"fx = {K_ba[0,0]:.6f}")
     print(f"fy = {K_ba[1,1]:.6f}")
@@ -477,13 +468,23 @@ def run_ba_fixed_f_free_pp(
     print(f"RMS reprojection error = {float(rms):.6f}")
     print(f"dist coeffs = {np.asarray(dist_ba, dtype=np.float64).reshape(-1)}")
 
-    print("\nPP displacement from image center:")
-    print(f"dcx = {K_ba[0,2] - cx_init:+.6f} px")
-    print(f"dcy = {K_ba[1,2] - cy_init:+.6f} px")
+    print("\nOptimized focal change:")
+    print(f"df = {K_ba[0,0] - initial_f_px:+.6f} px")
 
-    print("\nPP displacement from laser cross:")
-    print(f"dcx_laser = {K_ba[0,2] - LASER_CROSS_UV[0]:+.6f} px")
-    print(f"dcy_laser = {K_ba[1,2] - LASER_CROSS_UV[1]:+.6f} px")
+    default_name = "K_xray_ba_center_pp_equal_f.npz"
+    out_path = _save_intrinsics_dialog(default_name)
+
+    if out_path is None:
+        print("[INFO] Save cancelled.")
+    else:
+        save_intrinsics_npz(
+            out_path,
+            K=K_ba,
+            dist=dist_ba,
+            rms=float(rms),
+            image_size=image_size,
+            initial_f_px=initial_f_px,
+        )
 
     return K_ba, dist_ba, float(rms)
 
@@ -520,10 +521,6 @@ def filter_pairs(
     else:
         print("No matching excluded views were present.")
 
-    print("Remaining pairs:")
-    for stem, _, _ in filtered:
-        print(f"  {stem}")
-
     return filtered
 
 
@@ -544,15 +541,17 @@ def main() -> None:
     print("\n============================================================")
     print("CONFIG")
     print("============================================================")
-    print(f"IMAGE_SIZE                  = {IMAGE_SIZE}")
-    print(f"LASER_CROSS_UV              = {LASER_CROSS_UV}")
-    print(f"FIXED_FOCAL_LENGTH_PX       = {FIXED_FOCAL_LENGTH_PX}")
-    print(f"ENFORCE_ZERO_SKEW           = {ENFORCE_ZERO_SKEW}")
+    print(f"IMAGE_SIZE              = {IMAGE_SIZE}")
+    print(f"LASER_CROSS_UV          = {LASER_CROSS_UV}")
+    print(f"INITIAL_FOCAL_LENGTH_PX = {INITIAL_FOCAL_LENGTH_PX}")
+    print(f"ENFORCE_ZERO_SKEW       = {ENFORCE_ZERO_SKEW}")
+    print(f"EXCLUDE_VIEWS           = {sorted(EXCLUDE_VIEWS)}")
 
     pairs = find_matching_pairs(H_folder, corr_folder)
     pairs = filter_pairs(pairs, EXCLUDE_VIEWS)
 
     views: list[dict] = []
+
     for stem, h_path, corr_path in pairs:
         try:
             v = analyze_single_view(stem, h_path, corr_path)
@@ -582,20 +581,10 @@ def main() -> None:
         enforce_zero_skew=ENFORCE_ZERO_SKEW,
     )
 
-    run_leave_one_out_analysis(
+    _ = run_ba_center_pp_equal_f(
         views,
         IMAGE_SIZE,
-        enforce_zero_skew=ENFORCE_ZERO_SKEW,
-    )
-
-    # ============================================================
-    # DEBUG ONLY: fixed f, free PP, no save
-    # ============================================================
-
-    _ = run_ba_fixed_f_free_pp(
-        views,
-        IMAGE_SIZE,
-        fixed_f_px=FIXED_FOCAL_LENGTH_PX,
+        initial_f_px=INITIAL_FOCAL_LENGTH_PX,
     )
 
 

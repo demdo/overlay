@@ -10,6 +10,9 @@
     <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\checkerboard_detector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\dot_detector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\CMakeLists.txt" />

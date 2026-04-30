@@ -10,36 +10,12 @@
 
 namespace hydramarker {
 
-    /*
-     * One detected checkerboard/grid corner in image coordinates.
-     *
-     * uv:
-     *   Subpixel-refined image position.
-     *
-     * i, j:
-     *   Local grid indices assigned during grid reconstruction.
-     *   These indices are local only. They do not yet describe the global
-     *   HydraMarker field position.
-     */
     struct GridCorner {
         int i = -1;
         int j = -1;
         cv::Point2f uv;
     };
 
-    /*
-     * One valid checkerboard cell.
-     *
-     * A cell is formed by four neighboring grid corners:
-     *
-     *   0: (i,   j)
-     *   1: (i+1, j)
-     *   2: (i,   j+1)
-     *   3: (i+1, j+1)
-     *
-     * The cell center is the sampling location for the next pipeline stage,
-     * the DotDetector.
-     */
     struct GridCell {
         int i = -1;
         int j = -1;
@@ -49,15 +25,6 @@ namespace hydramarker {
         cv::Point2f center_uv;
     };
 
-    /*
-     * Complete CheckerboardDetector result.
-     *
-     * This is the output needed by the DotDetector:
-     *
-     *   - detected corners
-     *   - local grid indices
-     *   - valid cells with image-space centers
-     */
     struct CheckerboardDetection {
         std::vector<GridCorner> corners;
         std::vector<GridCell> cells;
@@ -65,14 +32,13 @@ namespace hydramarker {
         int cols = 0;
         int rows = 0;
 
+        bool tracking = false;
+
         bool valid() const {
             return !corners.empty() && !cells.empty();
         }
     };
 
-    /*
-     * Configuration for the CheckerboardDetector.
-     */
     struct CheckerboardDetectorConfig {
         cv::Size pattern_size;
         int det_width = 640;
@@ -82,22 +48,20 @@ namespace hydramarker {
         double subpix_eps = 1e-3;
 
         bool use_sb_fallback = false;
+
+        // Important:
+        // Tracking should only start from a strong full detection.
+        int min_detection_cells = 80;
+
+        // Tracking may continue with fewer cells than needed for initialization.
+        int min_tracking_cells = 40;
+        int min_tracking_points = 50;
+
+        int max_lost_frames = 2;
+
+        double max_tracking_reproj_error_px = 8.0;
     };
 
-    /*
-     * Detects the local checkerboard/grid structure of the HydraMarker board.
-     *
-     * Pipeline:
-     *
-     *   1. Convert image to grayscale.
-     *   2. Enhance contrast.
-     *   3. Segment black marker cells.
-     *   4. Extract cell corners.
-     *   5. Cluster duplicate corner candidates.
-     *   6. Refine corners to subpixel accuracy.
-     *   7. Reconstruct local grid connectivity.
-     *   8. Build valid cells from four neighboring corners.
-     */
     class CheckerboardDetector {
     public:
         explicit CheckerboardDetector(const MarkerField& field);
@@ -105,26 +69,56 @@ namespace hydramarker {
 
         std::optional<CheckerboardDetection> detect(
             const cv::Mat& image
-        ) const;
+        );
+
+        void resetTracking();
+
+        bool isTracking() const {
+            return tracking_active_;
+        }
 
     private:
         CheckerboardDetectorConfig config_;
 
-        static cv::Mat toGray(const cv::Mat& image);
+        bool tracking_active_ = false;
+        int lost_counter_ = 0;
 
-        bool detectClassic(
-            const cv::Mat& gray,
-            std::vector<cv::Point2f>& corners
-        ) const;
+        cv::Mat prev_gray_;
+
+        std::vector<cv::Point2f> tracked_grid_points_;
+        std::vector<cv::Point2f> tracked_image_points_;
+        cv::Mat H_grid_to_image_;
+
+        static cv::Mat toGray(const cv::Mat& image);
 
         void refine(
             const cv::Mat& gray,
             std::vector<cv::Point2f>& corners
         ) const;
 
+        std::optional<CheckerboardDetection> runFullDetection(
+            const cv::Mat& gray
+        ) const;
+
         CheckerboardDetection build(
             const std::vector<cv::Point2f>& corners
         ) const;
+
+        void initializeTracking(
+            const cv::Mat& gray,
+            const CheckerboardDetection& det
+        );
+
+        std::optional<CheckerboardDetection> trackFromPrevious(
+            const cv::Mat& gray
+        );
+
+        CheckerboardDetection buildDetectionFromTrackedModel(
+            const cv::Mat& gray,
+            const std::vector<cv::Point2f>& grid_points,
+            const std::vector<cv::Point2f>& image_points,
+            const cv::Mat& H
+        ) const;
     };
 
-}
+} // namespace hydramarker

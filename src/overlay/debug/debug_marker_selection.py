@@ -1,23 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-debug_marker_selection.py
-=========================
+debug_marker_selection_uv_transform.py
+======================================
 
-RAW-only Debug-Skript:
+Debug-Skript für X-ray Marker Selection mit echter UV-Transformation.
 
+Wichtig:
 - X-ray wird per Qt-Dateidialog gewählt
 - Marker-Detection läuft direkt auf dem RAW-Bild
 - 3 Anchor-Punkte werden direkt auf dem RAW-Bild gewählt
-- ROI wird direkt in RAW-Koordinaten berechnet
-- points_uv werden direkt in RAW als NPZ gespeichert
+- ROI wird zunächst in RAW-Koordinaten berechnet
+- Es wird NICHT semantisch umsortiert
+- Stattdessen werden die RAW-UVs echt in den X-ray Working-Space transformiert:
 
-Steuerung:
-  USE_FLIPPING = True   -> current/default behavior: flipped X-ray/source ordering
-  USE_FLIPPING = False  -> unflipped camera-view ordering
+      u_work = W - 1 - u_raw
+      v_work = v_raw
 
-  Linksklick  = Anchor wählen
-  R           = Reset
-  Q / ESC     = Beenden
+Gespeichert wird:
+- points_uv      : transformierte UVs im XRAY_WORKING_FLIPPED_UV Raum
+- points_uv_raw  : RAW-UVs in kanonischer Board-Reihenfolge
+- uv_space       : "XRAY_WORKING_FLIPPED_UV"
+
+Linksklick  = Anchor wählen
+R           = Reset
+Q / ESC     = Beenden
 """
 
 from __future__ import annotations
@@ -40,10 +46,8 @@ from overlay.tools.xray_marker_selection import (
 
 # ── Konfiguration ─────────────────────────────────────────────────────────────
 
-USE_FLIPPING = False  # default: True
-
 OUT_UV_PATH_DEFAULT = (
-    r"C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Data\uv_debug_raw.npz"
+    r"C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Data\uv_debug_working.npz"
 )
 
 HOUGH_PARAMS = HoughCircleParams(
@@ -64,6 +68,43 @@ DISPLAY_MAX_H = 1024
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def transform_xray_uv_raw_to_working(
+    uv_raw: np.ndarray,
+    *,
+    image_width: int,
+) -> np.ndarray:
+    """
+    RAW X-ray UV -> X-ray Working-Space UV.
+
+    Horizontaler Pixelraum-Flip:
+        u_work = W - 1 - u_raw
+        v_work = v_raw
+    """
+    uv_raw = np.asarray(uv_raw, dtype=np.float64).reshape(-1, 2)
+
+    uv_work = uv_raw.copy()
+    uv_work[:, 0] = float(image_width - 1) - uv_work[:, 0]
+
+    return uv_work
+
+
+def transform_circles_raw_to_working(
+    circles_raw: np.ndarray,
+    *,
+    image_width: int,
+) -> np.ndarray:
+    circles_raw = np.asarray(circles_raw, dtype=np.float64).reshape(-1, 3)
+
+    circles_work = circles_raw.copy()
+    circles_work[:, 0] = float(image_width - 1) - circles_work[:, 0]
+
+    return circles_work
+
+
+def flip_image_horizontal(img: np.ndarray) -> np.ndarray:
+    return cv2.flip(img, 1)
+
 
 def pick_open_file_qt() -> str | None:
     app = QApplication.instance()
@@ -173,7 +214,7 @@ def print_roi_debug(title: str, roi_uv: np.ndarray, dbg: dict) -> None:
     print("\n" + "═" * 72)
     print(title)
     print(f"  Punkte gefunden: {N}  (erwartet: {(nu + 1)}*{(nv + 1)} = {expected})")
-    print(f"  USE_FLIPPING = {USE_FLIPPING}")
+    print("  save_mode = UV_TRANSFORM_WORKING_SPACE")
     print(f"  nu={nu}  nv={nv}  pitch={dbg['pitch']:.2f}px")
     print(f"  Lu={dbg['Lu']:.1f}px  Lv={dbg['Lv']:.1f}px")
     print(f"  tol_px={dbg['tol_px']:.2f}  gate_tol_pitch={dbg['gate_tol_pitch']}")
@@ -233,10 +274,10 @@ def draw_state(
     dbg: dict | None,
     *,
     title: str,
+    footer: str,
 ) -> np.ndarray:
     vis = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
 
-    # alle detektierten Kreise
     for (x, y, r) in circles:
         if np.isfinite(x) and np.isfinite(y):
             cv2.circle(
@@ -247,7 +288,6 @@ def draw_state(
                 1,
             )
 
-    # Anchors
     anchor_labels = ["TL", "TR", "BL"]
 
     for k, idx in enumerate(anchors):
@@ -273,18 +313,18 @@ def draw_state(
             cv2.LINE_AA,
         )
 
-    # ROI
     if roi_uv is not None and dbg is not None:
         gi = np.asarray(dbg["grid_i"])
         gj = np.asarray(dbg["grid_j"])
 
         for k, (u, v) in enumerate(roi_uv):
             if gi[k] == 0:
-                color = (0, 255, 0)      # erste Zeile
+                color = (0, 255, 0)
             elif gj[k] == 0:
-                color = (0, 0, 255)      # erste Spalte
+                color = (0, 0, 255)
             else:
-                color = (255, 200, 0)    # Rest
+                color = (255, 200, 0)
+
             cv2.circle(vis, (int(round(u)), int(round(v))), 4, color, -1)
 
         for idx, label, color in point_label_sets(dbg, max_n=N_LABEL):
@@ -314,7 +354,7 @@ def draw_state(
     )
     cv2.putText(
         vis,
-        f"USE_FLIPPING={USE_FLIPPING} | Anchors: {len(anchors)}/3  |  LMB=select  R=reset  Q=quit",
+        footer,
         (10, h - 12),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
@@ -322,6 +362,7 @@ def draw_state(
         1,
         cv2.LINE_AA,
     )
+
     return vis
 
 
@@ -330,10 +371,6 @@ def make_display_transform(
     max_w: int,
     max_h: int,
 ) -> tuple[float, int, int, int, int]:
-    """
-    Returns:
-        scale, disp_w, disp_h, off_x, off_y
-    """
     h, w = img_shape[:2]
     scale = min(max_w / float(w), max_h / float(h))
     if scale <= 0:
@@ -353,12 +390,11 @@ def render_for_display(
     max_w: int,
     max_h: int,
 ) -> tuple[np.ndarray, float, int, int]:
-    """
-    Resizes while preserving aspect ratio and centers the image on a black canvas.
-    Returns:
-        canvas, scale, off_x, off_y
-    """
-    scale, disp_w, disp_h, off_x, off_y = make_display_transform(img_bgr.shape, max_w, max_h)
+    scale, disp_w, disp_h, off_x, off_y = make_display_transform(
+        img_bgr.shape,
+        max_w,
+        max_h,
+    )
 
     if abs(scale - 1.0) < 1e-12:
         resized = img_bgr.copy()
@@ -367,6 +403,7 @@ def render_for_display(
 
     canvas = np.zeros((max_h, max_w, 3), dtype=np.uint8)
     canvas[off_y:off_y + disp_h, off_x:off_x + disp_w] = resized
+
     return canvas, scale, off_x, off_y
 
 
@@ -391,6 +428,7 @@ def map_display_to_raw(
 
     u = x_rel / scale
     v = y_rel / scale
+
     return float(u), float(v)
 
 
@@ -406,14 +444,20 @@ def main():
         return
 
     print("\n" + "=" * 72)
-    print("DEBUG MARKER SELECTION")
+    print("DEBUG MARKER SELECTION — UV TRANSFORM")
     print("=" * 72)
-    print(f"USE_FLIPPING = {USE_FLIPPING}")
 
     print(f"\nLade Bild: {xray_path}")
     img_raw = load_xray(xray_path)
 
-    print("Führe Marker-Detection auf RAW image durch...")
+    Himg, Wimg = img_raw.shape[:2]
+
+    print(f"Image size: W={Wimg}, H={Himg}")
+    print("UV transform:")
+    print("  u_work = W - 1 - u_raw")
+    print("  v_work = v_raw")
+
+    print("\nFühre Marker-Detection auf RAW image durch...")
     res = run_xray_marker_detection(
         img_raw,
         hough_params=HOUGH_PARAMS,
@@ -428,19 +472,30 @@ def main():
         sys.exit(1)
 
     circles_raw = np.asarray(res.circles, dtype=np.float64).reshape(-1, 3)
+    circles_working = transform_circles_raw_to_working(
+        circles_raw,
+        image_width=Wimg,
+    )
+
     print(f"Detektiert: {len(circles_raw)} Kreise")
 
     radii = circles_raw[:, 2]
     finite_r = radii[np.isfinite(radii)]
     pick_r = 0.6 * float(np.median(finite_r)) if finite_r.size else 20.0
 
-    win_title = f"debug_marker_selection - RAW - {Path(xray_path).name}"
+    win_raw_title = f"debug_marker_selection - RAW - {Path(xray_path).name}"
+    win_work_title = f"debug_marker_selection - WORKING - {Path(xray_path).name}"
 
-    cv2.namedWindow(win_title, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(win_raw_title, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(win_work_title, cv2.WINDOW_NORMAL)
 
     anchors: list[int] = []
+
     roi_uv_raw: np.ndarray | None = None
-    dbg: dict | None = None
+    roi_uv_working: np.ndarray | None = None
+
+    dbg_raw: dict | None = None
+    dbg_working: dict | None = None
 
     display_state = {
         "scale": 1.0,
@@ -449,7 +504,11 @@ def main():
     }
 
     def on_click(event, x, y, flags, param):
-        nonlocal anchors, roi_uv_raw, dbg
+        nonlocal anchors
+        nonlocal roi_uv_raw
+        nonlocal roi_uv_working
+        nonlocal dbg_raw
+        nonlocal dbg_working
 
         if event != cv2.EVENT_LBUTTONDOWN:
             return
@@ -489,7 +548,10 @@ def main():
 
         if len(anchors) == 3:
             try:
-                roi_uv_final_, roi_idx, dbg_ = compute_roi_from_grid(
+                # compute_roi_from_grid liefert weiterhin debug_uv_raw.
+                # Wir verwenden NICHT roi_uv_final für das Speichern,
+                # weil roi_uv_final die alte semantische Umordnung enthält.
+                _, roi_idx, dbg_ = compute_roi_from_grid(
                     circles=circles_raw,
                     anchor_idx=anchors,
                     margin_px=1.1 * pick_r,
@@ -497,62 +559,111 @@ def main():
                     min_steps=2,
                 )
 
-                roi_uv_final = np.asarray(roi_uv_final_, dtype=np.float64).reshape(-1, 2)
+                dbg_raw = dict(dbg_)
 
-                if USE_FLIPPING:
-                    # current behavior: flipped / X-ray-source ordering
-                    roi_uv_raw = roi_uv_final
-                    dbg = dict(dbg_)
-                    points_uv_to_save = roi_uv_raw
-                    save_mode = "WITH_FLIPPING"
+                # KANONISCHE RAW-Reihenfolge:
+                # debug_uv_raw entspricht i_cam/j_cam, also ohne X-ray-Umsortierung.
+                roi_uv_raw = np.asarray(
+                    dbg_["debug_uv_raw"],
+                    dtype=np.float64,
+                ).reshape(-1, 2)
 
-                else:
-                    # unflipped / camera-view ordering from marker-selection debug output
-                    roi_uv_raw = np.asarray(dbg_["debug_uv_raw"], dtype=np.float64).reshape(-1, 2)
+                dbg_raw["grid_i"] = dbg_["grid_i_raw"]
+                dbg_raw["grid_j"] = dbg_["grid_j_raw"]
 
-                    dbg = dict(dbg_)
-                    dbg["grid_i"] = dbg_["grid_i_raw"]
-                    dbg["grid_j"] = dbg_["grid_j_raw"]
+                # ECHTE Pixelraum-Transformation:
+                roi_uv_working = transform_xray_uv_raw_to_working(
+                    roi_uv_raw,
+                    image_width=Wimg,
+                )
 
-                    points_uv_to_save = roi_uv_raw
-                    save_mode = "WITHOUT_FLIPPING"
+                dbg_working = dict(dbg_raw)
+                dbg_working["uv_space"] = "XRAY_WORKING_FLIPPED_UV"
+                dbg_working["uv_transform"] = "horizontal_flip"
+                dbg_working["uv_transform_formula"] = (
+                    "u_work = W - 1 - u_raw, v_work = v_raw"
+                )
 
                 np.savez(
                     out_uv_path,
-                    points_uv=points_uv_to_save.astype(np.float64),
-                    points_uv_display=roi_uv_raw.astype(np.float64),
-                    use_flipping=np.array(USE_FLIPPING, dtype=bool),
-                    save_mode=np.array(save_mode),
-                    nu=np.array(int(dbg["nu"]), dtype=np.int32),
-                    nv=np.array(int(dbg["nv"]), dtype=np.int32),
+                    # Haupt-Key für Cam2X:
+                    points_uv=roi_uv_working.astype(np.float64),
+
+                    # Debug / Rückverfolgbarkeit:
+                    points_uv_raw=roi_uv_raw.astype(np.float64),
+                    points_uv_working=roi_uv_working.astype(np.float64),
+
+                    # Anzeige:
+                    points_uv_display=roi_uv_working.astype(np.float64),
+
+                    # Metadaten:
+                    uv_space=np.array("XRAY_WORKING_FLIPPED_UV", dtype="<U64"),
+                    raw_uv_space=np.array("XRAY_RAW", dtype="<U64"),
+                    uv_transform=np.array("horizontal_flip", dtype="<U32"),
+                    uv_transform_formula=np.array(
+                        "u_work = W - 1 - u_raw, v_work = v_raw",
+                        dtype="<U64",
+                    ),
+                    semantic_reordering=np.array(False, dtype=bool),
+                    no_j_xray_reordering=np.array(True, dtype=bool),
+
+                    image_width=np.array(Wimg, dtype=np.int32),
+                    image_height=np.array(Himg, dtype=np.int32),
+
+                    nu=np.array(int(dbg_raw["nu"]), dtype=np.int32),
+                    nv=np.array(int(dbg_raw["nv"]), dtype=np.int32),
+                    grid_i=np.asarray(dbg_raw["grid_i"], dtype=np.int32),
+                    grid_j=np.asarray(dbg_raw["grid_j"], dtype=np.int32),
+
+                    anchor_idx=np.asarray(anchors, dtype=np.int32),
+                    roi_idx=np.asarray(roi_idx, dtype=np.int64),
+
+                    xray_path=np.array(str(xray_path), dtype="<U512"),
+                    save_mode=np.array("UV_TRANSFORM_WORKING_SPACE", dtype="<U64"),
                 )
 
-                print(f"[OK] saved RAW uv -> {out_uv_path}")
-                print(f"[OK] save_mode = {save_mode}")
+                print(f"[OK] saved transformed working uv -> {out_uv_path}")
+                print("[OK] save_mode = UV_TRANSFORM_WORKING_SPACE")
+                print("[OK] points_uv = XRAY_WORKING_FLIPPED_UV")
+                print("[OK] points_uv_raw also saved for debugging")
 
-                print_roi_debug(f"ROI DEBUG — {save_mode}", roi_uv_raw, dbg)
+                print_roi_debug(
+                    "ROI DEBUG — RAW canonical order",
+                    roi_uv_raw,
+                    dbg_raw,
+                )
+                print_roi_debug(
+                    "ROI DEBUG — WORKING transformed UV",
+                    roi_uv_working,
+                    dbg_working,
+                )
 
             except Exception as e:
-                print(f"[ERR] compute_roi_from_grid: {e}")
+                print(f"[ERR] compute_roi_from_grid / UV transform: {e}")
                 roi_uv_raw = None
-                dbg = None
+                roi_uv_working = None
+                dbg_raw = None
+                dbg_working = None
 
-    cv2.setMouseCallback(win_title, on_click)
+    cv2.setMouseCallback(win_raw_title, on_click)
 
-    print("\nLinksklick = 3 Anchors auf RAW image wählen | R = Reset | Q/ESC = Quit\n")
+    print("\nLinksklick = 3 Anchors auf RAW image wählen | R = Reset | Q/ESC = Quit")
+    print("Anchors weiterhin semantisch wählen: TL, TR, BL")
+    print("Gespeichert wird points_uv im transformierten Working-Space.\n")
 
     while True:
-        vis = draw_state(
+        vis_raw = draw_state(
             img_raw,
             circles_raw,
             anchors,
             roi_uv_raw,
-            dbg,
-            title="RAW view",
+            dbg_raw,
+            title="RAW view — select anchors here",
+            footer=f"Anchors: {len(anchors)}/3 | LMB=select TL/TR/BL | R=reset | Q=quit",
         )
 
-        vis_disp, scale, off_x, off_y = render_for_display(
-            vis,
+        vis_raw_disp, scale, off_x, off_y = render_for_display(
+            vis_raw,
             max_w=DISPLAY_MAX_W,
             max_h=DISPLAY_MAX_H,
         )
@@ -561,15 +672,39 @@ def main():
         display_state["off_x"] = off_x
         display_state["off_y"] = off_y
 
-        cv2.imshow(win_title, vis_disp)
+        cv2.imshow(win_raw_title, vis_raw_disp)
+
+        img_working = flip_image_horizontal(img_raw)
+
+        vis_working = draw_state(
+            img_working,
+            circles_working,
+            anchors=[],
+            roi_uv=roi_uv_working,
+            dbg=dbg_working,
+            title="WORKING view — saved points_uv lives here",
+            footer="points_uv = XRAY_WORKING_FLIPPED_UV | no semantic reordering",
+        )
+
+        vis_working_disp, _, _, _ = render_for_display(
+            vis_working,
+            max_w=DISPLAY_MAX_W,
+            max_h=DISPLAY_MAX_H,
+        )
+
+        cv2.imshow(win_work_title, vis_working_disp)
 
         key = cv2.waitKey(20) & 0xFF
+
         if key in (ord("q"), 27):
             break
+
         if key in (ord("r"), ord("R")):
             anchors = []
             roi_uv_raw = None
-            dbg = None
+            roi_uv_working = None
+            dbg_raw = None
+            dbg_working = None
             print("→ Reset.\n")
 
     cv2.destroyAllWindows()

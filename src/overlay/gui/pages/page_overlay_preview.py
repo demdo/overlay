@@ -67,6 +67,21 @@ def _draw_point(
     return out
 
 
+def _flip_xray_raw_to_working(img_gray_u8: np.ndarray) -> np.ndarray:
+    """
+    Convert RAW X-ray image display space into the X-ray working image space.
+
+    The working UV convention used by K_xray, xray_points_uv, Cam2X and H_xc is:
+        u_work = W - 1 - u_raw
+        v_work = v_raw
+
+    Therefore the image passed into the warp must be horizontally flipped.
+    H_xc itself must NOT be modified.
+    """
+    img_gray_u8 = np.asarray(img_gray_u8)
+    return np.ascontiguousarray(cv2.flip(img_gray_u8, 1))
+
+
 # ============================================================
 # Page
 # ============================================================
@@ -83,6 +98,19 @@ class OverlayPreviewPage(LiveImagePage):
     - Then the user can compute the overlay.
     - Alpha changes reuse the cached warped X-ray only.
     - Save Image stores the main overlay result data as NPZ.
+
+    X-ray coordinate convention
+    ---------------------------
+    - Loaded X-ray images are kept in RAW detector image space internally.
+    - K_xray, xray_points_uv, Cam2X and H_xc are defined in the X-ray working
+      pixel space, where u is horizontally flipped relative to RAW:
+
+          u_work = W - 1 - u_raw
+          v_work = v_raw
+
+    - Therefore, the X-ray image is horizontally flipped immediately before
+      warping/blending.
+    - H_xc is not changed for this visualization flip.
 
     Important drawing rule
     ----------------------
@@ -104,6 +132,7 @@ class OverlayPreviewPage(LiveImagePage):
         self._live_color: np.ndarray | None = None
 
         self._xray_gray_u8: np.ndarray | None = None
+        self._xray_gray_working_u8: np.ndarray | None = None
         self._snapshot_rgb_bgr: np.ndarray | None = None
         self._snapshot_rgb_with_tip_bgr: np.ndarray | None = None
 
@@ -299,6 +328,7 @@ class OverlayPreviewPage(LiveImagePage):
             snapshot_rgb_bgr=self._snapshot_rgb_bgr,
             snapshot_rgb_with_tip_bgr=self._snapshot_rgb_with_tip_bgr,
             xray_gray_u8=self._xray_gray_u8,
+            xray_gray_working_u8=self._xray_gray_working_u8,
             overlay_bgr=self._overlay_bgr,
 
             # -------------------------------------------------
@@ -338,6 +368,12 @@ class OverlayPreviewPage(LiveImagePage):
             # Metadata / bookkeeping
             # -------------------------------------------------
             xray_image_path=np.array(xray_image_path, dtype=object),
+            xray_image_space=np.array("XRAY_RAW", dtype="<U64"),
+            xray_warp_image_space=np.array("XRAY_WORKING_FLIPPED_UV", dtype="<U64"),
+            xray_working_transform=np.array(
+                "u_work = W - 1 - u_raw, v_work = v_raw",
+                dtype="<U64",
+            ),
             snapshot_taken=np.array(self._snapshot_taken, dtype=bool),
             xray_loaded=np.array(self._xray_loaded, dtype=bool),
             overlay_done=np.array(self._overlay_done, dtype=bool),
@@ -413,6 +449,7 @@ class OverlayPreviewPage(LiveImagePage):
 
         # new snapshot invalidates previous xray/overlay state
         self._xray_gray_u8 = None
+        self._xray_gray_working_u8 = None
         self._xray_loaded = False
         self._build_snapshot_base()
         self._reset_overlay_state()
@@ -475,6 +512,7 @@ class OverlayPreviewPage(LiveImagePage):
                 raise ValueError("Could not read image.")
 
             self._xray_gray_u8 = img
+            self._xray_gray_working_u8 = None
             self.state.xray_image_anatomy = img.copy()
             self.state.xray_image_anatomy_path = path
 
@@ -522,9 +560,14 @@ class OverlayPreviewPage(LiveImagePage):
             H_xc = self._compute_H_xc()
             self.state.H_xc = H_xc
 
+            # H_xc and K_xray are defined in XRAY_WORKING_FLIPPED_UV space.
+            # The loaded anatomy image is RAW, so flip the image before warping.
+            # Do NOT modify H_xc.
+            self._xray_gray_working_u8 = _flip_xray_raw_to_working(self._xray_gray_u8)
+
             out_bgr, cache = blend_xray_overlay(
                 camera_bgr=self._snapshot_rgb_bgr,
-                xray_gray_u8=self._xray_gray_u8,
+                xray_gray_u8=self._xray_gray_working_u8,
                 H_xc=self.state.H_xc,
                 alpha=self._alpha,
             )
@@ -656,6 +699,7 @@ class OverlayPreviewPage(LiveImagePage):
 
     def _reset_page_state(self) -> None:
         self._xray_gray_u8 = None
+        self._xray_gray_working_u8 = None
         self._snapshot_rgb_bgr = None
         self._snapshot_rgb_with_tip_bgr = None
 

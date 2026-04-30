@@ -228,7 +228,14 @@ class CameraToXrayCalibrationPage(StaticImagePage):
     # ---------------- Refresh ----------------
 
     def refresh(self) -> None:
+        # state.xray_image remains RAW.
+        # state.xray_points_uv is stored in XRAY_WORKING_FLIPPED_UV.
+        # Therefore, only the DISPLAY image is flipped here so that the
+        # measured/projected Working-Space UVs are visualized in the
+        # same pixel coordinate system used for Cam2X calibration.
         img = self.state.xray_image
+        if img is not None:
+            img = np.ascontiguousarray(np.fliplr(img))
 
         if hasattr(self, "instructions_label"):
             self.instructions_label.updateGeometry()
@@ -413,7 +420,7 @@ class CameraToXrayCalibrationPage(StaticImagePage):
                     dist_coeffs=None,
                     dist_coeffs_rgb=None,
                     pose_method="ippe_handeye",
-                    refine_with_iterative=False,
+                    refine_with_iterative=True,
                     pitch_mm=2.54,
                     checkerboard_corners_uv=np.asarray(
                         self.state.checkerboard_corners_uv, dtype=np.float64

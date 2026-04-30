@@ -47,8 +47,14 @@ class XrayMarkerSelectionPage(StaticImagePage):
     - The marker-selection widget shows the RAW image.
     - Detection runs on the RAW image.
     - self._circles are kept LOCAL in RAW coordinates for interaction.
-    - state.xray_points_uv is stored in RAW coordinates.
-    - K_x is calibrated in RAW coordinates, so PnP remains consistent.
+    - compute_roi_from_grid(...) returns measured UVs directly in XRAY WORKING SPACE:
+
+          u_work = W - 1 - u_raw
+          v_work = v_raw
+
+    - state.xray_points_uv receives this returned uv_final directly.
+    - The X-ray image itself is NOT flipped here. Image flipping happens later
+      when the overlay is rendered/warped.
 
     Anchor / ordering convention
     ----------------------------
@@ -64,18 +70,13 @@ class XrayMarkerSelectionPage(StaticImagePage):
     - compute_roi_from_grid(...) uses these anchors to define an affine ROI model
       for selection and ordering only.
 
-    - compute_roi_from_grid(...) first builds uv_raw in CAMERA VIEW ordering.
-
-    - For the current setup, the X-ray geometry corresponds effectively to a
-      view from the opposite side of the board. Therefore uv_raw is mirrored
-      LEFT-RIGHT to obtain uv_final.
-
     - No affine regularization or point repositioning is performed.
-      The stored points remain measured blob detections in RAW X-ray coordinates.
+      The selected points remain measured blob detections.
 
     Therefore:
-    - selection = [TL, TR, BL] in CAMERA VIEW
-    - stored state.xray_points_uv = final RAW uv_xray ordering (uv_final)
+    - selection = [TL, TR, BL] in CAMERA VIEW on the RAW image
+    - ROI extraction/order = canonical RAW board order
+    - stored state.xray_points_uv = transformed XRAY_WORKING_FLIPPED_UV
     """
 
     def __init__(self, state: SessionState, on_complete_changed, parent=None):
@@ -87,6 +88,7 @@ class XrayMarkerSelectionPage(StaticImagePage):
         # ---------------- local (page-only) runtime ----------------
         self._circles: np.ndarray | None = None       # (N,3), RAW coords
         self._pick_radius_px: float | None = None     # interaction radius
+        self._last_roi_uv_raw: np.ndarray | None = None  # local debug/display only
 
         # ======================================================
         # LEFT: replace template image_label with interactive widget
@@ -124,16 +126,13 @@ class XrayMarkerSelectionPage(StaticImagePage):
             "   TL, TR, BL in CAMERA VIEW\n"
             "\n"
             "IMPORTANT:\n"
+            "- The displayed image remains RAW in this page\n"
             "- Select anchors by real board meaning from the top-view / camera-view\n"
-            "- Do NOT select based only on naive X-ray image appearance\n"
-            "- compute_roi_from_grid(...) uses the anchors for ROI selection and ordering only\n"
-            "- uv_raw is first built in CAMERA VIEW ordering\n"
-            "- uv_raw is then mirrored LEFT-RIGHT to obtain uv_final for X-ray usage\n"
-            "- No affine regularization or point repositioning is applied\n"
-            "\n"
-            "So:\n"
-            "Select anchors by real board meaning in CAMERA VIEW,\n"
-            "not by naive X-ray image appearance."
+            "- compute_roi_from_grid(...) returns canonical RAW UVs\n"
+            "- The stored state.xray_points_uv is transformed to XRAY WORKING SPACE:\n"
+            "  u_work = W - 1 - u_raw, v_work = v_raw\n"
+            "- The X-ray image itself is flipped later during overlay rendering\n"
+            "- No semantic j_xray reordering is used anymore"
         )
 
         self.refresh()
@@ -254,6 +253,7 @@ class XrayMarkerSelectionPage(StaticImagePage):
 
             self._circles = None
             self._pick_radius_px = None
+            self._last_roi_uv_raw = None
 
             self.marker_widget.clear_selection()
             self.marker_widget.set_roi_indices([])
@@ -318,6 +318,7 @@ class XrayMarkerSelectionPage(StaticImagePage):
             self.state.xray_points_uv = None
             self.state.xray_points_confirmed = False
             self.state.xray_marker_overlay_bgr = None
+            self._last_roi_uv_raw = None
 
             self.marker_widget.clear_selection()
             self.marker_widget.set_roi_indices([])
@@ -348,10 +349,13 @@ class XrayMarkerSelectionPage(StaticImagePage):
         try:
             margin_px = 1.1 * float(self._pick_radius_px)
 
+            image_width = int(self.state.xray_image.shape[1])
+
             roi_uv_final, roi_idx, dbg = compute_roi_from_grid(
                 circles=self._circles,
                 anchor_idx=selected_idx,
                 margin_px=margin_px,
+                image_width=image_width,
                 gate_tol_pitch=0.40,
                 min_steps=2,
             )
@@ -412,10 +416,17 @@ class XrayMarkerSelectionPage(StaticImagePage):
             roi_uv_final = np.asarray(roi_uv_final, dtype=np.float64).reshape(-1, 2)
             roi_idx = np.asarray(roi_idx, dtype=np.int64).reshape(-1)
 
-            # Stored in RAW X-ray coordinates, already ordered as final uv_xray
-            # (i.e. uv_final after LEFT-RIGHT mirroring inside compute_roi_from_grid)
+            # compute_roi_from_grid(...) already returns uv_final in
+            # XRAY_WORKING_FLIPPED_UV. Do not transform again here.
             self.state.xray_points_uv = roi_uv_final.astype(float)
             self.state.xray_points_confirmed = True
+
+            if "debug_uv_raw" in dbg:
+                self._last_roi_uv_raw = np.asarray(
+                    dbg["debug_uv_raw"], dtype=np.float64
+                ).reshape(-1, 2)
+            else:
+                self._last_roi_uv_raw = None
 
             self.marker_widget.set_roi_indices(list(roi_idx.tolist()))
             self.marker_widget.set_locked(True)
@@ -436,6 +447,7 @@ class XrayMarkerSelectionPage(StaticImagePage):
             self.state.xray_points_uv = None
             self.state.xray_points_confirmed = False
             self.state.xray_marker_overlay_bgr = None
+            self._last_roi_uv_raw = None
 
             self.marker_widget.clear_selection()
             self.marker_widget.set_roi_indices([])
@@ -484,7 +496,27 @@ class XrayMarkerSelectionPage(StaticImagePage):
 
         np.savez(
             out_name,
+            # Main points used by the rest of the pipeline:
+            # XRAY_WORKING_FLIPPED_UV
             points_uv=np.asarray(self.state.xray_points_uv, dtype=np.float64),
+
+            # Debug / traceability:
+            points_uv_working=np.asarray(self.state.xray_points_uv, dtype=np.float64),
+            points_uv_raw=np.asarray(
+                dbg.get("points_uv_raw", dbg.get("debug_uv_raw", [])),
+                dtype=np.float64,
+            ).reshape(-1, 2),
+            uv_space=np.array("XRAY_WORKING_FLIPPED_UV", dtype="<U64"),
+            raw_uv_space=np.array("XRAY_RAW_CANONICAL_BOARD_ORDER", dtype="<U64"),
+            uv_transform=np.array("horizontal_flip", dtype="<U32"),
+            uv_transform_formula=np.array(
+                "u_work = W - 1 - u_raw, v_work = v_raw",
+                dtype="<U64",
+            ),
+            semantic_reordering=np.array(False, dtype=bool),
+            no_j_xray_reordering=np.array(True, dtype=bool),
+            image_width=np.array(int(dbg.get("image_width", -1)), dtype=np.int32),
+
             anchor_indices=np.asarray(selected_idx, dtype=np.int64),
             roi_indices=np.asarray(roi_idx, dtype=np.int64),
             circles_uvr=(
@@ -521,11 +553,12 @@ class XrayMarkerSelectionPage(StaticImagePage):
 
         Note
         ----
-        state.xray_points_uv stores the final uv_xray ordering (uv_final),
-        but all points remain in RAW pixel coordinates.
+        state.xray_points_uv is stored in XRAY WORKING SPACE. The page itself
+        does not transform these points. For the RAW preview overlay, this uses
+        the locally stored RAW ROI points from the selection debug data.
         """
         img_raw = self.state.xray_image
-        uv_raw = self.state.xray_points_uv
+        uv_raw = self._last_roi_uv_raw
 
         if img_raw is None or uv_raw is None or len(uv_raw) == 0:
             return None

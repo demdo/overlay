@@ -63,18 +63,11 @@ class PlaneFittingPage(LiveImagePage):
        on the same averaged depth map. Each cycle uses a different random seed so
        RANSAC point sampling varies.
 
-    Grid reconstruction modes
-    -------------------------
-    1) plane_3corners
-       - use TL / TR / BL
-       - intersect these 3 rays with the fitted plane
-       - interpolate full 11x11 grid in 3D
-
-    2) plane_9corners_h
-       - use all 9 checkerboard corners
-       - estimate board->image homography in UV
-       - generate full 11x11 UV grid
-       - intersect all 121 rays with the fitted plane
+    Grid reconstruction
+    -------------------
+    - always use TL / TR / BL
+    - intersect these 3 rays with the fitted plane
+    - interpolate full 11x11 grid in 3D
 
     IMPORTANT:
     - This page MUST NOT add any new SessionState fields dynamically.
@@ -82,7 +75,6 @@ class PlaneFittingPage(LiveImagePage):
         * xray_points_xyz_c
         * plane_confirmed
         * checkerboard_corners_uv
-        * checkerboard_corners_uv_9
         * checkerboard_corners_confirmed
     """
 
@@ -111,17 +103,6 @@ class PlaneFittingPage(LiveImagePage):
 
         # ---------------- local config ----------------
         self.steps_per_edge = 10
-        self.grid_rows = 11
-        self.grid_cols = 11
-        self.grid_pitch_mm = 2.54
-        self.corner_step = 5
-
-        # ---------------- grid reconstruction mode ----------------
-        self._grid_reconstruction_mode = "plane_3corners"
-        # alternatives:
-        #   "plane_3corners"
-        #   "plane_9corners_h"
-
         # ---------------- depth averaging ----------------
         self.use_temporal_filter = True
         self.temporal_alpha = 0.1
@@ -180,8 +161,7 @@ class PlaneFittingPage(LiveImagePage):
             "1) Press Start to open RGB-D\n"
             "2) Move checkerboard until FOUND\n"
             "3) Press SPACE to capture\n"
-            "4) Confirm corners to run plane fitting\n"
-            "5) Choose grid reconstruction mode on the right"
+            "4) Confirm corners to run plane fitting"
         )
 
         self.set_viewport_background(active=False)
@@ -221,19 +201,6 @@ class PlaneFittingPage(LiveImagePage):
         self.chk_depth_tuning.toggled.connect(self._on_use_tuning_changed)
         self.chk_depth_tuning.setFocusPolicy(Qt.NoFocus)
 
-        self.chk_mode_3corners = QCheckBox("3 corners")
-        self.chk_mode_9corners_h = QCheckBox("9 corners + H")
-
-        self.chk_mode_3corners.setChecked(True)
-        self.chk_mode_9corners_h.setChecked(False)
-
-        self.chk_mode_3corners.toggled.connect(
-            lambda checked: self._on_grid_mode_toggled("plane_3corners", checked)
-        )
-        self.chk_mode_9corners_h.toggled.connect(
-            lambda checked: self._on_grid_mode_toggled("plane_9corners_h", checked)
-        )
-
         wrap = QWidget()
         wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         row = QHBoxLayout(wrap)
@@ -246,41 +213,10 @@ class PlaneFittingPage(LiveImagePage):
         col.setSpacing(8)
         col.addWidget(self.chk_show_depth)
         col.addWidget(self.chk_depth_tuning)
-        col.addSpacing(8)
-        col.addWidget(self.chk_mode_3corners)
-        col.addWidget(self.chk_mode_9corners_h)
         col.addStretch(1)
 
         row.addLayout(col, 1)
         self.controls_content.addWidget(wrap)
-
-    def _on_grid_mode_toggled(self, mode: str, checked: bool) -> None:
-        """
-        Keep the two mode checkboxes mutually exclusive.
-        If the active one is unchecked and none remain selected,
-        revert to 3-corner mode.
-        """
-        if checked:
-            self._grid_reconstruction_mode = mode
-
-            self.chk_mode_3corners.blockSignals(True)
-            self.chk_mode_9corners_h.blockSignals(True)
-
-            self.chk_mode_3corners.setChecked(mode == "plane_3corners")
-            self.chk_mode_9corners_h.setChecked(mode == "plane_9corners_h")
-
-            self.chk_mode_3corners.blockSignals(False)
-            self.chk_mode_9corners_h.blockSignals(False)
-            return
-
-        if not (
-            self.chk_mode_3corners.isChecked()
-            or self.chk_mode_9corners_h.isChecked()
-        ):
-            self.chk_mode_3corners.blockSignals(True)
-            self.chk_mode_3corners.setChecked(True)
-            self.chk_mode_3corners.blockSignals(False)
-            self._grid_reconstruction_mode = "plane_3corners"
 
     def _update_panels(self) -> None:
         rows = self.stats_rows()
@@ -604,7 +540,6 @@ class PlaneFittingPage(LiveImagePage):
         self.state.xray_points_xyz_c = None
         self.state.plane_confirmed = False
         self.state.checkerboard_corners_uv = None
-        self.state.checkerboard_corners_uv_9 = None
         self.state.checkerboard_corners_confirmed = False
 
         self._plane_kf.reset()
@@ -786,7 +721,6 @@ class PlaneFittingPage(LiveImagePage):
             self._stats = []
             self._last_stats_rows = None
             self.state.checkerboard_corners_uv = None
-            self.state.checkerboard_corners_uv_9 = None
             self.state.checkerboard_corners_confirmed = False
             self.set_viewport_background(active=True)
             self.start_timer(self.FPS)
@@ -801,9 +735,6 @@ class PlaneFittingPage(LiveImagePage):
         self._seed = 0
 
         self.state.checkerboard_corners_uv = ext_uv
-        self.state.checkerboard_corners_uv_9 = (
-            np.asarray(self._corners_full, dtype=np.float64).reshape(9, 2).copy()
-        )
         self.state.checkerboard_corners_confirmed = True
 
         self._collect_fits()
@@ -826,7 +757,6 @@ class PlaneFittingPage(LiveImagePage):
 
         print(f"[PlaneFitting] Starting {self.n_fit_runs} fit runs on frozen depth map …")
         print(f"[PlaneFitting] SNAPSHOT_MODE = '{SNAPSHOT_MODE}'")
-        print(f"[PlaneFitting] Grid mode = '{self._grid_reconstruction_mode}'")
 
         last_marker_xyz_filtered: np.ndarray | None = None
         last_stats: list[str] = []
@@ -988,36 +918,15 @@ class PlaneFittingPage(LiveImagePage):
             return np.empty((0, 3), dtype=np.float64)
 
         try:
-            if self._grid_reconstruction_mode == "plane_3corners":
-                corner_xyz = rpf.intersect_pixels_with_plane(
-                    self._ext_uv,
-                    self.state.K_rgb,
-                    plane,
-                    None,
-                )
-                return rpf.interpolate_marker_grid(
-                    corner_xyz,
-                    steps_per_edge=int(self.steps_per_edge),
-                )
-
-            if self._grid_reconstruction_mode == "plane_9corners_h":
-                corners_uv_9 = np.asarray(self._corners_full, dtype=np.float64).reshape(9, 2)
-                grid_uv = cbd.interpolate_grid_uv(
-                    corners_uv=corners_uv_9,
-                    nrows=int(self.grid_rows),
-                    ncols=int(self.grid_cols),
-                    pitch_mm=float(self.grid_pitch_mm),
-                    corner_step=int(self.corner_step),
-                )
-                return rpf.intersect_pixels_with_plane(
-                    grid_uv,
-                    self.state.K_rgb,
-                    plane,
-                    None,
-                )
-
-            raise ValueError(
-                f"Unknown grid reconstruction mode: {self._grid_reconstruction_mode}"
+            corner_xyz = rpf.intersect_pixels_with_plane(
+                self._ext_uv,
+                self.state.K_rgb,
+                plane,
+                None,
+            )
+            return rpf.interpolate_marker_grid(
+                corner_xyz,
+                steps_per_edge=int(self.steps_per_edge),
             )
 
         except Exception as e:
@@ -1074,8 +983,6 @@ class PlaneFittingPage(LiveImagePage):
                     arrays["run_index"] = np.array([run_idx], dtype=np.int32)
                 if seed is not None:
                     arrays["seed"] = np.array([seed], dtype=np.int32)
-
-                arrays["grid_reconstruction_mode"] = np.array(self._grid_reconstruction_mode)
 
                 if plane_single is not None:
                     arrays["plane_abcd_single"] = np.asarray(plane_single, dtype=np.float64)
@@ -1134,8 +1041,6 @@ class PlaneFittingPage(LiveImagePage):
                 fname = DEBUG_SNAPSHOT_DIR / f"plane_session_{ts}.npz"
 
                 arrays: dict[str, np.ndarray] = {}
-                arrays["grid_reconstruction_mode"] = np.array(self._grid_reconstruction_mode)
-
                 if session_planes_raw is not None:
                     arrays["planes_raw"] = np.asarray(session_planes_raw, dtype=np.float64)
                 if session_planes_filt is not None:
@@ -1191,5 +1096,3 @@ class PlaneFittingPage(LiveImagePage):
         self.btn_start.setEnabled(self._mode == "idle")
         self.chk_show_depth.setEnabled(self._mode in ("live", "frozen"))
         self.chk_depth_tuning.setEnabled(self.pipeline is None or self._mode == "live")
-        self.chk_mode_3corners.setEnabled(self._mode in ("idle", "live", "frozen"))
-        self.chk_mode_9corners_h.setEnabled(self._mode in ("idle", "live", "frozen"))

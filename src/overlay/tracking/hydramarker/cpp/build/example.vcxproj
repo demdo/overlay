@@ -429,6 +429,7 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
     <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\generator_HydraMarker.cpp" />
     <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\marker_field.cpp" />
     <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\checkerboard_detector.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\dot_detector.cpp" />
   </ItemGroup>
   <ItemGroup />
   <ItemGroup>

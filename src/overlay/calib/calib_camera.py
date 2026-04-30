@@ -4,11 +4,24 @@
 ChArUco / ArUco camera calibration utilities.
 
 - ONLY ChArUco / ArUco
-- Robust for OpenCV 4.x (uses interpolateCornersCharuco)
+- Robust for OpenCV 4.x old + new APIs
 - Supports:
     * Intrinsics calibration from multiple RGB images
     * Pose estimation on new images
     * Average reprojection error on new images
+
+Compatibility notes
+-------------------
+Some OpenCV builds still expose the classic contrib functions:
+    - cv2.aruco.interpolateCornersCharuco
+    - cv2.aruco.calibrateCameraCharuco
+
+Newer OpenCV builds may expose instead:
+    - cv2.aruco.CharucoDetector
+
+and may no longer expose the old ChArUco interpolation/calibration helpers.
+This module therefore keeps the public project interface unchanged, but uses
+small compatibility wrappers internally.
 """
 
 from __future__ import annotations
@@ -54,6 +67,106 @@ def _image_size(img: np.ndarray) -> Tuple[int, int]:
     return (w, h)
 
 
+def _make_detector_params() -> Any:
+    """
+    Create ArUco detector parameters compatible with older/newer OpenCV builds.
+    """
+    if hasattr(cv2.aruco, "DetectorParameters"):
+        return cv2.aruco.DetectorParameters()
+    if hasattr(cv2.aruco, "DetectorParameters_create"):
+        return cv2.aruco.DetectorParameters_create()
+    raise RuntimeError("No compatible ArUco DetectorParameters API found.")
+
+
+def _detect_aruco_markers(
+    gray: np.ndarray,
+    aruco_dict: Any,
+    detector_params: Optional[Any],
+) -> tuple[List[np.ndarray], Optional[np.ndarray]]:
+    """
+    Detect ArUco markers with old/new OpenCV API.
+    """
+    if detector_params is None:
+        detector_params = _make_detector_params()
+
+    if hasattr(cv2.aruco, "ArucoDetector"):
+        detector = cv2.aruco.ArucoDetector(aruco_dict, detector_params)
+        aruco_corners, aruco_ids, _ = detector.detectMarkers(gray)
+    else:
+        aruco_corners, aruco_ids, _ = cv2.aruco.detectMarkers(
+            gray,
+            aruco_dict,
+            parameters=detector_params,
+        )
+
+    return aruco_corners, aruco_ids
+
+
+def _interpolate_charuco_compat(
+    *,
+    gray: np.ndarray,
+    board: Any,
+    aruco_corners: List[np.ndarray],
+    aruco_ids: np.ndarray,
+) -> tuple[int, Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Interpolate ChArUco corners with old or new OpenCV API.
+
+    Returns
+    -------
+    ret : int
+        Number of interpolated ChArUco corners.
+    cc : np.ndarray | None
+        ChArUco corners, shape (N,1,2).
+    ci : np.ndarray | None
+        ChArUco ids, shape (N,1).
+    """
+    # ------------------------------------------------------------
+    # OLD API: classic opencv-contrib
+    # ------------------------------------------------------------
+    if hasattr(cv2.aruco, "interpolateCornersCharuco"):
+        ret, cc, ci = cv2.aruco.interpolateCornersCharuco(
+            markerCorners=aruco_corners,
+            markerIds=aruco_ids,
+            image=gray,
+            board=board,
+        )
+
+        n = 0 if ret is None else int(ret)
+        if n <= 0 or cc is None or ci is None:
+            return 0, None, None
+        return n, cc, ci
+
+    # ------------------------------------------------------------
+    # NEW API: OpenCV builds with CharucoDetector
+    # ------------------------------------------------------------
+    if hasattr(cv2.aruco, "CharucoDetector"):
+        # Keep behavior close to the old call: no camera matrix / distortion.
+        if hasattr(cv2.aruco, "CharucoParameters"):
+            charuco_params = cv2.aruco.CharucoParameters()
+            charuco_params.cameraMatrix = None
+            charuco_params.distCoeffs = None
+            detector = cv2.aruco.CharucoDetector(
+                board,
+                charucoParams=charuco_params,
+            )
+        else:
+            detector = cv2.aruco.CharucoDetector(board)
+
+        cc, ci, _, _ = detector.detectBoard(
+            gray,
+            markerCorners=aruco_corners,
+            markerIds=aruco_ids,
+        )
+
+        if cc is None or ci is None or len(ci) == 0:
+            return 0, None, None
+
+        return int(len(ci)), cc, ci
+
+    raise RuntimeError("No compatible ChArUco interpolation API available in cv2.aruco.")
+
+
 def detect_charuco(
     image: np.ndarray,
     board: Any,
@@ -62,32 +175,28 @@ def detect_charuco(
 ) -> CharucoDetection:
     """
     Detect ArUco markers and interpolate ChArUco corners.
+
+    The public return type is unchanged across OpenCV versions.
     """
     gray = _ensure_gray(image)
 
-    if detector_params is None:
-        detector_params = cv2.aruco.DetectorParameters()
-
-    # ArUco detection
-    if hasattr(cv2.aruco, "ArucoDetector"):
-        detector = cv2.aruco.ArucoDetector(aruco_dict, detector_params)
-        aruco_corners, aruco_ids, _ = detector.detectMarkers(gray)
-    else:
-        aruco_corners, aruco_ids, _ = cv2.aruco.detectMarkers(
-            gray, aruco_dict, parameters=detector_params
-        )
+    aruco_corners, aruco_ids = _detect_aruco_markers(
+        gray=gray,
+        aruco_dict=aruco_dict,
+        detector_params=detector_params,
+    )
 
     charuco_corners = None
     charuco_ids = None
 
     if aruco_ids is not None and len(aruco_ids) > 0:
-        ret, cc, ci = cv2.aruco.interpolateCornersCharuco(
-            markerCorners=aruco_corners,
-            markerIds=aruco_ids,
-            image=gray,
+        ret, cc, ci = _interpolate_charuco_compat(
+            gray=gray,
             board=board,
+            aruco_corners=aruco_corners,
+            aruco_ids=aruco_ids,
         )
-        if ret is not None and ret > 0:
+        if ret > 0:
             charuco_corners, charuco_ids = cc, ci
 
     return CharucoDetection(
@@ -107,6 +216,79 @@ def _charuco_object_points(board: Any, charuco_ids: np.ndarray) -> np.ndarray:
     all_obj = board.getChessboardCorners()  # (Nc,3)
     ids = charuco_ids.reshape(-1).astype(int)
     return all_obj[ids, :].astype(np.float32)
+
+
+def _calibrate_charuco_compat(
+    *,
+    all_charuco_corners: Sequence[np.ndarray],
+    all_charuco_ids: Sequence[np.ndarray],
+    board: Any,
+    image_size: Tuple[int, int],
+    K_init: np.ndarray,
+    dist_init: np.ndarray,
+    flags: int,
+    criteria: Tuple[int, int, float],
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """
+    Calibrate camera from ChArUco detections with old or new OpenCV API.
+
+    Old API:
+        cv2.aruco.calibrateCameraCharuco(...)
+
+    Fallback for new builds without calibrateCameraCharuco:
+        explicitly map each ChArUco id to its board object point and call
+        cv2.calibrateCamera(...).
+    """
+    # ------------------------------------------------------------
+    # OLD API: classic opencv-contrib
+    # ------------------------------------------------------------
+    if hasattr(cv2.aruco, "calibrateCameraCharuco"):
+        rms, K, dist, _, _ = cv2.aruco.calibrateCameraCharuco(
+            charucoCorners=all_charuco_corners,
+            charucoIds=all_charuco_ids,
+            board=board,
+            imageSize=image_size,
+            cameraMatrix=K_init,
+            distCoeffs=dist_init,
+            flags=flags,
+            criteria=criteria,
+        )
+        return float(rms), np.asarray(K, dtype=np.float64), np.asarray(dist, dtype=np.float64)
+
+    # ------------------------------------------------------------
+    # NEW API fallback: standard camera calibration from explicit
+    # object/image point correspondences.
+    # ------------------------------------------------------------
+    object_points: list[np.ndarray] = []
+    image_points: list[np.ndarray] = []
+
+    for corners, ids in zip(all_charuco_corners, all_charuco_ids):
+        if corners is None or ids is None:
+            continue
+
+        obj = _charuco_object_points(board, ids).astype(np.float32)
+        img = np.asarray(corners, dtype=np.float32).reshape(-1, 2)
+
+        if obj.shape[0] != img.shape[0] or obj.shape[0] < 4:
+            continue
+
+        object_points.append(obj)
+        image_points.append(img)
+
+    if len(object_points) < 3:
+        raise RuntimeError("Not enough valid ChArUco views for fallback calibration.")
+
+    rms, K, dist, _, _ = cv2.calibrateCamera(
+        objectPoints=object_points,
+        imagePoints=image_points,
+        imageSize=image_size,
+        cameraMatrix=K_init,
+        distCoeffs=dist_init,
+        flags=flags,
+        criteria=criteria,
+    )
+
+    return float(rms), np.asarray(K, dtype=np.float64), np.asarray(dist, dtype=np.float64)
 
 
 # =========================
@@ -167,13 +349,13 @@ def calibrate_charuco_intrinsics(
     K_init = np.eye(3, dtype=np.float64)
     dist_init = np.zeros((5, 1), dtype=np.float64)
 
-    rms, K, dist, _, _ = cv2.aruco.calibrateCameraCharuco(
-        charucoCorners=all_charuco_corners,
-        charucoIds=all_charuco_ids,
+    rms, K, dist = _calibrate_charuco_compat(
+        all_charuco_corners=all_charuco_corners,
+        all_charuco_ids=all_charuco_ids,
         board=board,
-        imageSize=image_size,
-        cameraMatrix=K_init,
-        distCoeffs=dist_init,
+        image_size=image_size,
+        K_init=K_init,
+        dist_init=dist_init,
         flags=flags,
         criteria=criteria,
     )
@@ -186,6 +368,16 @@ def calibrate_charuco_intrinsics(
         "per_image_num_charuco": per_img_charuco,
         "per_image_num_aruco": per_img_aruco,
         "rms": float(rms),
+        "charuco_interpolation_api": (
+            "interpolateCornersCharuco"
+            if hasattr(cv2.aruco, "interpolateCornersCharuco")
+            else "CharucoDetector"
+        ),
+        "charuco_calibration_api": (
+            "calibrateCameraCharuco"
+            if hasattr(cv2.aruco, "calibrateCameraCharuco")
+            else "calibrateCamera_fallback"
+        ),
     }
 
     return K, dist, float(rms), stats
@@ -218,7 +410,11 @@ def estimate_charuco_pose(
     img_pts = det.charuco_corners.reshape(-1, 2).astype(np.float32)
 
     ok, rvec, tvec = cv2.solvePnP(
-        obj_pts, img_pts, K, dist, flags=cv2.SOLVEPNP_ITERATIVE
+        obj_pts,
+        img_pts,
+        K,
+        dist,
+        flags=cv2.SOLVEPNP_ITERATIVE,
     )
 
     return rvec, tvec, det, bool(ok)
@@ -245,7 +441,13 @@ def reprojection_error_charuco(
 
     for i, img in enumerate(test_images):
         rvec, tvec, det, ok = estimate_charuco_pose(
-            img, board, aruco_dict, K, dist, detector_params, min_charuco_corners
+            img,
+            board,
+            aruco_dict,
+            K,
+            dist,
+            detector_params,
+            min_charuco_corners,
         )
 
         per_img_charuco.append(det.num_charuco)
@@ -276,6 +478,11 @@ def reprojection_error_charuco(
         "used_indices": used_idx,
         "per_image_num_charuco": per_img_charuco,
         "per_image_num_aruco": per_img_aruco,
+        "charuco_interpolation_api": (
+            "interpolateCornersCharuco"
+            if hasattr(cv2.aruco, "interpolateCornersCharuco")
+            else "CharucoDetector"
+        ),
     }
 
     return mean_px, per_view, stats

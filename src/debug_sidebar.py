@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import sys
+
 import cv2
 import numpy as np
 import pyrealsense2 as rs
 
-from PySide6.QtCore import Qt, QTimer, QRect
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -13,7 +14,6 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QSizePolicy,
     QSlider,
     QToolButton,
@@ -32,71 +32,77 @@ def _np_to_qpixmap(img_bgr: np.ndarray) -> QPixmap:
 
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     h, w, ch = img_rgb.shape
-    bytes_per_line = ch * w
 
     qimg = QImage(
         img_rgb.data,
         w,
         h,
-        bytes_per_line,
+        ch * w,
         QImage.Format_RGB888,
     )
     return QPixmap.fromImage(qimg.copy())
 
 
 # ============================================================
-# Right slide-out control rail
+# Professional sidebar — scaled 60%
 # ============================================================
 
 class _OverlayControlRail(QFrame):
     """
-    Professional right-side drawer:
-    - collapsed: only slim handle visible
-    - expanded: clean side panel opens to the left
+    Standalone debug version of the live-overlay sidebar.
+
+    - Starts collapsed.
+    - Can be opened/closed repeatedly.
+    - Overall size is scaled to 60% of the previous version.
     """
 
-    HANDLE_W = 26
-    PANEL_W = 320
-    PANEL_H = 290
-    RADIUS = 18
-    HANDLE_RADIUS = 16
+    SCALE = 0.60
+
+    HANDLE_W = int(round(34 * SCALE))
+    PANEL_W = int(round(380 * SCALE))
+    PANEL_H = int(round(330 * SCALE))
+    GAP = int(round(10 * SCALE))
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
 
-        self._expanded = True
+        self._expanded = False
 
         self.setObjectName("overlayControlRail")
         self.setFrameShape(QFrame.NoFrame)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.setAttribute(Qt.WA_StyledBackground, True)
 
+        # ---------------- Handle ----------------
         self.handle = QToolButton(self)
         self.handle.setObjectName("overlayRailHandle")
-        self.handle.setText("❯")
+        self.handle.setText("‹")
         self.handle.setCursor(Qt.PointingHandCursor)
-        self.handle.setToolTip("Hide controls")
+        self.handle.setToolTip("Show overlay controls")
         self.handle.clicked.connect(self._toggle)
 
+        # ---------------- Panel ----------------
         self.panel = QFrame(self)
         self.panel.setObjectName("overlayRailPanel")
         self.panel.setFrameShape(QFrame.NoFrame)
+        self.panel.setAttribute(Qt.WA_StyledBackground, True)
 
+        # Compact title: no subtitle
         self.title_label = QLabel("Overlay Controls")
         self.title_label.setObjectName("overlayRailTitle")
+        self.title_label.setFixedWidth(self._s(230))
 
-        self.subtitle_label = QLabel("Live adjustment")
-        self.subtitle_label.setObjectName("overlayRailSubtitle")
-
-        # ---------- Alpha ----------
+        # ---------------- Alpha ----------------
         self.lbl_alpha = QLabel("Alpha")
         self.lbl_alpha.setObjectName("overlayRailLabel")
 
         self.lbl_alpha_value = QLabel("0.50")
         self.lbl_alpha_value.setObjectName("overlayRailValue")
+        self.lbl_alpha_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         alpha_head = QHBoxLayout()
         alpha_head.setContentsMargins(0, 0, 0, 0)
-        alpha_head.setSpacing(10)
+        alpha_head.setSpacing(self._s(12))
         alpha_head.addWidget(self.lbl_alpha)
         alpha_head.addStretch(1)
         alpha_head.addWidget(self.lbl_alpha_value)
@@ -108,17 +114,19 @@ class _OverlayControlRail(QFrame):
         self.slider_alpha.setSingleStep(1)
         self.slider_alpha.setPageStep(10)
         self.slider_alpha.setTracking(True)
+        self.slider_alpha.setMinimumHeight(self._s(28))
 
-        # ---------- d_x ----------
-        self.lbl_dx = QLabel("d_x [mm]")
+        # ---------------- d_x ----------------
+        self.lbl_dx = QLabel("Plane depth")
         self.lbl_dx.setObjectName("overlayRailLabel")
 
         self.lbl_dx_value = QLabel("0.0")
         self.lbl_dx_value.setObjectName("overlayRailValue")
+        self.lbl_dx_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         dx_head = QHBoxLayout()
         dx_head.setContentsMargins(0, 0, 0, 0)
-        dx_head.setSpacing(10)
+        dx_head.setSpacing(self._s(12))
         dx_head.addWidget(self.lbl_dx)
         dx_head.addStretch(1)
         dx_head.addWidget(self.lbl_dx_value)
@@ -130,46 +138,45 @@ class _OverlayControlRail(QFrame):
         self.slider_dx.setSingleStep(1)
         self.slider_dx.setPageStep(10)
         self.slider_dx.setTracking(True)
+        self.slider_dx.setMinimumHeight(self._s(28))
 
-        # ---------- Tip ----------
-        self.chk_show_tip = QCheckBox("Show tip")
+        # ---------------- Tip ----------------
+        self.chk_show_tip = QCheckBox("Show pointer tip")
         self.chk_show_tip.setObjectName("overlayRailCheck")
         self.chk_show_tip.setChecked(True)
+        self.chk_show_tip.setMinimumHeight(self._s(26))
 
-        # ---------- Group cards ----------
+        # ---------------- Cards ----------------
         alpha_card = QFrame()
         alpha_card.setObjectName("overlayRailGroup")
+        alpha_card.setAttribute(Qt.WA_StyledBackground, True)
         alpha_layout = QVBoxLayout(alpha_card)
-        alpha_layout.setContentsMargins(16, 14, 16, 14)
-        alpha_layout.setSpacing(12)
+        alpha_layout.setContentsMargins(self._s(18), self._s(14), self._s(18), self._s(14))
+        alpha_layout.setSpacing(self._s(10))
         alpha_layout.addLayout(alpha_head)
         alpha_layout.addWidget(self.slider_alpha)
 
         dx_card = QFrame()
         dx_card.setObjectName("overlayRailGroup")
+        dx_card.setAttribute(Qt.WA_StyledBackground, True)
         dx_layout = QVBoxLayout(dx_card)
-        dx_layout.setContentsMargins(16, 14, 16, 14)
-        dx_layout.setSpacing(12)
+        dx_layout.setContentsMargins(self._s(18), self._s(14), self._s(18), self._s(14))
+        dx_layout.setSpacing(self._s(10))
         dx_layout.addLayout(dx_head)
         dx_layout.addWidget(self.slider_dx)
 
         tip_card = QFrame()
         tip_card.setObjectName("overlayRailGroup")
+        tip_card.setAttribute(Qt.WA_StyledBackground, True)
         tip_layout = QVBoxLayout(tip_card)
-        tip_layout.setContentsMargins(16, 14, 16, 14)
-        tip_layout.setSpacing(10)
+        tip_layout.setContentsMargins(self._s(18), self._s(13), self._s(18), self._s(13))
+        tip_layout.setSpacing(0)
         tip_layout.addWidget(self.chk_show_tip)
 
-        header_layout = QVBoxLayout()
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setSpacing(3)
-        header_layout.addWidget(self.title_label)
-        header_layout.addWidget(self.subtitle_label)
-
         panel_layout = QVBoxLayout(self.panel)
-        panel_layout.setContentsMargins(18, 18, 18, 18)
-        panel_layout.setSpacing(14)
-        panel_layout.addLayout(header_layout)
+        panel_layout.setContentsMargins(self._s(22), self._s(22), self._s(22), self._s(22))
+        panel_layout.setSpacing(self._s(16))
+        panel_layout.addWidget(self.title_label, 0, Qt.AlignLeft)
         panel_layout.addWidget(alpha_card)
         panel_layout.addWidget(dx_card)
         panel_layout.addWidget(tip_card)
@@ -178,10 +185,13 @@ class _OverlayControlRail(QFrame):
         self._apply_style()
         self._update_geometry()
 
+    def _s(self, value: float) -> int:
+        return max(1, int(round(float(value) * self.SCALE)))
+
     def _toggle(self) -> None:
         self._expanded = not self._expanded
-        self.handle.setText("❯" if self._expanded else "❮")
-        self.handle.setToolTip("Hide controls" if self._expanded else "Show controls")
+        self.handle.setText("›" if self._expanded else "‹")
+        self.handle.setToolTip("Hide overlay controls" if self._expanded else "Show overlay controls")
         self._update_geometry()
 
         parent = self.parentWidget()
@@ -189,111 +199,158 @@ class _OverlayControlRail(QFrame):
             parent._position_controls()
 
     def _update_geometry(self) -> None:
-        total_w = self.PANEL_W + self.HANDLE_W + 6 if self._expanded else self.HANDLE_W
-        self.setFixedSize(total_w, self.PANEL_H)
-
-        handle_margin_y = 14
-        handle_h = self.PANEL_H - 2 * handle_margin_y
+        handle_h = self._s(86)
+        handle_y = 0
 
         if self._expanded:
+            total_w = self.PANEL_W + self.GAP + self.HANDLE_W
+            total_h = self.PANEL_H
+            self.setFixedSize(total_w, total_h)
+
             self.panel.show()
             self.panel.setGeometry(0, 0, self.PANEL_W, self.PANEL_H)
-            self.handle.setGeometry(self.PANEL_W + 6, handle_margin_y, self.HANDLE_W, handle_h)
+            self.handle.setGeometry(
+                self.PANEL_W + self.GAP,
+                handle_y,
+                self.HANDLE_W,
+                handle_h,
+            )
         else:
             self.panel.hide()
-            self.handle.setGeometry(0, handle_margin_y, self.HANDLE_W, handle_h)
+            self.setFixedSize(self.HANDLE_W, handle_h)
+            self.handle.setGeometry(0, 0, self.HANDLE_W, handle_h)
 
     def _apply_style(self) -> None:
+        border_radius_panel = self._s(22)
+        border_radius_handle = self._s(17)
+        border_radius_group = self._s(16)
+        checkbox_radius = self._s(5)
+
+        font_title = self._s(22)
+        font_label = self._s(14)
+        font_handle = self._s(28)
+
+        slider_groove_h = self._s(7)
+        slider_handle = self._s(18)
+        slider_handle_margin = -self._s(6)
+
+        checkbox_size = self._s(18)
+
         self.setStyleSheet(
             f"""
+            QFrame#overlayControlRail {{
+                background: transparent;
+                border: none;
+            }}
+
             QFrame#overlayRailPanel {{
-                background: rgba(248, 250, 252, 242);
-                border: 1px solid rgba(15, 23, 42, 26);
-                border-radius: {self.RADIUS}px;
+                background-color: rgba(18, 24, 38, 232);
+                border: 1px solid rgba(255, 255, 255, 44);
+                border-radius: {border_radius_panel}px;
             }}
 
             QToolButton#overlayRailHandle {{
-                background: rgba(248, 250, 252, 236);
-                border: 1px solid rgba(15, 23, 42, 24);
-                border-radius: {self.HANDLE_RADIUS}px;
-                color: #0f172a;
-                font-size: 13px;
+                background-color: rgba(18, 24, 38, 226);
+                border: 1px solid rgba(255, 255, 255, 50);
+                border-radius: {border_radius_handle}px;
+                color: #f8fafc;
+                font-size: {font_handle}px;
                 font-weight: 700;
                 padding: 0px;
-                text-align: center;
             }}
 
             QToolButton#overlayRailHandle:hover {{
-                background: rgba(255, 255, 255, 245);
+                background-color: rgba(30, 41, 59, 242);
+                border: 1px solid rgba(96, 165, 250, 150);
+                color: #ffffff;
             }}
 
             QLabel#overlayRailTitle {{
-                color: #0f172a;
-                font-size: 18px;
-                font-weight: 700;
-            }}
-
-            QLabel#overlayRailSubtitle {{
-                color: #64748b;
-                font-size: 12px;
-                font-weight: 500;
+                background: transparent;
+                color: #f8fafc;
+                font-size: {font_title}px;
+                font-weight: 800;
+                min-height: {self._s(28)}px;
             }}
 
             QFrame#overlayRailGroup {{
-                background: rgba(255, 255, 255, 228);
-                border: 1px solid rgba(15, 23, 42, 16);
-                border-radius: 14px;
+                background-color: rgba(255, 255, 255, 24);
+                border: 1px solid rgba(255, 255, 255, 34);
+                border-radius: {border_radius_group}px;
             }}
 
             QLabel#overlayRailLabel {{
-                color: #334155;
-                font-size: 13px;
-                font-weight: 600;
-                min-height: 20px;
+                background: transparent;
+                color: #e2e8f0;
+                font-size: {font_label}px;
+                font-weight: 700;
+                min-height: {self._s(22)}px;
             }}
 
             QLabel#overlayRailValue {{
-                color: #0f172a;
-                font-size: 13px;
-                font-weight: 700;
-                min-width: 44px;
-                min-height: 20px;
-                qproperty-alignment: AlignRight | AlignVCenter;
+                background: transparent;
+                color: #ffffff;
+                font-size: {font_label}px;
+                font-weight: 800;
+                min-width: {self._s(86)}px;
+                min-height: {self._s(22)}px;
             }}
 
             QCheckBox#overlayRailCheck {{
-                color: #334155;
-                font-size: 13px;
-                font-weight: 600;
-                spacing: 8px;
+                background: transparent;
+                color: #ffffff;
+                font-size: {font_label}px;
+                font-weight: 700;
+                spacing: {self._s(10)}px;
             }}
 
             QCheckBox#overlayRailCheck::indicator {{
-                width: 16px;
-                height: 16px;
+                width: {checkbox_size}px;
+                height: {checkbox_size}px;
+                border-radius: {checkbox_radius}px;
+                border: 1px solid rgba(255, 255, 255, 95);
+                background-color: rgba(15, 23, 42, 180);
+            }}
+
+            QCheckBox#overlayRailCheck::indicator:checked {{
+                background-color: #3b82f6;
+                border: 1px solid #93c5fd;
             }}
 
             QSlider#overlayRailSlider {{
-                min-height: 18px;
+                background: transparent;
+                min-height: {self._s(28)}px;
             }}
 
             QSlider#overlayRailSlider::groove:horizontal {{
-                height: 6px;
-                background: #dbe4ee;
-                border-radius: 3px;
+                height: {slider_groove_h}px;
+                background-color: rgba(148, 163, 184, 80);
+                border-radius: {max(1, slider_groove_h // 2)}px;
             }}
 
             QSlider#overlayRailSlider::sub-page:horizontal {{
-                background: #60a5fa;
-                border-radius: 3px;
+                height: {slider_groove_h}px;
+                background-color: #3b82f6;
+                border-radius: {max(1, slider_groove_h // 2)}px;
+            }}
+
+            QSlider#overlayRailSlider::add-page:horizontal {{
+                height: {slider_groove_h}px;
+                background-color: rgba(148, 163, 184, 80);
+                border-radius: {max(1, slider_groove_h // 2)}px;
             }}
 
             QSlider#overlayRailSlider::handle:horizontal {{
-                width: 16px;
-                margin: -5px 0;
-                border-radius: 8px;
-                background: #2563eb;
-                border: 1px solid #1d4ed8;
+                width: {slider_handle}px;
+                height: {slider_handle}px;
+                margin: {slider_handle_margin}px 0px;
+                border-radius: {max(1, slider_handle // 2)}px;
+                background-color: #ffffff;
+                border: {self._s(3)}px solid #3b82f6;
+            }}
+
+            QSlider#overlayRailSlider::handle:horizontal:hover {{
+                border: {self._s(3)}px solid #60a5fa;
             }}
             """
         )
@@ -305,9 +362,9 @@ class _OverlayControlRail(QFrame):
 
 class DebugSidebarPage(QWidget):
     FPS = 30
-    COLOR_SIZE = (1920, 1080)
+    COLOR_SIZE = (1280, 720)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
 
         self.pipeline: rs.pipeline | None = None
@@ -318,10 +375,6 @@ class DebugSidebarPage(QWidget):
 
         self._build_ui()
         self._connect_signals()
-
-    # --------------------------------------------------------
-    # UI
-    # --------------------------------------------------------
 
     def _build_ui(self) -> None:
         self.setObjectName("debugSidebarPage")
@@ -356,17 +409,13 @@ class DebugSidebarPage(QWidget):
         x = self.width() - size.width() - margin_right - 8
         y = margin_top
 
-        self.controls.setGeometry(QRect(x, y, size.width(), size.height()))
+        self.controls.setGeometry(x, y, size.width(), size.height())
         self.controls.raise_()
 
     def _connect_signals(self) -> None:
         self.controls.slider_alpha.valueChanged.connect(self._on_alpha_changed)
         self.controls.slider_dx.valueChanged.connect(self._on_dx_changed)
         self.controls.chk_show_tip.toggled.connect(self._on_show_tip_toggled)
-
-    # --------------------------------------------------------
-    # RealSense
-    # --------------------------------------------------------
 
     def _start_realsense(self) -> None:
         if self.pipeline is not None:
@@ -433,15 +482,7 @@ class DebugSidebarPage(QWidget):
         except Exception as e:
             self._stop_timer()
             self._stop_realsense()
-            QMessageBox.critical(
-                self,
-                "Debug Sidebar",
-                f"Live update failed.\n\n{e}",
-            )
-
-    # --------------------------------------------------------
-    # Display
-    # --------------------------------------------------------
+            print(f"[ERROR] Live update failed: {e}")
 
     def _update_image_label(self) -> None:
         if self._live_color is None:
@@ -453,14 +494,10 @@ class DebugSidebarPage(QWidget):
 
         scaled = pix.scaled(
             self.image_label.size(),
-            Qt.KeepAspectRatio,
+            Qt.KeepAspectRatioByExpanding,
             Qt.SmoothTransformation,
         )
         self.image_label.setPixmap(scaled)
-
-    # --------------------------------------------------------
-    # Dummy callbacks
-    # --------------------------------------------------------
 
     def _on_alpha_changed(self, value: int) -> None:
         alpha = float(value) / 100.0
@@ -472,10 +509,6 @@ class DebugSidebarPage(QWidget):
     def _on_show_tip_toggled(self, checked: bool) -> None:
         _ = checked
 
-    # --------------------------------------------------------
-    # Lifecycle
-    # --------------------------------------------------------
-
     def start(self) -> None:
         try:
             self._start_realsense()
@@ -485,11 +518,7 @@ class DebugSidebarPage(QWidget):
         except Exception as e:
             self._stop_timer()
             self._stop_realsense()
-            QMessageBox.critical(
-                self,
-                "Camera",
-                f"Could not open RealSense camera.\n\n{e}",
-            )
+            print(f"[ERROR] Could not open RealSense camera: {e}")
 
     def stop(self) -> None:
         self._stop_timer()
@@ -501,22 +530,22 @@ class DebugSidebarPage(QWidget):
 
 
 # ============================================================
-# Standalone launcher
+# Spyder-compatible launcher
 # ============================================================
 
-def main() -> int:
+def main() -> None:
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
 
     w = DebugSidebarPage()
-    w.resize(1920, 1080)
+    w.resize(1280, 720)
     w.setWindowTitle("Debug Sidebar")
     w.show()
     w.start()
 
-    return app.exec()
+    app.exec()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
